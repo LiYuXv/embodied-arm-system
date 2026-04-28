@@ -897,13 +897,19 @@ class ELA3Interface:
             logger.warning("零力矩模式已启用 (Kd=%.3f, adaptive=%s)",
                            kd, "ON" if self._adaptive_kd_enabled else "OFF")
         else:
+            # 获取当前反馈位置，用于同步目标位置
+            current_positions = self._read_feedback_positions()
+            
+            # 同步目标位置到当前位置，避免回到旧目标（如0位置）
+            with self._cmd_lock:
+                for i in range(min(len(current_positions), self.NUM_ARM_JOINTS)):
+                    self._target_positions[i] = current_positions[i]
+                    self._last_cmd_positions[i] = current_positions[i]
+                    self._target_velocities[i] = 0.0
+
             for mid in range(1, self.NUM_JOINTS + 1):
                 fb = self._driver.get_feedback(mid)
                 motor_pos = fb.position if (fb and fb.is_valid) else 0.0
-
-                direction = self._joint_directions.get(mid, 1.0)
-                offset = self._joint_offsets.get(mid, 0.0)
-                joint_pos = (motor_pos - offset) / direction
 
                 is_gripper = (mid == self.NUM_JOINTS)
                 target_mode = RunMode.POSITION_PP if is_gripper else RunMode.MOTION_CONTROL
@@ -916,14 +922,16 @@ class ELA3Interface:
                         time.sleep(0.005)
                         self._driver.set_pp_acceleration(mid, self._pp_acceleration)
                     else:
+                        # 保持运控模式，使用当前位置作为目标，开启关节空间阻抗控制
+                        # 力矩 = Kp*(当前位置-目标位置) + Kd*(速度-0) + 重力补偿
                         self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
                         time.sleep(0.005)
-                        target_motor_pos = joint_pos * direction + offset
                         self._driver.send_motion_control(
-                            mid, target_motor_pos, 0.0, self._position_kp, self._position_kd, 0.0)
+                            mid, motor_pos, 0.0, self._position_kp, self._position_kd, 0.0)
                     time.sleep(0.01)
                     continue
 
+                # 如果模式不对，才需要重新配置电机
                 self._driver.disable_motor(mid, clear_fault=False)
                 time.sleep(0.01)
                 self._driver.set_run_mode(mid, target_mode)
@@ -937,15 +945,14 @@ class ELA3Interface:
                 else:
                     self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
                     time.sleep(0.005)
-                    target_motor_pos = joint_pos * direction + offset
                     self._driver.send_motion_control(
-                        mid, target_motor_pos, 0.0, self._position_kp, self._position_kd, 0.0)
+                        mid, motor_pos, 0.0, self._position_kp, self._position_kd, 0.0)
                 time.sleep(0.01)
 
             with self._state_lock:
                 self._state = ArmState.ENABLED
                 self._first_command = True
-            logger.info("零力矩模式已关闭，恢复运控模式")
+            logger.info("零力矩模式已关闭，切换到关节空间阻抗模式（目标位置锁定当前位置）")
 
         return True
 
