@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.vscode/
+.idea/
+*.log
+
+# data and large files
+*.zip
+*.tar
+*.tar.gz
+*.mp4
+*.avi
+*.bag
+*.db3
+
+# python
+dist/
+build/
+*.egg-info/
+
+# ros
+install/
+build/
+log/
