@@ -1,0 +1,45 @@
+robot:
+  name: edulite_a3
+  base_frame: base_link
+  planning_frame: base_link
+
+controllers:
+  arm:
+    name: arm_controller
+    action_name: /arm_controller/follow_joint_trajectory
+    joint_names:
+      - L1_joint
+      - L2_joint
+      - L3_joint
+      - L4_joint
+      - L5_joint
+      - L6_joint
+
+  gripper:
+    name: gripper_controller
+    action_name: /gripper_controller/follow_joint_trajectory
+    joint_names: []
+
+named_poses:
+  home:
+    positions:
+      - 0.0
+      - 0.785
+      - -0.785
+      - 0.0
+      - 0.0
+      - 0.0
+
+  observe:
+    positions:
+      - 0.0
+      - 0.6
+      - -0.9
+      - 0.0
+      - 0.4
+      - 0.0
+
+motion:
+  default_duration_sec: 3.0
+  default_velocity_scale: 0.2
+  default_acceleration_scale: 0.2
