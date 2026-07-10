@@ -1,12 +1,39 @@
 robot:
   name: edulite_a3
+
+  # 坐标系与 MoveIt2 规划组
   base_frame: base_link
   planning_frame: base_link
+  planning_group: arm
+
+  # SRDF 中定义的末端执行器
+  end_effector_link: end_effector
+  end_effector_name: ee
+
+moveit:
+  # MoveIt2 对外提供的规划执行 Action
+  move_group_action: /move_action
+  execute_trajectory_action: /execute_trajectory
+
+  # 留空表示使用 move_group 当前加载的默认规划管线
+  # 不直接填写参数查询结果中的 "move_group"
+  pipeline_id: ""
+
+  planner_id: RRTConnect
+  kinematics_solver: pick_ik/PickIkPlugin
+
+  allowed_planning_time: 5.0
+  num_planning_attempts: 5
+
+  replan: true
+  replan_attempts: 2
+  replan_delay: 0.5
 
 controllers:
   arm:
     name: arm_controller
     action_name: /arm_controller/follow_joint_trajectory
+
     joint_names:
       - L1_joint
       - L2_joint
@@ -18,10 +45,14 @@ controllers:
   gripper:
     name: gripper_controller
     action_name: /gripper_controller/follow_joint_trajectory
-    joint_names: []
+
+    joint_names:
+      - L7_joint
 
 named_poses:
+  # SRDF 中定义的安全待机位姿
   home:
+    group: arm
     positions:
       - 0.0
       - 0.785
@@ -30,7 +61,9 @@ named_poses:
       - 0.0
       - 0.0
 
+  # 当前项目已有的观察位姿
   observe:
+    group: arm
     positions:
       - 0.0
       - 0.6
@@ -39,7 +72,54 @@ named_poses:
       - 0.4
       - 0.0
 
+  # SRDF 中定义的工作准备位姿
+  ready:
+    group: arm
+    positions:
+      - 0.0
+      - 0.785
+      - -1.57
+      - 0.0
+      - 0.785
+      - 0.0
+
+gripper_positions:
+  open:
+    position: 1.5708
+    duration_sec: 1.0
+
+  close:
+    position: 0.0
+    duration_sec: 1.0
+
 motion:
+  # 兼容当前 FollowJointTrajectory 命名位姿执行逻辑
   default_duration_sec: 3.0
+
+  # MoveIt2 速度和加速度缩放
   default_velocity_scale: 0.2
   default_acceleration_scale: 0.2
+
+  min_velocity_scale: 0.01
+  max_velocity_scale: 1.0
+
+  min_acceleration_scale: 0.01
+  max_acceleration_scale: 1.0
+
+  # 与当前 pick_ik 配置保持一致
+  joint_tolerance: 0.001
+  position_tolerance: 0.001
+  orientation_tolerance: 0.01
+
+  # 运动状态管理
+  reject_command_while_busy: true
+  action_server_timeout_sec: 5.0
+
+validation:
+  # PoseStamped 输入检查
+  require_frame_id: true
+  allowed_frames:
+    - base_link
+
+  reject_zero_quaternion: true
+  quaternion_norm_tolerance: 0.001
