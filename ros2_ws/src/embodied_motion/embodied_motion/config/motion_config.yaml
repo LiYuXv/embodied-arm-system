@@ -6,9 +6,17 @@ robot:
   planning_frame: base_link
   planning_group: arm
 
-  # SRDF 中定义的末端执行器
+  # Public TCP used by /motion/move_to_pose.
   end_effector_link: end_effector
   end_effector_name: ee
+
+  # KDL's IK tip must be the last link after an active joint, not the fixed
+  # TCP child.  The transform is the URDF end_effector_joint transform from
+  # this link to end_effector.  Keep it in sync with el_a3.urdf.xacro.
+  ik_link: l5_l6_urdf_asm
+  tcp_offset_from_ik_link:
+    xyz: [0.0, 0.0, -0.074]
+    rpy: [0.0, 0.0, 0.0]
 
 moveit:
   # MoveIt2 对外提供的规划执行 Action
@@ -20,7 +28,9 @@ moveit:
   pipeline_id: ""
 
   planner_id: RRTConnect
-  kinematics_solver: pick_ik/PickIkPlugin
+  # Informational only: MoveIt loads the solver from el_a3_moveit_config.
+  # Keep this value aligned with config/kinematics.yaml for diagnostics.
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
 
   allowed_planning_time: 5.0
   num_planning_attempts: 5

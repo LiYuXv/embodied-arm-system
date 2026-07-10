@@ -1,3 +1,4 @@
 [submodule "third_party/EDULITE_A3"]
 	path = third_party/EDULITE_A3
-	url = https://github.com/RobStride/EDULITE_A3.git
+	# This fork contains the EL-A3 MoveIt IK configuration fix referenced below.
+	url = https://github.com/LiYuXv/EDULITE_A3.git

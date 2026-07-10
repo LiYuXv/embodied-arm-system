@@ -27,6 +27,12 @@ class MoveItGoalBuilder:
         self.base_frame = robot_config["base_frame"]
         self.planning_group = robot_config["planning_group"]
         self.end_effector_link = robot_config["end_effector_link"]
+        self.ik_link = str(
+            robot_config.get("ik_link", self.end_effector_link)
+        )
+        self.tcp_offset_from_ik_link = self._parse_tcp_offset(
+            robot_config.get("tcp_offset_from_ik_link", {})
+        )
 
         # MoveIt2 规划配置
         self.pipeline_id = str(moveit_config["pipeline_id"])
@@ -169,15 +175,19 @@ class MoveItGoalBuilder:
 
         self._validate_pose(target_pose)
 
+        # Configure KDL's group tip as the last active link. The public action
+        # still accepts a TCP pose, so convert it before creating constraints.
+        ik_target_pose = self._tcp_pose_to_ik_pose(target_pose)
+
         goal_constraints = Constraints()
         goal_constraints.name = "end_effector_pose_target"
 
         # 位置约束
         position_constraint = PositionConstraint()
         position_constraint.header = copy.deepcopy(
-            target_pose.header
+            ik_target_pose.header
         )
-        position_constraint.link_name = self.end_effector_link
+        position_constraint.link_name = self.ik_link
         position_constraint.weight = 1.0
 
         target_region = BoundingVolume()
@@ -190,7 +200,7 @@ class MoveItGoalBuilder:
 
         region_pose = Pose()
         region_pose.position = copy.deepcopy(
-            target_pose.pose.position
+            ik_target_pose.pose.position
         )
         region_pose.orientation.w = 1.0
 
@@ -202,11 +212,11 @@ class MoveItGoalBuilder:
         # 姿态约束
         orientation_constraint = OrientationConstraint()
         orientation_constraint.header = copy.deepcopy(
-            target_pose.header
+            ik_target_pose.header
         )
-        orientation_constraint.link_name = self.end_effector_link
+        orientation_constraint.link_name = self.ik_link
         orientation_constraint.orientation = copy.deepcopy(
-            target_pose.pose.orientation
+            ik_target_pose.pose.orientation
         )
 
         orientation_constraint.absolute_x_axis_tolerance = (
@@ -353,6 +363,97 @@ class MoveItGoalBuilder:
                 f"allowed error="
                 f"{self.quaternion_norm_tolerance}"
             )
+
+    @staticmethod
+    def _parse_tcp_offset(offset_config: dict) -> tuple:
+        """Read the fixed IK-link-to-TCP transform from motion_config.yaml."""
+        if not isinstance(offset_config, dict):
+            raise ValueError("tcp_offset_from_ik_link must be a mapping")
+
+        xyz = offset_config.get("xyz", [0.0, 0.0, 0.0])
+        rpy = offset_config.get("rpy", [0.0, 0.0, 0.0])
+
+        if len(xyz) != 3 or len(rpy) != 3:
+            raise ValueError(
+                "tcp_offset_from_ik_link.xyz and .rpy must have three values"
+            )
+
+        values = [float(value) for value in [*xyz, *rpy]]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("tcp_offset_from_ik_link must be finite")
+
+        roll, pitch, yaw = values[3:]
+        half_roll = roll / 2.0
+        half_pitch = pitch / 2.0
+        half_yaw = yaw / 2.0
+        cy, sy = math.cos(half_yaw), math.sin(half_yaw)
+        cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+        cr, sr = math.cos(half_roll), math.sin(half_roll)
+
+        # Quaternion order is x, y, z, w, matching geometry_msgs/URDF.
+        orientation = (
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        )
+        return (tuple(values[:3]), orientation)
+
+    def _tcp_pose_to_ik_pose(self, tcp_pose: PoseStamped) -> PoseStamped:
+        """Convert a requested TCP pose to the configured active IK link."""
+        offset_xyz, offset_orientation = self.tcp_offset_from_ik_link
+        tcp_orientation = tcp_pose.pose.orientation
+        tcp_quaternion = (
+            float(tcp_orientation.x),
+            float(tcp_orientation.y),
+            float(tcp_orientation.z),
+            float(tcp_orientation.w),
+        )
+
+        ik_quaternion = self._quaternion_multiply(
+            tcp_quaternion,
+            self._quaternion_conjugate(offset_orientation),
+        )
+        rotated_offset = self._rotate_vector(ik_quaternion, offset_xyz)
+
+        ik_pose = copy.deepcopy(tcp_pose)
+        ik_pose.pose.position.x -= rotated_offset[0]
+        ik_pose.pose.position.y -= rotated_offset[1]
+        ik_pose.pose.position.z -= rotated_offset[2]
+        ik_pose.pose.orientation.x = ik_quaternion[0]
+        ik_pose.pose.orientation.y = ik_quaternion[1]
+        ik_pose.pose.orientation.z = ik_quaternion[2]
+        ik_pose.pose.orientation.w = ik_quaternion[3]
+        return ik_pose
+
+    @staticmethod
+    def _quaternion_multiply(left: tuple, right: tuple) -> tuple:
+        """Return left * right for geometry_msgs quaternion tuples."""
+        lx, ly, lz, lw = left
+        rx, ry, rz, rw = right
+        return (
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        )
+
+    @staticmethod
+    def _quaternion_conjugate(quaternion: tuple) -> tuple:
+        x, y, z, w = quaternion
+        return (-x, -y, -z, w)
+
+    @classmethod
+    def _rotate_vector(cls, quaternion: tuple, vector: tuple) -> tuple:
+        """Rotate a vector by a normalized geometry_msgs quaternion."""
+        rotated = cls._quaternion_multiply(
+            cls._quaternion_multiply(
+                quaternion,
+                (vector[0], vector[1], vector[2], 0.0),
+            ),
+            cls._quaternion_conjugate(quaternion),
+        )
+        return rotated[:3]
 
     @staticmethod
     def _validate_scale(
