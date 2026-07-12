@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DetectedObject.msg"
   "msg/DetectedObjectArray.msg"
   "srv/MoveNamedPose.srv"
+  "srv/SetGripper.srv"
   "action/MoveToPose.action"
   "action/ExecuteTask.action"
   DEPENDENCIES std_msgs geometry_msgs

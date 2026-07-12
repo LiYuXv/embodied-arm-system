@@ -92,6 +92,16 @@ named_poses:
       - 0.0
       - 0.785
       - 0.0
+  # 预抓取位姿；当前暂与 ready 相同，待桌面抓取场景确定后重新标定
+  pre_pick:
+    group: arm
+    positions:
+      - 0.0
+      - 0.785
+      - -1.57
+      - 0.0
+      - 0.785
+      - 0.0
 
 gripper_positions:
   open:

@@ -6,8 +6,9 @@ import rclpy
 import yaml
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
+from control_msgs.action import FollowJointTrajectory
 from embodied_interfaces.action import MoveToPose
-from embodied_interfaces.srv import MoveNamedPose
+from embodied_interfaces.srv import MoveNamedPose, SetGripper
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import MoveItErrorCodes
 from rclpy.action import (
@@ -19,6 +20,7 @@ from rclpy.action import (
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from trajectory_msgs.msg import JointTrajectoryPoint
 
 from embodied_motion.moveit_goal_builder import MoveItGoalBuilder
 
@@ -69,6 +71,18 @@ class MotionExecutorNode(Node):
         GoalStatus.STATUS_ABORTED: "ABORTED",
     }
 
+    GRIPPER_ERROR_NAMES = {
+        FollowJointTrajectory.Result.SUCCESSFUL: "SUCCESSFUL",
+        FollowJointTrajectory.Result.INVALID_GOAL: "INVALID_GOAL",
+        FollowJointTrajectory.Result.INVALID_JOINTS: "INVALID_JOINTS",
+        FollowJointTrajectory.Result.OLD_HEADER_TIMESTAMP:
+            "OLD_HEADER_TIMESTAMP",
+        FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED:
+            "PATH_TOLERANCE_VIOLATED",
+        FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED:
+            "GOAL_TOLERANCE_VIOLATED",
+    }
+
     SUPPORTED_MOTION_TYPES = {
         "",
         "pose",
@@ -97,10 +111,24 @@ class MotionExecutorNode(Node):
             callback_group=self.callback_group,
         )
 
+        self.gripper_client = ActionClient(
+            self,
+            FollowJointTrajectory,
+            self.gripper_action_name,
+            callback_group=self.callback_group,
+        )
+
         self.go_named_pose_service = self.create_service(
             MoveNamedPose,
             "/motion/go_named_pose",
             self._handle_go_named_pose,
+            callback_group=self.callback_group,
+        )
+
+        self.set_gripper_service = self.create_service(
+            SetGripper,
+            "/motion/set_gripper",
+            self._handle_set_gripper,
             callback_group=self.callback_group,
         )
 
@@ -116,9 +144,13 @@ class MotionExecutorNode(Node):
 
         self._print_config_summary()
         self._check_move_group_server()
+        self._check_gripper_server()
 
         self.get_logger().info(
             "Service ready: /motion/go_named_pose"
+        )
+        self.get_logger().info(
+            "Service ready: /motion/set_gripper"
         )
         self.get_logger().info(
             "Action ready: /motion/move_to_pose"
@@ -179,7 +211,21 @@ class MotionExecutorNode(Node):
             in controllers_config["arm"]["joint_names"]
         ]
 
+        gripper_config = controllers_config["gripper"]
+
+        self.gripper_action_name = str(
+            gripper_config["action_name"]
+        )
+        self.gripper_joint_names = [
+            str(joint_name)
+            for joint_name
+            in gripper_config["joint_names"]
+        ]
+
         self.named_poses = self.config["named_poses"]
+        self.gripper_positions = self.config[
+            "gripper_positions"
+        ]
 
         self.default_velocity_scale = float(
             motion_config["default_velocity_scale"]
@@ -212,10 +258,20 @@ class MotionExecutorNode(Node):
             f"MoveGroup action: {self.move_group_action_name}"
         )
         self.get_logger().info(
+            f"Gripper action: {self.gripper_action_name}"
+        )
+        self.get_logger().info(
             f"Arm joints: {self.arm_joint_names}"
         )
         self.get_logger().info(
+            f"Gripper joints: {self.gripper_joint_names}"
+        )
+        self.get_logger().info(
             f"Named poses: {list(self.named_poses.keys())}"
+        )
+        self.get_logger().info(
+            "Gripper positions: "
+            f"{list(self.gripper_positions.keys())}"
         )
         self.get_logger().info(
             "============================================"
@@ -240,6 +296,27 @@ class MotionExecutorNode(Node):
             self.get_logger().warning(
                 f"MoveGroup server is not currently available: "
                 f"{self.move_group_action_name}"
+            )
+
+    def _check_gripper_server(self) -> None:
+        self.get_logger().info(
+            f"Checking gripper server: "
+            f"{self.gripper_action_name}"
+        )
+
+        ready = self.gripper_client.wait_for_server(
+            timeout_sec=self.action_server_timeout_sec
+        )
+
+        if ready:
+            self.get_logger().info(
+                f"Gripper server connected: "
+                f"{self.gripper_action_name}"
+            )
+        else:
+            self.get_logger().warning(
+                f"Gripper server is not currently available: "
+                f"{self.gripper_action_name}"
             )
 
     def _reserve_motion(self, source: str) -> bool:
@@ -380,7 +457,91 @@ class MotionExecutorNode(Node):
         except Exception as error:
             response.success = False
             response.message = (
-                f'Unexpected named-pose error: {error}'
+                f"Unexpected named-pose error: {error}"
+            )
+            self.get_logger().exception(response.message)
+            return response
+
+        finally:
+            self._release_motion()
+
+    async def _handle_set_gripper(
+        self,
+        request: SetGripper.Request,
+        response: SetGripper.Response,
+    ) -> SetGripper.Response:
+        position_name = request.position_name.strip().lower()
+
+        self.get_logger().info(
+            f"Received gripper request: {position_name}"
+        )
+
+        if not position_name:
+            response.success = False
+            response.message = "position_name is empty"
+            return response
+
+        if position_name not in self.gripper_positions:
+            response.success = False
+            response.message = (
+                f'Unknown gripper position "{position_name}". '
+                f"Available positions: "
+                f"{list(self.gripper_positions.keys())}"
+            )
+            return response
+
+        if len(self.gripper_joint_names) != 1:
+            response.success = False
+            response.message = (
+                "Gripper controller must contain exactly "
+                "one commanded joint"
+            )
+            return response
+
+        source = f"gripper:{position_name}"
+
+        if not self._reserve_motion(source):
+            response.success = False
+            response.message = (
+                "Motion executor is busy with: "
+                f"{self._get_busy_source()}"
+            )
+            return response
+
+        try:
+            position_config = self.gripper_positions[
+                position_name
+            ]
+
+            position = float(position_config["position"])
+            duration_sec = float(
+                position_config["duration_sec"]
+            )
+
+            success, message = await self._send_gripper_goal(
+                position=position,
+                duration_sec=duration_sec,
+            )
+
+            response.success = success
+            response.message = (
+                f'Gripper "{position_name}": {message}'
+            )
+            return response
+
+        except (KeyError, TypeError, ValueError) as error:
+            response.success = False
+            response.message = (
+                f'Invalid gripper position '
+                f'"{position_name}": {error}'
+            )
+            self.get_logger().error(response.message)
+            return response
+
+        except Exception as error:
+            response.success = False
+            response.message = (
+                f"Unexpected gripper error: {error}"
             )
             self.get_logger().exception(response.message)
             return response
@@ -411,7 +572,6 @@ class MotionExecutorNode(Node):
                 )
             )
 
-            # 在接受目标前完成参数和 Pose 校验。
             self.goal_builder.build_pose_goal(
                 target_pose=goal_request.target_pose,
                 velocity_scale=velocity_scale,
@@ -570,6 +730,111 @@ class MotionExecutorNode(Node):
 
         finally:
             self._release_motion()
+
+    async def _send_gripper_goal(
+        self,
+        position: float,
+        duration_sec: float,
+    ) -> Tuple[bool, str]:
+        if duration_sec <= 0.0:
+            raise ValueError(
+                "gripper duration_sec must be greater than zero"
+            )
+
+        if not self.gripper_client.server_is_ready():
+            ready = self.gripper_client.wait_for_server(
+                timeout_sec=self.action_server_timeout_sec
+            )
+
+            if not ready:
+                message = (
+                    "Gripper action server is unavailable: "
+                    f"{self.gripper_action_name}"
+                )
+                self.get_logger().error(message)
+                return False, message
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(
+            self.gripper_joint_names
+        )
+
+        point = JointTrajectoryPoint()
+        point.positions = [float(position)]
+
+        seconds = int(duration_sec)
+        nanoseconds = int(
+            round((duration_sec - seconds) * 1_000_000_000)
+        )
+
+        if nanoseconds >= 1_000_000_000:
+            seconds += 1
+            nanoseconds -= 1_000_000_000
+
+        point.time_from_start.sec = seconds
+        point.time_from_start.nanosec = nanoseconds
+
+        goal.trajectory.points = [point]
+
+        self.get_logger().info(
+            "Sending goal to gripper controller: "
+            f"joint={self.gripper_joint_names[0]}, "
+            f"position={position:.4f}"
+        )
+
+        goal_handle = await self.gripper_client.send_goal_async(
+            goal
+        )
+
+        if not goal_handle.accepted:
+            message = "Gripper controller rejected the goal"
+            self.get_logger().error(message)
+            return False, message
+
+        self.get_logger().info(
+            "Gripper controller accepted the goal"
+        )
+
+        result_response = await goal_handle.get_result_async()
+
+        action_status = result_response.status
+        result = result_response.result
+        error_code = int(result.error_code)
+
+        status_name = self.GOAL_STATUS_NAMES.get(
+            action_status,
+            str(action_status),
+        )
+        error_name = self.GRIPPER_ERROR_NAMES.get(
+            error_code,
+            f"UNKNOWN_ERROR_{error_code}",
+        )
+
+        success = (
+            action_status == GoalStatus.STATUS_SUCCEEDED
+            and error_code
+            == FollowJointTrajectory.Result.SUCCESSFUL
+        )
+
+        message = (
+            f"status={status_name}, "
+            f"controller_error={error_name}"
+        )
+
+        error_string = str(result.error_string).strip()
+        if error_string:
+            message += f", detail={error_string}"
+
+        if success:
+            self.get_logger().info(
+                f"Gripper motion succeeded: {message}"
+            )
+        else:
+            self.get_logger().error(
+                f"Gripper motion failed: {message}"
+            )
+
+        return success, message
 
     async def _send_move_group_goal(
         self,
