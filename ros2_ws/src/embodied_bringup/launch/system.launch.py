@@ -138,6 +138,24 @@ def generate_launch_description() -> LaunchDescription:
         ],
     )
 
+    perception_node = Node(
+        package="embodied_perception",
+        executable="perception_node",
+        name="perception_node",
+        output="screen",
+        emulate_tty=True,
+    )
+
+    delayed_perception = TimerAction(
+        period=6.0,
+        actions=[
+            LogInfo(
+                msg="正在启动 perception_node..."
+            ),
+            perception_node,
+        ],
+    )
+
     delayed_language_node = TimerAction(
         period=7.0,
         actions=[
@@ -160,12 +178,13 @@ def generate_launch_description() -> LaunchDescription:
             LogInfo(
                 msg=(
                     "正在启动机械臂具身操作系统："
-                    "MoveIt、运动层、任务层和语言交互层"
+                    "MoveIt、运动层、任务层、视觉感知层和语言交互层"
                 )
             ),
             moveit_launch,
             delayed_motion_executor,
             delayed_task_manager,
+            delayed_perception,
             delayed_language_node,
         ]
     )

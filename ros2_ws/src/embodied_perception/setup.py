@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            "perception_node = "
+            "embodied_perception.perception_node:main"
         ],
     },
 )
