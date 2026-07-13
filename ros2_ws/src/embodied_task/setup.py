@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'task_manager_node = embodied_task.task_manager_node:main',
         ],
     },
 )
