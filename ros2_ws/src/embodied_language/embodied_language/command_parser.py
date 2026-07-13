@@ -1,4 +1,4 @@
-"""中文机械臂指令的基础规则解析器。"""
+"""中文机械臂指令的基础规则解析器."""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -6,7 +6,7 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class ParsedCommand:
-    """自然语言指令的结构化解析结果。"""
+    """自然语言指令的结构化解析结果."""
 
     raw_text: str
     action: str
@@ -14,7 +14,7 @@ class ParsedCommand:
 
 
 class CommandParser:
-    """将基础中文指令映射为机械臂标准任务命令。"""
+    """将基础中文指令映射为机械臂标准任务命令."""
 
     _NAMED_POSE_RULES = {
         "home": (
@@ -64,7 +64,7 @@ class CommandParser:
 
     @classmethod
     def normalize(cls, text: str) -> str:
-        """移除空白和常见中文标点。"""
+        """移除空白和常见中文标点."""
         normalized = "".join(text.strip().split())
 
         for character in cls._IGNORED_CHARACTERS:
@@ -73,7 +73,7 @@ class CommandParser:
         return normalized
 
     def parse(self, text: str) -> Optional[ParsedCommand]:
-        """解析中文指令；无法识别时返回 None。"""
+        """解析中文指令；无法识别时返回 None."""
         normalized_text = self.normalize(text)
 
         if not normalized_text:

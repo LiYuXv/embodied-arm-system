@@ -24,6 +24,7 @@
   <exec_depend>launch_ros</exec_depend>
 
   <exec_depend>embodied_motion</exec_depend>
+  <exec_depend>embodied_task</exec_depend>
   <exec_depend>embodied_language</exec_depend>
   <exec_depend>el_a3_moveit_config</exec_depend>
 

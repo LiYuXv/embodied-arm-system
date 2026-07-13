@@ -1,4 +1,4 @@
-"""机械臂具身操作系统总启动文件。"""
+"""机械臂具身操作系统总启动文件."""
 
 import os
 import shutil
@@ -23,7 +23,7 @@ from launch_ros.actions import Node
 
 
 def _launch_language_node(context):
-    """在独立终端中启动交互式语言节点。"""
+    """在独立终端中启动交互式语言节点."""
     open_terminal = (
         LaunchConfiguration(
             "open_language_terminal"
@@ -83,7 +83,7 @@ def _launch_language_node(context):
 
 
 def generate_launch_description() -> LaunchDescription:
-    """生成完整系统启动描述。"""
+    """生成完整系统启动描述."""
     moveit_share_directory = (
         get_package_share_directory(
             "el_a3_moveit_config"
@@ -120,8 +120,26 @@ def generate_launch_description() -> LaunchDescription:
         ],
     )
 
+    task_manager_node = Node(
+        package="embodied_task",
+        executable="task_manager_node",
+        name="task_manager_node",
+        output="screen",
+        emulate_tty=True,
+    )
+
+    delayed_task_manager = TimerAction(
+        period=5.0,
+        actions=[
+            LogInfo(
+                msg="正在启动 task_manager_node..."
+            ),
+            task_manager_node,
+        ],
+    )
+
     delayed_language_node = TimerAction(
-        period=6.0,
+        period=7.0,
         actions=[
             OpaqueFunction(
                 function=_launch_language_node
@@ -142,11 +160,12 @@ def generate_launch_description() -> LaunchDescription:
             LogInfo(
                 msg=(
                     "正在启动机械臂具身操作系统："
-                    "MoveIt、运动层和语言交互层"
+                    "MoveIt、运动层、任务层和语言交互层"
                 )
             ),
             moveit_launch,
             delayed_motion_executor,
+            delayed_task_manager,
             delayed_language_node,
         ]
     )
