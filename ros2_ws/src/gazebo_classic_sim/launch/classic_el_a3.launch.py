@@ -3,7 +3,7 @@
 from launch import LaunchDescription
 import os
 
-from ament_index_python.packages import get_package_prefix
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
@@ -24,7 +24,15 @@ def generate_launch_description():
     world = PathJoinSubstitution([package_share, "worlds", "el_a3_workbench.world"])
     gazebo_plugin_path = os.environ.get("GAZEBO_PLUGIN_PATH", "")
     ros_plugin_dir = os.path.join(get_package_prefix("gazebo_ros2_control"), "lib")
-    plugin_path = ros_plugin_dir if not gazebo_plugin_path else f"{ros_plugin_dir}:{gazebo_plugin_path}"
+    gripper_plugin_dir = os.path.join(get_package_prefix("gazebo_classic_gripper_mimic"), "lib")
+    plugin_path = ":".join(filter(None, (ros_plugin_dir, gripper_plugin_dir, gazebo_plugin_path)))
+    description_share = get_package_share_directory("el_a3_description")
+    gazebo_model_path = os.environ.get("GAZEBO_MODEL_PATH", "")
+    model_path = ":".join(filter(None, (
+        description_share,
+        os.path.dirname(description_share),
+        gazebo_model_path,
+    )))
     description = ParameterValue(
         Command([
             FindExecutable(name="python3"), " ",
@@ -66,6 +74,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("verbose", default_value="false"),
         SetEnvironmentVariable("GAZEBO_PLUGIN_PATH", plugin_path),
+        SetEnvironmentVariable("GAZEBO_MODEL_PATH", model_path),
         SetEnvironmentVariable("GAZEBO_MODEL_DATABASE_URI", ""),
         gazebo,
         robot_state_publisher,

@@ -11,9 +11,20 @@ for `L1_joint` through `L7_joint`, assigns zero initial values, and fixes
 with the robot, then the launch file activates the joint-state broadcaster,
 arm trajectory controller, and gripper trajectory controller as one group.
 
+The visual gripper jaws have a position offset that Gazebo Classic's built-in
+mimic support cannot represent.  `gazebo_classic_gripper_mimic` is a local
+model plugin that applies the vendor mapping
+`jaw = clamp(0.05 - 0.031831 * L7, 0, 0.05)` to both visible jaw joints each
+simulation update.  The jaws are exported as read-only state interfaces, so
+`/joint_states` reports their actual Gazebo positions while the existing
+gripper controller continues to command only `L7_joint`.
+
 The inline world intentionally contains its own ground plane, light, and
 workbench.  This avoids `model://` downloads and lets the controller plugin
 come up before the spawner timeout.
+The launch also prepends the local plugin paths and the EDULITE description
+share path to `GAZEBO_PLUGIN_PATH` and `GAZEBO_MODEL_PATH`; no manual export is
+needed.
 
 ## Build and start
 
@@ -21,7 +32,7 @@ come up before the spawner timeout.
 cd <spike-checkout>/ros2_ws
 source /opt/ros/humble/setup.bash
 colcon build --base-paths src ../third_party/EDULITE_A3/el_a3_ros/el_a3_description \
-  --packages-select el_a3_description gazebo_classic_sim --symlink-install
+  --packages-select el_a3_description gazebo_classic_gripper_mimic gazebo_classic_sim --symlink-install
 source install/setup.bash
 ros2 launch gazebo_classic_sim classic_el_a3.launch.py
 ```
@@ -48,3 +59,15 @@ In that GUI-backed simulation, the initial pose changed by at most
 The safe trajectory completed with `Goal successfully reached!`; L4 measured
 `0.300005 rad` afterward and changed by only `1e-8 rad` over a further
 11.986 simulation seconds.
+
+### Gripper verification (2026-07-14)
+
+In the Gazebo Classic GUI, all gripper actions returned `SUCCEEDED` and the
+actual left/right jaw positions published by Gazebo were:
+
+| L7 target | left jaw | right jaw | observed state |
+| --- | --- | --- | --- |
+| 0.0 | 0.050000 | 0.050000 | closed |
+| 0.8 | 0.024535 | 0.024535 | visibly open |
+| 1.5708 | 0.000000 | 0.000000 | fully open |
+| 0.0 | 0.050000 | 0.050000 | closed again |

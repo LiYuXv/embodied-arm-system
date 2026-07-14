@@ -15,6 +15,7 @@ from ament_index_python.packages import get_package_share_directory
 
 
 ARM_JOINTS = ("L1_joint", "L2_joint", "L3_joint", "L4_joint", "L5_joint", "L6_joint")
+JAW_JOINTS = ("left_jaw_joint", "right_jaw_joint")
 INITIAL_POSITIONS = {
     "L1_joint": 0.0,
     "L2_joint": 0.0,
@@ -24,6 +25,7 @@ INITIAL_POSITIONS = {
     "L6_joint": 0.0,
     "L7_joint": 0.0,
 }
+JAW_CLOSED_POSITION = 0.05
 
 
 def interface(name, initial_value=None):
@@ -68,6 +70,14 @@ def main():
         joint.append(interface("position"))
         joint.append(interface("position", INITIAL_POSITIONS[joint_name]))
         joint.append(interface("velocity", 0.0))
+    # Gazebo Classic does not apply URDF mimic tags to simulated joints.  The
+    # companion model plugin owns the two visual jaw positions; declaring them
+    # as state-only interfaces makes their actual positions observable through
+    # /joint_states without exposing them to the L7 controller.
+    for joint_name in JAW_JOINTS:
+        joint = etree.SubElement(control, "joint", name=joint_name)
+        joint.append(interface("position", JAW_CLOSED_POSITION))
+        joint.append(interface("velocity", 0.0))
 
     gazebo = etree.SubElement(robot, "gazebo")
     plugin = etree.SubElement(
@@ -79,6 +89,20 @@ def main():
     etree.SubElement(plugin, "robot_param").text = "robot_description"
     etree.SubElement(plugin, "robot_param_node").text = "robot_state_publisher"
     etree.SubElement(plugin, "parameters").text = args.controllers
+
+    mimic_plugin = etree.SubElement(
+        gazebo,
+        "plugin",
+        filename="libgazebo_classic_gripper_mimic.so",
+        name="gazebo_classic_gripper_mimic",
+    )
+    etree.SubElement(mimic_plugin, "driver_joint").text = "L7_joint"
+    etree.SubElement(mimic_plugin, "left_joint").text = "left_jaw_joint"
+    etree.SubElement(mimic_plugin, "right_joint").text = "right_jaw_joint"
+    etree.SubElement(mimic_plugin, "multiplier").text = "-0.031831"
+    etree.SubElement(mimic_plugin, "offset").text = "0.05"
+    etree.SubElement(mimic_plugin, "lower_limit").text = "0.0"
+    etree.SubElement(mimic_plugin, "upper_limit").text = "0.05"
 
     sys.stdout.write(etree.tostring(robot, encoding="unicode"))
 
