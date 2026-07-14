@@ -23,4 +23,9 @@ setup(
     maintainer_email="liyu@example.com",
     description="Minimal Gazebo Classic validation for the EDULITE A3.",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "usb_camera_publisher = gazebo_classic_sim.usb_camera_publisher:main",
+        ],
+    },
 )

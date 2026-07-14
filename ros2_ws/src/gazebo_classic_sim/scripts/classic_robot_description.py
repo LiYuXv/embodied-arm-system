@@ -23,9 +23,14 @@ INITIAL_POSITIONS = {
     "L4_joint": 0.0,
     "L5_joint": 0.0,
     "L6_joint": 0.0,
-    "L7_joint": 0.0,
+    "L7_joint": 1.5708,
 }
-JAW_CLOSED_POSITION = 0.05
+JAW_OPEN_POSITION = 0.0
+YELLOW_ARM_LINKS = (
+    "base_link", "l1_link_urdf_asm", "l1_urdf_urdf_asm", "l2_l3_urdf_asm",
+    "l3_lnik_urdf_asm", "l4_l5_urdf_asm", "l5_l6_urdf_asm", "end_effector",
+)
+DARK_LINKS = ("gripper_base_link", "gripper_driver_link", "left_jaw_link", "right_jaw_link")
 
 
 def interface(name, initial_value=None):
@@ -37,9 +42,60 @@ def interface(name, initial_value=None):
     return element
 
 
+def add_rgbd_camera(robot):
+    """Attach the RGB-D sensor above the wrist without changing vendor files."""
+    camera_link = etree.SubElement(robot, "link", name="rgbd_camera_link")
+    visual = etree.SubElement(camera_link, "visual")
+    etree.SubElement(visual, "origin", xyz="0 0 0", rpy="0 0 0")
+    geometry = etree.SubElement(visual, "geometry")
+    etree.SubElement(geometry, "box", size="0.045 0.030 0.020")
+    material = etree.SubElement(visual, "material", name="matte_black")
+    etree.SubElement(material, "color", rgba="0.04 0.04 0.04 1")
+    camera_joint = etree.SubElement(robot, "joint", name="rgbd_camera_fixed_joint", type="fixed")
+    etree.SubElement(camera_joint, "parent", link="l5_l6_urdf_asm")
+    etree.SubElement(camera_joint, "child", link="rgbd_camera_link")
+    # Above the end-effector and rotated to observe the work surface.
+    etree.SubElement(camera_joint, "origin", xyz="0.055 0 0.105", rpy="0 1.5708 0")
+
+    gazebo = etree.SubElement(robot, "gazebo", reference="rgbd_camera_link")
+    sensor = etree.SubElement(gazebo, "sensor", name="wrist_rgbd_sensor", type="depth")
+    etree.SubElement(sensor, "always_on").text = "true"
+    etree.SubElement(sensor, "update_rate").text = "30"
+    etree.SubElement(sensor, "visualize").text = "false"
+    camera = etree.SubElement(sensor, "camera")
+    etree.SubElement(camera, "horizontal_fov").text = "1.047"
+    image = etree.SubElement(camera, "image")
+    etree.SubElement(image, "width").text = "640"
+    etree.SubElement(image, "height").text = "480"
+    etree.SubElement(image, "format").text = "R8G8B8"
+    etree.SubElement(camera, "depth_camera")
+    clip = etree.SubElement(camera, "clip")
+    etree.SubElement(clip, "near").text = "0.10"
+    etree.SubElement(clip, "far").text = "4.0"
+    plugin = etree.SubElement(sensor, "plugin", name="wrist_rgbd_ros", filename="libgazebo_ros_camera.so")
+    ros = etree.SubElement(plugin, "ros")
+    etree.SubElement(ros, "namespace").text = "/camera"
+    etree.SubElement(ros, "remapping").text = "color/depth/image_raw:=aligned_depth_to_color/image_raw"
+    etree.SubElement(plugin, "camera_name").text = "color"
+    etree.SubElement(plugin, "frame_name").text = "rgbd_camera_link"
+    etree.SubElement(plugin, "min_depth").text = "0.10"
+    etree.SubElement(plugin, "max_depth").text = "4.0"
+
+
+def add_classic_materials(robot):
+    """Restore the yellow arm and dark gripper appearance in Classic."""
+    for link_name in YELLOW_ARM_LINKS:
+        gazebo = etree.SubElement(robot, "gazebo", reference=link_name)
+        etree.SubElement(gazebo, "material").text = "Gazebo/Yellow"
+    for link_name in DARK_LINKS:
+        gazebo = etree.SubElement(robot, "gazebo", reference=link_name)
+        etree.SubElement(gazebo, "material").text = "Gazebo/DarkGrey"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--controllers", required=True)
+    parser.add_argument("--camera-mode", choices=("none", "rgbd"), default="none")
     args = parser.parse_args()
 
     description_share = get_package_share_directory("el_a3_description")
@@ -54,6 +110,11 @@ def main():
 
     for control in list(robot.findall("ros2_control")):
         robot.remove(control)
+
+    add_classic_materials(robot)
+
+    if args.camera_mode == "rgbd":
+        add_rgbd_camera(robot)
 
     world_link = etree.Element("link", name="world")
     robot.insert(0, world_link)
@@ -76,7 +137,7 @@ def main():
     # /joint_states without exposing them to the L7 controller.
     for joint_name in JAW_JOINTS:
         joint = etree.SubElement(control, "joint", name=joint_name)
-        joint.append(interface("position", JAW_CLOSED_POSITION))
+        joint.append(interface("position", JAW_OPEN_POSITION))
         joint.append(interface("velocity", 0.0))
 
     gazebo = etree.SubElement(robot, "gazebo")
