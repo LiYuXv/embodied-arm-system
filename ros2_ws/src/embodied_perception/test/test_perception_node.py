@@ -47,6 +47,14 @@ def test_camera_input_state_and_output_frame() -> None:
         assert node.camera_info_message_count == 1
         assert node._camera_inputs_ready() is True
 
+        node.require_depth = False
+        node.require_aux_rgb = True
+        node.latest_aux_rgb = None
+        assert node._camera_inputs_ready() is False
+        node._handle_aux_rgb_image(Image())
+        assert node.aux_rgb_message_count == 1
+        assert node._camera_inputs_ready() is True
+
     finally:
         node.destroy_node()
 

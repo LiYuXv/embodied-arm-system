@@ -12,11 +12,14 @@
   <depend>launch</depend>
   <depend>launch_ros</depend>
   <depend>ros_gz_sim</depend>
+  <depend>ros_gz_bridge</depend>
   <depend>gz_ros2_control</depend>
   <depend>robot_state_publisher</depend>
   <depend>controller_manager</depend>
   <depend>xacro</depend>
   <exec_depend>el_a3_description</exec_depend>
+  <exec_depend>embodied_perception</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

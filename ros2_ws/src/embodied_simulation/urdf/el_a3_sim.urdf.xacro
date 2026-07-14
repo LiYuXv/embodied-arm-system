@@ -8,9 +8,12 @@
   <xacro:arg name="can_interface" default="can0"/>
   <xacro:arg name="host_can_id" default="253"/>
   <xacro:arg name="wrist_motor_type" default="EL05"/>
+  <!-- none, rgbd, or dual_rgb. Each perception route has its own sensors. -->
+  <xacro:arg name="camera_mode" default="none"/>
 
   <!-- Wrist motor parameters (EL05: 6Nm, RS05: 5.5Nm) -->
   <xacro:property name="wrist_motor_type" value="$(arg wrist_motor_type)"/>
+  <xacro:property name="camera_mode" value="$(arg camera_mode)"/>
   <xacro:property name="wrist_effort" value="${5.5 if wrist_motor_type == 'RS05' else 6.0}"/>
 
   <!-- Include ros2_control -->
@@ -197,6 +200,69 @@
 
   <!-- End Effector link -->
   <link name="end_effector"/>
+
+  <!-- RGB-D camera rigidly mounted above the wrist and aimed at the grasp area. -->
+  <xacro:if value="${camera_mode == 'rgbd'}">
+    <link name="rgbd_camera_link">
+      <visual>
+        <geometry><box size="0.060 0.035 0.025"/></geometry>
+        <material name="dark_brown"/>
+      </visual>
+    </link>
+    <joint name="rgbd_camera_joint" type="fixed">
+      <parent link="l5_l6_urdf_asm"/>
+      <child link="rgbd_camera_link"/>
+      <!-- Camera optical axis points down at the end effector workspace. -->
+      <origin xyz="0.030 0 0.120" rpy="0 1.5708 0"/>
+    </joint>
+    <gazebo reference="rgbd_camera_link">
+      <sensor name="rgbd_camera" type="rgbd_camera">
+        <always_on>1</always_on>
+        <update_rate>30</update_rate>
+        <visualize>false</visualize>
+        <topic>/camera</topic>
+        <camera>
+          <horizontal_fov>1.047</horizontal_fov>
+          <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+          <clip><near>0.080</near><far>3.0</far></clip>
+        </camera>
+      </sensor>
+    </gazebo>
+  </xacro:if>
+
+  <!-- Two fixed-over-workcell USB-style RGB cameras with complementary views. -->
+  <xacro:if value="${camera_mode == 'dual_rgb'}">
+    <link name="camera_main_link">
+      <visual><geometry><box size="0.070 0.040 0.030"/></geometry><material name="dark_brown"/></visual>
+    </link>
+    <joint name="camera_main_joint" type="fixed">
+      <parent link="base_link"/><child link="camera_main_link"/>
+      <!-- Front-left view of the work mat. -->
+      <origin xyz="0.78 -0.60 1.15" rpy="0 0.49 1.82"/>
+    </joint>
+    <gazebo reference="camera_main_link">
+      <sensor name="camera_main" type="camera">
+        <always_on>1</always_on><update_rate>30</update_rate><visualize>false</visualize>
+        <topic>/camera_main</topic>
+        <camera><horizontal_fov>1.047</horizontal_fov><image><width>640</width><height>480</height><format>R8G8B8</format></image><clip><near>0.10</near><far>4.0</far></clip></camera>
+      </sensor>
+    </gazebo>
+    <link name="camera_aux_link">
+      <visual><geometry><box size="0.070 0.040 0.030"/></geometry><material name="dark_brown"/></visual>
+    </link>
+    <joint name="camera_aux_joint" type="fixed">
+      <parent link="base_link"/><child link="camera_aux_link"/>
+      <!-- Rear-right view avoids occlusion by the arm in the main camera. -->
+      <origin xyz="0.30 0.60 1.05" rpy="0 0.32 -1.04"/>
+    </joint>
+    <gazebo reference="camera_aux_link">
+      <sensor name="camera_aux" type="camera">
+        <always_on>1</always_on><update_rate>30</update_rate><visualize>false</visualize>
+        <topic>/camera_aux</topic>
+        <camera><horizontal_fov>1.047</horizontal_fov><image><width>640</width><height>480</height><format>R8G8B8</format></image><clip><near>0.10</near><far>4.0</far></clip></camera>
+      </sensor>
+    </gazebo>
+  </xacro:if>
 
   <!-- Joints -->
   <!-- Joint L1 (RS00 Motor 1) -->

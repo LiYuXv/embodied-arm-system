@@ -25,7 +25,9 @@ setup(
     entry_points={
         'console_scripts': [
             "perception_node = "
-            "embodied_perception.perception_node:main"
+            "embodied_perception.perception_node:main",
+            "camera_info_from_image = "
+            "embodied_perception.camera_info_from_image:main",
         ],
     },
 )

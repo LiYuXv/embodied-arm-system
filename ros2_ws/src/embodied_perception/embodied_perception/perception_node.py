@@ -24,6 +24,7 @@ class PerceptionNode(Node):
             "depth_topic",
             "/camera/aligned_depth_to_color/image_raw",
         )
+        self.declare_parameter("aux_rgb_topic", "")
         self.declare_parameter(
             "camera_info_topic",
             "/camera/color/camera_info",
@@ -36,6 +37,8 @@ class PerceptionNode(Node):
             "camera_frame",
             "camera_color_optical_frame",
         )
+        self.declare_parameter("require_depth", True)
+        self.declare_parameter("require_aux_rgb", False)
         self.declare_parameter(
             "publish_rate_hz",
             1.0,
@@ -51,6 +54,9 @@ class PerceptionNode(Node):
         self.depth_topic = str(
             self.get_parameter("depth_topic").value
         )
+        self.aux_rgb_topic = str(
+            self.get_parameter("aux_rgb_topic").value
+        )
         self.camera_info_topic = str(
             self.get_parameter("camera_info_topic").value
         )
@@ -59,6 +65,12 @@ class PerceptionNode(Node):
         )
         self.camera_frame = str(
             self.get_parameter("camera_frame").value
+        )
+        self.require_depth = bool(
+            self.get_parameter("require_depth").value
+        )
+        self.require_aux_rgb = bool(
+            self.get_parameter("require_aux_rgb").value
         )
 
         publish_rate_hz = self._read_positive_rate(
@@ -72,10 +84,12 @@ class PerceptionNode(Node):
 
         self.latest_rgb: Optional[Image] = None
         self.latest_depth: Optional[Image] = None
+        self.latest_aux_rgb: Optional[Image] = None
         self.latest_camera_info: Optional[CameraInfo] = None
 
         self.rgb_message_count = 0
         self.depth_message_count = 0
+        self.aux_rgb_message_count = 0
         self.camera_info_message_count = 0
 
         self.rgb_subscription = self.create_subscription(
@@ -84,12 +98,22 @@ class PerceptionNode(Node):
             self._handle_rgb_image,
             qos_profile_sensor_data,
         )
-        self.depth_subscription = self.create_subscription(
-            Image,
-            self.depth_topic,
-            self._handle_depth_image,
-            qos_profile_sensor_data,
-        )
+        self.depth_subscription = None
+        if self.require_depth:
+            self.depth_subscription = self.create_subscription(
+                Image,
+                self.depth_topic,
+                self._handle_depth_image,
+                qos_profile_sensor_data,
+            )
+        self.aux_rgb_subscription = None
+        if self.require_aux_rgb:
+            self.aux_rgb_subscription = self.create_subscription(
+                Image,
+                self.aux_rgb_topic,
+                self._handle_aux_rgb_image,
+                qos_profile_sensor_data,
+            )
         self.camera_info_subscription = self.create_subscription(
             CameraInfo,
             self.camera_info_topic,
@@ -119,6 +143,8 @@ class PerceptionNode(Node):
         self.get_logger().info(
             f"Depth topic: {self.depth_topic}"
         )
+        if self.require_aux_rgb:
+            self.get_logger().info(f"Aux RGB topic: {self.aux_rgb_topic}")
         self.get_logger().info(
             f"Camera info topic: {self.camera_info_topic}"
         )
@@ -129,7 +155,7 @@ class PerceptionNode(Node):
             "Publishing detected objects on: /detected_objects"
         )
         self.get_logger().info(
-            "正在等待 RGB、Depth 和 CameraInfo 数据"
+            "正在等待配置的相机数据"
         )
 
     def _read_positive_rate(
@@ -161,6 +187,11 @@ class PerceptionNode(Node):
         self.latest_depth = message
         self.depth_message_count += 1
 
+    def _handle_aux_rgb_image(self, message: Image) -> None:
+        """Store the auxiliary image from the dual-RGB route."""
+        self.latest_aux_rgb = message
+        self.aux_rgb_message_count += 1
+
     def _handle_camera_info(
         self,
         message: CameraInfo,
@@ -173,8 +204,9 @@ class PerceptionNode(Node):
         """判断三路相机输入是否全部到达."""
         return (
             self.latest_rgb is not None
-            and self.latest_depth is not None
             and self.latest_camera_info is not None
+            and (not self.require_depth or self.latest_depth is not None)
+            and (not self.require_aux_rgb or self.latest_aux_rgb is not None)
         )
 
     def _report_input_status(self) -> None:
@@ -184,6 +216,7 @@ class PerceptionNode(Node):
                 "相机输入已就绪："
                 f"rgb={self.rgb_message_count}, "
                 f"depth={self.depth_message_count}, "
+                f"aux_rgb={self.aux_rgb_message_count}, "
                 f"camera_info={self.camera_info_message_count}"
             )
             return
@@ -193,8 +226,11 @@ class PerceptionNode(Node):
         if self.latest_rgb is None:
             missing_inputs.append("RGB")
 
-        if self.latest_depth is None:
+        if self.require_depth and self.latest_depth is None:
             missing_inputs.append("Depth")
+
+        if self.require_aux_rgb and self.latest_aux_rgb is None:
+            missing_inputs.append("Aux RGB")
 
         if self.latest_camera_info is None:
             missing_inputs.append("CameraInfo")
