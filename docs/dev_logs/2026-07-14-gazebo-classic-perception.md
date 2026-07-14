@@ -65,7 +65,6 @@ exact devices requested:
 
 ```bash
 cd <spike-checkout>/ros2_ws
-source /opt/ros/humble/setup.bash
 source install/setup.bash
 
 ros2 launch gazebo_classic_sim classic_rgbd_sim.launch.py

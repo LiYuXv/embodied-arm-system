@@ -37,7 +37,6 @@ needed.
 
 ```bash
 cd <spike-checkout>/ros2_ws
-source /opt/ros/humble/setup.bash
 colcon build --base-paths src ../third_party/EDULITE_A3/el_a3_ros/el_a3_description \
   --packages-select embodied_interfaces embodied_perception el_a3_description gazebo_classic_gripper_mimic gazebo_classic_sim --symlink-install
 source install/setup.bash
