@@ -4,13 +4,11 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (
-    IncludeLaunchDescription,
-    SetEnvironmentVariable,
-    TimerAction,
-)
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.event_handlers import OnProcessExit
+from launch.actions import RegisterEventHandler
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, FindExecutable, PathJoinSubstitution
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -31,7 +29,7 @@ def generate_launch_description() -> LaunchDescription:
         [
             FindPackageShare("embodied_simulation"),
             "worlds",
-            "sorting_workcell.sdf",
+            LaunchConfiguration("world_file"),
         ]
     )
 
@@ -70,6 +68,8 @@ def generate_launch_description() -> LaunchDescription:
             )
         ),
         launch_arguments={
+            # Gazebo starts paused unless -r is supplied. It is resumed only
+            # after the position controllers are active below.
             "gz_args": ["-v 1 ", world_path],
         }.items(),
     )
@@ -85,6 +85,8 @@ def generate_launch_description() -> LaunchDescription:
                     "el_a3_sim.urdf.xacro",
                 ]
             ),
+            " camera_mode:=",
+            LaunchConfiguration("camera_mode"),
         ]
     )
 
@@ -122,15 +124,87 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
     )
 
+    controllers_file = PathJoinSubstitution(
+        [FindPackageShare("embodied_simulation"), "config", "gazebo_controllers.yaml"]
+    )
+    load_controllers = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[
+            "joint_state_broadcaster",
+            "arm_controller",
+            "gripper_controller",
+            "--activate-as-group",
+            "--inactive",
+            "--param-file",
+            controllers_file,
+            "--controller-manager-timeout",
+            "30",
+        ],
+        output="screen",
+    )
+    activate_controllers = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[
+            "joint_state_broadcaster",
+            "arm_controller",
+            "gripper_controller",
+            "--activate-as-group",
+            "--param-file",
+            controllers_file,
+            "--controller-manager-timeout",
+            "30",
+            "--switch-timeout",
+            "30",
+        ],
+        output="screen",
+    )
+    resume_simulation = ExecuteProcess(
+        cmd=[
+            "ign",
+            "service",
+            "--service",
+            ["/world/", LaunchConfiguration("world_name"), "/control"],
+            "--reqtype",
+            "ignition.msgs.WorldControl",
+            "--reptype",
+            "ignition.msgs.Boolean",
+            "--timeout",
+            "3000",
+            "--req",
+            "pause: false",
+        ],
+        output="screen",
+    )
+
     return LaunchDescription(
         [
+            DeclareLaunchArgument("world_file", default_value="sorting_workcell.sdf"),
+            DeclareLaunchArgument("world_name", default_value="sorting_workcell"),
+            DeclareLaunchArgument("camera_mode", default_value="none"),
             set_ign_resource_path,
             set_gz_resource_path,
             gazebo,
             robot_state_publisher,
-            TimerAction(
-                period=3.0,
-                actions=[spawn_robot],
+            spawn_robot,
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=spawn_robot,
+                    on_exit=[load_controllers],
+                )
+            ),
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=load_controllers,
+                    on_exit=[resume_simulation],
+                )
+            ),
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=resume_simulation,
+                    on_exit=[activate_controllers],
+                )
             ),
         ]
     )
