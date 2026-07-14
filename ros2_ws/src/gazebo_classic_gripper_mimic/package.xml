@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>gazebo_classic_gripper_mimic</name>
+  <version>0.1.0</version>
+  <description>Offset-aware visible jaw mimic plugin for EDULITE A3 in Gazebo Classic.</description>
+  <maintainer email="liyu@example.com">liyu</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>gazebo_dev</build_depend>
+  <exec_depend>gazebo</exec_depend>
+
+  <export><build_type>ament_cmake</build_type></export>
+</package>

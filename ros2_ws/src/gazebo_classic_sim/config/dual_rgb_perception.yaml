@@ -1,0 +1,10 @@
+perception_node:
+  ros__parameters:
+    use_sim_time: true
+    rgb_topic: /camera_main/image_raw
+    aux_rgb_topic: /camera_aux/image_raw
+    depth_topic: ""
+    camera_info_topic: /camera_main/camera_info
+    camera_frame: camera_main_link
+    require_depth: false
+    require_aux_rgb: true
