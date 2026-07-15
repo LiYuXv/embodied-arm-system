@@ -106,7 +106,7 @@ def add_aux_rgb_camera(robot):
         camera_joint,
         "origin",
         xyz="0.0 0.16 -0.04",
-        rpy="3.141593 0.667072 -1.570796",
+        rpy="3.141593 0.50 -1.570796",
     )
 
     gazebo = etree.SubElement(robot, "gazebo", reference="camera_aux_link")
