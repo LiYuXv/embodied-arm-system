@@ -131,6 +131,47 @@ def add_aux_rgb_camera(robot):
     etree.SubElement(plugin, "frame_name").text = "camera_aux_link"
 
 
+def add_main_rgb_camera(robot):
+    """Add a world-fixed (base-mounted) overhead RGB camera.
+
+    ``base_link`` is rigidly mounted in the Classic workcell, so this link is
+    global while still being part of the spawned robot model.  Loading it from
+    the robot avoids the Classic world-plugin startup race that can leave a
+    standalone camera without a ROS publisher.
+    """
+    camera_link = etree.SubElement(robot, "link", name="camera_main_link")
+    visual = etree.SubElement(camera_link, "visual")
+    geometry = etree.SubElement(visual, "geometry")
+    etree.SubElement(geometry, "box", size="0.090 0.060 0.050")
+    material = etree.SubElement(visual, "material", name="matte_black")
+    etree.SubElement(material, "color", rgba="0.03 0.03 0.03 1")
+    camera_joint = etree.SubElement(robot, "joint", name="camera_main_fixed_joint", type="fixed")
+    etree.SubElement(camera_joint, "parent", link="base_link")
+    etree.SubElement(camera_joint, "child", link="camera_main_link")
+    # Compensate the pi spawn yaw: this places the camera at the front-side
+    # overhead corner of the workbench and points it toward the operation area.
+    etree.SubElement(camera_joint, "origin", xyz="-0.73 1.05 0.93", rpy="0 0.55 -1.57")
+    gazebo = etree.SubElement(robot, "gazebo", reference="camera_main_link")
+    sensor = etree.SubElement(gazebo, "sensor", name="camera_main_sensor", type="camera")
+    etree.SubElement(sensor, "always_on").text = "true"
+    etree.SubElement(sensor, "update_rate").text = "30"
+    etree.SubElement(sensor, "visualize").text = "false"
+    camera = etree.SubElement(sensor, "camera")
+    etree.SubElement(camera, "horizontal_fov").text = "1.047"
+    image = etree.SubElement(camera, "image")
+    etree.SubElement(image, "width").text = "640"
+    etree.SubElement(image, "height").text = "480"
+    etree.SubElement(image, "format").text = "R8G8B8"
+    clip = etree.SubElement(camera, "clip")
+    etree.SubElement(clip, "near").text = "0.10"
+    etree.SubElement(clip, "far").text = "5.0"
+    plugin = etree.SubElement(sensor, "plugin", name="camera_main_ros", filename="libgazebo_ros_camera.so")
+    ros = etree.SubElement(plugin, "ros")
+    etree.SubElement(ros, "namespace").text = "/"
+    etree.SubElement(plugin, "camera_name").text = "camera_main"
+    etree.SubElement(plugin, "frame_name").text = "camera_main_link"
+
+
 def add_classic_materials(robot):
     """Restore the yellow arm and dark gripper appearance in Classic."""
     for link_name in YELLOW_ARM_LINKS:
@@ -170,6 +211,7 @@ def main():
         add_rgbd_camera(robot)
     elif args.camera_mode == "aux_rgb":
         add_aux_rgb_camera(robot)
+        add_main_rgb_camera(robot)
 
     world_link = etree.Element("link", name="world")
     robot.insert(0, world_link)

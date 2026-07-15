@@ -237,6 +237,8 @@ ros2 launch embodied_bringup system.launch.py \
 | `use_rviz` | `true`、`false` | 是否启动 RViz |
 | `open_language_terminal` | `true`、`false` | 是否打开终端语言节点 |
 | `gazebo_gui` | `true`、`false` | 是否显示 Gazebo Classic 客户端 |
+| `gazebo_master_uri` | URI | 独立 Classic master（默认 `http://127.0.0.1:11346`），避免遗留实例冲突 |
+| `show_camera_views` | `true`、`false` | 双 RGB 仿真时自动打开两路 `rqt_image_view` |
 
 `dual_usb` 路线还支持 `camera_main_device`、`camera_aux_device`、`camera_main_frame_id` 和 `camera_aux_frame_id`；默认设备使用稳定的 `/dev/v4l/by-path/...` 路径。Gazebo 后端的 Classic 启动负责 `robot_state_publisher`、`controller_manager` 和感知节点；一键启动仅额外启动 MoveIt 规划层，避免重复节点。
 
@@ -251,7 +253,7 @@ ros2 launch embodied_bringup system.launch.py \
 把红色方块抓到红色位置
 ```
 
-抓放位姿、工作台高度及主相机外参保存在 `embodied_task/config/pick_place.yaml`。算法先在 BGR 图像上转换 HSV，以两个红色阈值区间分割并形态学去噪；按轮廓面积区分方块和目标区域，再由像素中心、`CameraInfo` 内参和已标定的相机到 `base_link` 外参构建射线，与工作台平面求交得到机器人基坐标。Gazebo 中若接触抓取不稳定，释放步骤会调用 `/gazebo/set_model_state` 将 `red_cube` 放入红色目标区，保证演示结果可重复。
+抓放位姿、工作台高度及主相机外参保存在 `embodied_task/config/pick_place.yaml`。算法先在 BGR 图像上转换 HSV，以两个红色阈值区间分割并形态学去噪；按轮廓面积区分方块和目标区域，再由像素中心、`CameraInfo` 内参和已标定的相机到 `base_link` 外参构建射线，与工作台平面求交得到机器人基坐标。默认使用已验证的 YAML 标定位姿；启用 `use_camera_localization` 后才以有效视觉结果更新位姿。任务不会调用 `/gazebo/set_model_state` 或以其他方式伪造抓放结果。
 
 抓放任务将任一必需位姿的 IK 或规划执行失败明确报告为任务失败，不会以命名位姿替代失败段。
 

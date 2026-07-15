@@ -76,9 +76,18 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
     actions = [
         DeclareLaunchArgument("verbose", default_value="false"),
         DeclareLaunchArgument("gazebo_gui", default_value="true"),
+        DeclareLaunchArgument(
+            "gazebo_master_uri",
+            default_value="http://127.0.0.1:11346",
+            description="Dedicated Gazebo Classic master URI for this system instance.",
+        ),
         SetEnvironmentVariable("GAZEBO_PLUGIN_PATH", ":".join(filter(None, plugin_dirs))),
         SetEnvironmentVariable("GAZEBO_MODEL_PATH", ":".join(filter(None, model_dirs))),
         SetEnvironmentVariable("GAZEBO_MODEL_DATABASE_URI", ""),
+        SetEnvironmentVariable(
+            "GAZEBO_MASTER_URI",
+            LaunchConfiguration("gazebo_master_uri"),
+        ),
         gazebo,
         robot_state_publisher,
         spawn_robot,

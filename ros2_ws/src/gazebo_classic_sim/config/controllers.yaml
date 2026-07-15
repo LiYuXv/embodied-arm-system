@@ -24,7 +24,9 @@ arm_controller:
     action_monitor_rate: 20.0
     constraints:
       stopped_velocity_tolerance: 0.03
-      goal_time: 0.5
+      # Gazebo needs additional settling time after the trajectory's nominal
+      # end when the arm moves through the elevated manipulation workspace.
+      goal_time: 2.0
       L1_joint: {goal: 0.03}
       L2_joint: {goal: 0.03}
       L3_joint: {goal: 0.03}

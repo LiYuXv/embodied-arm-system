@@ -13,8 +13,6 @@ from cv_bridge import CvBridge
 from embodied_interfaces.action import MoveToPose
 from embodied_interfaces.msg import TaskCommand
 from embodied_interfaces.srv import MoveNamedPose, SetGripper
-from gazebo_msgs.msg import ModelState
-from gazebo_msgs.srv import SetModelState
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -38,13 +36,10 @@ class TaskManagerNode(Node):
     def __init__(self) -> None:
         super().__init__("task_manager_node")
         self.declare_parameter("backend", "mock")
-        self.declare_parameter("use_gazebo_attachment", True)
         self.declare_parameter("camera_main_image_topic", "/camera_main/image_raw")
         self.declare_parameter("camera_main_info_topic", "/camera_main/camera_info")
+        self.declare_parameter("use_camera_localization", False)
         self.backend = str(self.get_parameter("backend").value).lower()
-        self.use_gazebo_attachment = bool(
-            self.get_parameter("use_gazebo_attachment").value
-        )
         self.pick_place_config = self._load_pick_place_config()
         self.bridge = CvBridge()
         self.latest_image: Optional[Image] = None
@@ -80,10 +75,6 @@ class TaskManagerNode(Node):
             self,
             MoveToPose,
             "/motion/move_to_pose",
-        )
-        self.set_model_state_client = self.create_client(
-            SetModelState,
-            "/gazebo/set_model_state",
         )
         self.task_in_progress = False
         self.current_command_id = ""
@@ -207,9 +198,11 @@ class TaskManagerNode(Node):
         object_pose = dict(objects[target_name])
         region_pose = dict(regions[region_name])
         detected = self._detect_red_object_and_region(object_pose, region_pose)
-        if detected:
+        if detected and bool(self.get_parameter("use_camera_localization").value):
             object_pose, region_pose = detected
             self.get_logger().info("已使用 HSV 红色分割和标定外参更新抓放坐标")
+        elif detected:
+            self.get_logger().info("HSV 红色分割已检测到方块和区域；使用已验证 YAML 位姿执行")
         else:
             self.get_logger().warning("未获得有效相机识别，使用 YAML 标定抓放位姿")
 
@@ -237,7 +230,6 @@ class TaskManagerNode(Node):
             ),
             TaskStep("pose", region_pose, "下移到红色区域"),
             TaskStep("gripper", "open", "打开夹爪释放"),
-            TaskStep("release_sim_object", region_pose, "在 Gazebo 中解除附着并放置方块"),
             TaskStep(
                 "pose",
                 region_pose["approach_position"],
@@ -261,7 +253,7 @@ class TaskManagerNode(Node):
         elif step.operation == "pose":
             self._call_pick_place_pose(step.value)
         else:
-            self._release_gazebo_object(step.value)
+            self._abort_pick_place(f"不支持的抓放步骤：{step.operation}")
 
     def _call_pick_place_gripper(self, position_name: str) -> None:
         if not self.gripper_client.wait_for_service(2.0):
@@ -324,32 +316,6 @@ class TaskManagerNode(Node):
         except Exception as error:
             self._abort_pick_place(f"抓放位姿执行异常：{error}")
             return
-        self._execute_next_pick_place_step()
-
-    def _release_gazebo_object(self, region_pose: object) -> None:
-        """Use a deterministic Gazebo state update when contact grasp slips."""
-        if self.backend != "gazebo" or not self.use_gazebo_attachment:
-            self._execute_next_pick_place_step()
-            return
-        if not self.set_model_state_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warning("Gazebo set_model_state 不可用，保留物理接触结果")
-            self._execute_next_pick_place_step()
-            return
-        request = SetModelState.Request()
-        request.model_state = ModelState()
-        request.model_state.model_name = "red_cube"
-        request.model_state.reference_frame = "world"
-        request.model_state.pose = self._pose_stamped(region_pose).pose
-        future = self.set_model_state_client.call_async(request)
-        future.add_done_callback(self._handle_gazebo_release_result)
-
-    def _handle_gazebo_release_result(self, future: Future) -> None:
-        try:
-            response = future.result()
-            if response is None or not response.success:
-                self.get_logger().warning("Gazebo 方块放置状态更新未成功")
-        except Exception as error:
-            self.get_logger().warning(f"Gazebo 方块放置状态更新异常：{error}")
         self._execute_next_pick_place_step()
 
     def _abort_pick_place(self, reason: str) -> None:

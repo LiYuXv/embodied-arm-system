@@ -2,8 +2,8 @@
 # used with CameraInfo to ray-cast HSV contour centres onto the tabletop.
 objects:
   red_cube:
-    # Measured against the actual pre_pick TCP transform.  Coordinates are
-    # expressed in base_link, not world (the robot spawn yaw is pi).
+    # The supported Gazebo cube pose converted through the robot spawn
+    # (-0.08, 0.0, 0.83, yaw=pi), expressed in base_link.
     position: [-0.110394, 0.047445, 0.356903]
     approach_position:
       position: [-0.110394, 0.047445, 0.406903]
@@ -11,7 +11,7 @@ objects:
     orientation_xyzw: [0.706939, 0.499990, 0.000805, 0.500246]
 regions:
   red_target_zone:
-    position: [0.069606, 0.047445, 0.396903]
+    position: [0.069606, 0.047445, 0.356903]
     approach_position:
       position: [0.069606, 0.047445, 0.406903]
       orientation_xyzw: [0.706939, 0.499990, 0.000805, 0.500246]

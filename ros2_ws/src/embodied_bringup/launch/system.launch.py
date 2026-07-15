@@ -135,7 +135,10 @@ def _select_backend(context):
     actions = [_include(
         "gazebo_classic_sim",
         gazebo_launch,
-        {"gazebo_gui": LaunchConfiguration("gazebo_gui")},
+        {
+            "gazebo_gui": LaunchConfiguration("gazebo_gui"),
+            "gazebo_master_uri": LaunchConfiguration("gazebo_master_uri"),
+        },
     )]
     if camera_source == "dual_usb":
         actions.append(_include(
@@ -193,7 +196,6 @@ def _launch_runtime_nodes(context):
         name="task_manager_node",
         parameters=[{
             "backend": LaunchConfiguration("backend"),
-            "use_gazebo_attachment": True,
             "use_sim_time": use_sim_time,
         }],
         output="screen",
@@ -202,6 +204,33 @@ def _launch_runtime_nodes(context):
     return [
         TimerAction(period=6.0, actions=[motion_executor]),
         TimerAction(period=7.0, actions=[task_manager]),
+    ]
+
+
+def _launch_camera_views(context):
+    """Open both simulated RGB feeds when a desktop session is available."""
+    if (
+        LaunchConfiguration("backend").perform(context).strip().lower() != "gazebo"
+        or LaunchConfiguration("camera_source").perform(context).strip().lower()
+        != "dual_rgb_sim"
+        or not _as_bool(context, "show_camera_views")
+    ):
+        return []
+    return [
+        Node(
+            package="rqt_image_view",
+            executable="rqt_image_view",
+            name="camera_main_view",
+            arguments=["/camera_main/image_raw"],
+            output="screen",
+        ),
+        Node(
+            package="rqt_image_view",
+            executable="rqt_image_view",
+            name="camera_aux_view",
+            arguments=["/camera_aux/image_raw"],
+            output="screen",
+        ),
     ]
 
 
@@ -232,6 +261,16 @@ def generate_launch_description():
             "gazebo_gui",
             default_value="true",
             description="Show Gazebo Classic client when using backend=gazebo.",
+        ),
+        DeclareLaunchArgument(
+            "gazebo_master_uri",
+            default_value="http://127.0.0.1:11346",
+            description="Dedicated Gazebo Classic master URI.",
+        ),
+        DeclareLaunchArgument(
+            "show_camera_views",
+            default_value="true",
+            description="Open rqt_image_view windows for both dual-RGB feeds.",
         ),
         DeclareLaunchArgument(
             "camera_main_device",
@@ -265,5 +304,9 @@ def generate_launch_description():
         TimerAction(
             period=8.0,
             actions=[OpaqueFunction(function=_launch_language_node)],
+        ),
+        TimerAction(
+            period=9.0,
+            actions=[OpaqueFunction(function=_launch_camera_views)],
         ),
     ])
