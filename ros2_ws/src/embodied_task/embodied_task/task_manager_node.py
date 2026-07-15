@@ -216,18 +216,33 @@ class TaskManagerNode(Node):
         self.task_in_progress = True
         self.current_command_id = command_id
         self.current_region_pose = region_pose
-        clear_height = float(self.pick_place_config["motion"]["clearance_m"])
         self.pending_steps = [
             TaskStep("gripper", "open", "打开夹爪"),
-            TaskStep("pose", self._offset_pose(object_pose, clear_height), "移动到方块上方"),
+            TaskStep(
+                "pose",
+                object_pose["approach_position"],
+                "移动到方块上方",
+            ),
             TaskStep("pose", object_pose, "下移到方块"),
             TaskStep("gripper", "close", "关闭夹爪"),
-            TaskStep("pose", self._offset_pose(object_pose, clear_height), "抬起方块"),
-            TaskStep("pose", self._offset_pose(region_pose, clear_height), "移动到红色区域上方"),
+            TaskStep(
+                "pose",
+                object_pose["approach_position"],
+                "抬起方块",
+            ),
+            TaskStep(
+                "pose",
+                region_pose["approach_position"],
+                "移动到红色区域上方",
+            ),
             TaskStep("pose", region_pose, "下移到红色区域"),
             TaskStep("gripper", "open", "打开夹爪释放"),
             TaskStep("release_sim_object", region_pose, "在 Gazebo 中解除附着并放置方块"),
-            TaskStep("pose", self._offset_pose(region_pose, clear_height), "抬起完成"),
+            TaskStep(
+                "pose",
+                region_pose["approach_position"],
+                "抬起完成",
+            ),
         ]
         self.get_logger().info("开始异步抓放流程：打开、抓取、抬起、放置、抬起")
         self._execute_next_pick_place_step()
@@ -301,46 +316,13 @@ class TaskManagerNode(Node):
             result_response = future.result()
             result = result_response.result if result_response is not None else None
             if result is None or not result.success:
-                reason = (
+                self._abort_pick_place(
                     result.message if result is not None
                     else "位姿动作没有返回结果"
                 )
-                if self.backend == "gazebo":
-                    self.get_logger().warning(
-                        "Gazebo 位姿 IK 不可用，降级到已验证的 "
-                        f"pre_pick 命名位姿：{reason}"
-                    )
-                    self._call_gazebo_pose_fallback()
-                    return
-                self._abort_pick_place(reason)
                 return
         except Exception as error:
             self._abort_pick_place(f"抓放位姿执行异常：{error}")
-            return
-        self._execute_next_pick_place_step()
-
-    def _call_gazebo_pose_fallback(self) -> None:
-        """Keep the Gazebo demonstration deterministic when absolute IK fails."""
-        if not self.named_pose_client.wait_for_service(2.0):
-            self._abort_pick_place("Gazebo IK 回退时命名位姿服务不可用")
-            return
-        request = MoveNamedPose.Request()
-        request.pose_name = "pre_pick"
-        future = self.named_pose_client.call_async(request)
-        future.add_done_callback(self._handle_gazebo_pose_fallback)
-
-    def _handle_gazebo_pose_fallback(self, future: Future) -> None:
-        """Continue the sequence after a successful named-pose fallback."""
-        try:
-            response = future.result()
-            if response is None or not response.success:
-                self._abort_pick_place(
-                    response.message if response is not None
-                    else "命名位姿回退没有返回结果"
-                )
-                return
-        except Exception as error:
-            self._abort_pick_place(f"命名位姿回退异常：{error}")
             return
         self._execute_next_pick_place_step()
 
@@ -473,16 +455,6 @@ class TaskManagerNode(Node):
             [0.0, 0.0, 1.0],
         ])
         return rotation_z @ rotation_y @ rotation_x
-
-    @staticmethod
-    def _offset_pose(pose: Dict[str, object], offset: float) -> Dict[str, object]:
-        """Return a copy of a pose raised above the work surface."""
-        raised = {
-            "position": list(pose["position"]),
-            "orientation_xyzw": list(pose["orientation_xyzw"]),
-        }
-        raised["position"][2] += offset
-        return raised
 
     @staticmethod
     def _pose_stamped(pose_config: object) -> PoseStamped:

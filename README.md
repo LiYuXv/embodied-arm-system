@@ -253,7 +253,7 @@ ros2 launch embodied_bringup system.launch.py \
 
 抓放位姿、工作台高度及主相机外参保存在 `embodied_task/config/pick_place.yaml`。算法先在 BGR 图像上转换 HSV，以两个红色阈值区间分割并形态学去噪；按轮廓面积区分方块和目标区域，再由像素中心、`CameraInfo` 内参和已标定的相机到 `base_link` 外参构建射线，与工作台平面求交得到机器人基坐标。Gazebo 中若接触抓取不稳定，释放步骤会调用 `/gazebo/set_model_state` 将 `red_cube` 放入红色目标区，保证演示结果可重复。
 
-若当前供应商 MoveIt 配置的绝对末端 IK 拒绝某个 YAML 位姿，Gazebo 演示会记录该失败并降级到已验证的 `pre_pick` 命名位姿，继续执行夹爪时序和最终确定性放置；mock 后端不会隐藏此类规划失败。
+抓放任务将任一必需位姿的 IK 或规划执行失败明确报告为任务失败，不会以命名位姿替代失败段。
 
 输入 `exit` 或 `quit` 可退出语言交互节点。
 
