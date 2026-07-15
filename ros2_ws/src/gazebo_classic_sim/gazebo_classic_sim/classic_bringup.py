@@ -4,7 +4,8 @@ import os
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable, TimerAction
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration
@@ -45,7 +46,10 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
         launch_arguments={
             "world": world,
             "verbose": LaunchConfiguration("verbose"),
-            "gui": LaunchConfiguration("gazebo_gui"),
+            # Start the client explicitly after gzserver has loaded the SDF;
+            # starting both simultaneously leaves the Classic GUI stuck on
+            # "Preparing your world" on slower desktops.
+            "gui": "false",
         }.items(),
     )
     robot_state_publisher = Node(
@@ -89,6 +93,11 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
             LaunchConfiguration("gazebo_master_uri"),
         ),
         gazebo,
+        TimerAction(
+            period=4.0,
+            actions=[ExecuteProcess(cmd=["gzclient"], output="screen")],
+            condition=IfCondition(LaunchConfiguration("gazebo_gui")),
+        ),
         robot_state_publisher,
         spawn_robot,
         RegisterEventHandler(OnProcessExit(target_action=spawn_robot, on_exit=[spawn_controllers])),

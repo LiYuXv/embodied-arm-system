@@ -83,7 +83,7 @@ def add_rgbd_camera(robot):
 
 
 def add_aux_rgb_camera(robot):
-    """Attach the auxiliary RGB sensor to the gripper base for dual RGB."""
+    """Attach the auxiliary RGB sensor above the fixed final wrist link."""
     camera_link = etree.SubElement(robot, "link", name="camera_aux_link")
     visual = etree.SubElement(camera_link, "visual")
     geometry = etree.SubElement(visual, "geometry")
@@ -96,16 +96,21 @@ def add_aux_rgb_camera(robot):
         name="camera_aux_fixed_joint",
         type="fixed",
     )
-    etree.SubElement(camera_joint, "parent", link="gripper_base_link")
+    etree.SubElement(camera_joint, "parent", link="l5_l6_urdf_asm")
     etree.SubElement(camera_joint, "child", link="camera_aux_link")
+    # It is on the jaw centre line, behind and above the finger tips.  The
+    # rotation is the look-at result from (0,.16,-.04) to (0,0,-.166), so the
+    # wrist body is behind the image plane rather than blocking the gap.  Roll
+    # pi makes the image upright while keeping its optical axis unchanged.
     etree.SubElement(
         camera_joint,
         "origin",
-        xyz="0.055 0.0 0.045",
-        rpy="0 1.5708 0",
+        xyz="0.0 0.16 -0.04",
+        rpy="3.141593 0.667072 -1.570796",
     )
 
     gazebo = etree.SubElement(robot, "gazebo", reference="camera_aux_link")
+    etree.SubElement(gazebo, "material").text = "Gazebo/DarkGrey"
     sensor = etree.SubElement(gazebo, "sensor", name="camera_aux_sensor", type="camera")
     etree.SubElement(sensor, "always_on").text = "true"
     etree.SubElement(sensor, "update_rate").text = "30"
@@ -148,9 +153,16 @@ def add_main_rgb_camera(robot):
     camera_joint = etree.SubElement(robot, "joint", name="camera_main_fixed_joint", type="fixed")
     etree.SubElement(camera_joint, "parent", link="base_link")
     etree.SubElement(camera_joint, "child", link="camera_main_link")
-    # Compensate the pi spawn yaw: this places the camera at the front-side
-    # overhead corner of the workbench and points it toward the operation area.
-    etree.SubElement(camera_joint, "origin", xyz="-0.73 1.05 0.93", rpy="0 0.55 -1.57")
+    # Spawn yaw is pi.  The translation is Rz(-pi) * (camera_world - base),
+    # with camera_world=(0.65,-1.05,1.75).  The rpy is the explicit look-at
+    # rotation for camera +X toward deck centre=(0.08,0,1.16), transformed
+    # from world into base_link: Rz(-pi) * R_look_at.
+    etree.SubElement(
+        camera_joint,
+        "origin",
+        xyz="-0.73 1.05 0.93",
+        rpy="0 0.458701 -1.073454",
+    )
     gazebo = etree.SubElement(robot, "gazebo", reference="camera_main_link")
     sensor = etree.SubElement(gazebo, "sensor", name="camera_main_sensor", type="camera")
     etree.SubElement(sensor, "always_on").text = "true"
@@ -211,7 +223,6 @@ def main():
         add_rgbd_camera(robot)
     elif args.camera_mode == "aux_rgb":
         add_aux_rgb_camera(robot)
-        add_main_rgb_camera(robot)
 
     world_link = etree.Element("link", name="world")
     robot.insert(0, world_link)
