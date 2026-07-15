@@ -1,0 +1,23 @@
+# Calibrated fallback positions in base_link.  The fixed-camera calibration is
+# used with CameraInfo to ray-cast HSV contour centres onto the tabletop.
+objects:
+  red_cube:
+    # The robot is spawned at world (-0.08, 0.0, 0.83), so these
+    # table-top coordinates are expressed relative to base_link.
+    position: [0.51, -0.16, 0.06]
+    orientation_xyzw: [0.0, 1.0, 0.0, 0.0]
+regions:
+  red_target_zone:
+    position: [0.63, -0.27, 0.06]
+    orientation_xyzw: [0.0, 1.0, 0.0, 0.0]
+motion:
+  clearance_m: 0.12
+  velocity_scale: 0.12
+  acceleration_scale: 0.12
+camera_main_calibration:
+  # Gazebo camera_main pose expressed from the spawned base_link origin.
+  # rotation_rpy has the camera optical-axis convention applied during
+  # calibration; update it from a real camera hand-eye calibration as needed.
+  translation_base_m: [1.33, -1.15, 0.52]
+  rotation_rpy: [0.0, 0.45, 2.38]
+  table_plane_z_m: 0.03

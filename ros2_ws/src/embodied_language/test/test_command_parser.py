@@ -64,6 +64,17 @@ def test_parse_gripper_commands(
     assert result.target == expected_target
 
 
+def test_parse_red_cube_pick_place_command(
+    parser: CommandParser,
+) -> None:
+    result = parser.parse("把红色方块抓到红色位置")
+
+    assert result is not None
+    assert result.action == "pick_place"
+    assert result.target == "red_cube"
+    assert result.target_region == "red_target_zone"
+
+
 @pytest.mark.parametrize(
     "text",
     [

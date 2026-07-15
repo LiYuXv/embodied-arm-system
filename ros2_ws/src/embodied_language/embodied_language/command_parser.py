@@ -11,6 +11,7 @@ class ParsedCommand:
     raw_text: str
     action: str
     target: str
+    target_region: str = ""
 
 
 class CommandParser:
@@ -62,6 +63,17 @@ class CommandParser:
 
     _IGNORED_CHARACTERS = "，。！？!?、"
 
+    _PICK_PLACE_RULES = {
+        "把红色方块抓到红色位置": (
+            "red_cube",
+            "red_target_zone",
+        ),
+        "将红色方块放到红色位置": (
+            "red_cube",
+            "red_target_zone",
+        ),
+    }
+
     @classmethod
     def normalize(cls, text: str) -> str:
         """移除空白和常见中文标点."""
@@ -78,6 +90,17 @@ class CommandParser:
 
         if not normalized_text:
             return None
+
+        for phrase, (target, target_region) in (
+            self._PICK_PLACE_RULES.items()
+        ):
+            if normalized_text == self.normalize(phrase):
+                return ParsedCommand(
+                    raw_text=text,
+                    action="pick_place",
+                    target=target,
+                    target_region=target_region,
+                )
 
         for target, phrases in self._NAMED_POSE_RULES.items():
             for phrase in phrases:

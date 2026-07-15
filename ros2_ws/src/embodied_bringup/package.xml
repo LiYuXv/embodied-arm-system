@@ -28,6 +28,10 @@
   <exec_depend>embodied_perception</exec_depend>
   <exec_depend>embodied_language</exec_depend>
   <exec_depend>el_a3_moveit_config</exec_depend>
+  <exec_depend>el_a3_description</exec_depend>
+  <exec_depend>gazebo_classic_sim</exec_depend>
+  <exec_depend>moveit_ros_move_group</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

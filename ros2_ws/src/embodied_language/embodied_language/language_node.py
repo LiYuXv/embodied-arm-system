@@ -97,6 +97,7 @@ class LanguageNode(Node):
             raw_text=parsed_command.raw_text,
             action=parsed_command.action,
             target=parsed_command.target,
+            target_region=parsed_command.target_region,
         )
 
         self.command_publisher.publish(task_command)
@@ -105,6 +106,7 @@ class LanguageNode(Node):
             "任务命令已发布："
             f"action={task_command.action}, "
             f"target={task_command.target}, "
+            f"target_region={task_command.target_region}, "
             f"command_id={task_command.command_id}"
         )
 
@@ -113,6 +115,7 @@ class LanguageNode(Node):
         raw_text: str,
         action: str,
         target: str,
+        target_region: str,
     ) -> TaskCommand:
         """构造统一任务命令消息."""
         message = TaskCommand()
@@ -127,7 +130,7 @@ class LanguageNode(Node):
 
         message.action = action
         message.target = target
-        message.target_region = ""
+        message.target_region = target_region
 
         message.source = "terminal_rules"
 

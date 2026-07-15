@@ -42,7 +42,11 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory("gazebo_ros"), "launch", "gazebo.launch.py")
         ),
-        launch_arguments={"world": world, "verbose": LaunchConfiguration("verbose")}.items(),
+        launch_arguments={
+            "world": world,
+            "verbose": LaunchConfiguration("verbose"),
+            "gui": LaunchConfiguration("gazebo_gui"),
+        }.items(),
     )
     robot_state_publisher = Node(
         package="robot_state_publisher",
@@ -71,6 +75,7 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
     )
     actions = [
         DeclareLaunchArgument("verbose", default_value="false"),
+        DeclareLaunchArgument("gazebo_gui", default_value="true"),
         SetEnvironmentVariable("GAZEBO_PLUGIN_PATH", ":".join(filter(None, plugin_dirs))),
         SetEnvironmentVariable("GAZEBO_MODEL_PATH", ":".join(filter(None, model_dirs))),
         SetEnvironmentVariable("GAZEBO_MODEL_DATABASE_URI", ""),

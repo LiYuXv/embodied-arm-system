@@ -82,6 +82,55 @@ def add_rgbd_camera(robot):
     etree.SubElement(plugin, "max_depth").text = "4.0"
 
 
+def add_aux_rgb_camera(robot):
+    """Attach the auxiliary RGB sensor to the gripper base for dual RGB."""
+    camera_link = etree.SubElement(robot, "link", name="camera_aux_link")
+    visual = etree.SubElement(camera_link, "visual")
+    geometry = etree.SubElement(visual, "geometry")
+    etree.SubElement(geometry, "box", size="0.040 0.030 0.020")
+    material = etree.SubElement(visual, "material", name="matte_black")
+    etree.SubElement(material, "color", rgba="0.04 0.04 0.04 1")
+    camera_joint = etree.SubElement(
+        robot,
+        "joint",
+        name="camera_aux_fixed_joint",
+        type="fixed",
+    )
+    etree.SubElement(camera_joint, "parent", link="gripper_base_link")
+    etree.SubElement(camera_joint, "child", link="camera_aux_link")
+    etree.SubElement(
+        camera_joint,
+        "origin",
+        xyz="0.055 0.0 0.045",
+        rpy="0 1.5708 0",
+    )
+
+    gazebo = etree.SubElement(robot, "gazebo", reference="camera_aux_link")
+    sensor = etree.SubElement(gazebo, "sensor", name="camera_aux_sensor", type="camera")
+    etree.SubElement(sensor, "always_on").text = "true"
+    etree.SubElement(sensor, "update_rate").text = "30"
+    etree.SubElement(sensor, "visualize").text = "false"
+    camera = etree.SubElement(sensor, "camera")
+    etree.SubElement(camera, "horizontal_fov").text = "1.047"
+    image = etree.SubElement(camera, "image")
+    etree.SubElement(image, "width").text = "640"
+    etree.SubElement(image, "height").text = "480"
+    etree.SubElement(image, "format").text = "R8G8B8"
+    clip = etree.SubElement(camera, "clip")
+    etree.SubElement(clip, "near").text = "0.10"
+    etree.SubElement(clip, "far").text = "4.0"
+    plugin = etree.SubElement(
+        sensor,
+        "plugin",
+        name="camera_aux_ros",
+        filename="libgazebo_ros_camera.so",
+    )
+    ros = etree.SubElement(plugin, "ros")
+    etree.SubElement(ros, "namespace").text = "/"
+    etree.SubElement(plugin, "camera_name").text = "camera_aux"
+    etree.SubElement(plugin, "frame_name").text = "camera_aux_link"
+
+
 def add_classic_materials(robot):
     """Restore the yellow arm and dark gripper appearance in Classic."""
     for link_name in YELLOW_ARM_LINKS:
@@ -95,7 +144,11 @@ def add_classic_materials(robot):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--controllers", required=True)
-    parser.add_argument("--camera-mode", choices=("none", "rgbd"), default="none")
+    parser.add_argument(
+        "--camera-mode",
+        choices=("none", "rgbd", "aux_rgb"),
+        default="none",
+    )
     args = parser.parse_args()
 
     description_share = get_package_share_directory("el_a3_description")
@@ -115,6 +168,8 @@ def main():
 
     if args.camera_mode == "rgbd":
         add_rgbd_camera(robot)
+    elif args.camera_mode == "aux_rgb":
+        add_aux_rgb_camera(robot)
 
     world_link = etree.Element("link", name="world")
     robot.insert(0, world_link)
