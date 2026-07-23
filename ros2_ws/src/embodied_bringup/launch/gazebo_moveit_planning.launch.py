@@ -74,9 +74,19 @@ def generate_launch_description():
     trajectory_execution = {
         # Gazebo owns /controller_manager and controller activation.
         "moveit_manage_controllers": False,
-        "trajectory_execution.allowed_execution_duration_scaling": 1.2,
-        "trajectory_execution.allowed_goal_duration_margin": 0.5,
-        "trajectory_execution.allowed_start_tolerance": 0.01,
+        # Gazebo's position controller settles a little after the trajectory
+        # timestamp.  The former 1.2x + 0.5 s window canceled valid motions
+        # while the controller was still reporting its final point.
+        "trajectory_execution.allowed_execution_duration_scaling": 4.0,
+        # Keep MoveIt's watchdog longer than arm_controller's physical
+        # post-trajectory settling window.  Otherwise MoveIt cancels a valid
+        # damped Gazebo trajectory before the controller can report its
+        # collision-checked final state.
+        "trajectory_execution.allowed_goal_duration_margin": 13.0,
+        # Gazebo feedback is sampled while the previous point is settling;
+        # retain a realistic tolerance so chained pick/place motions are not
+        # rejected before they reach the controller.
+        "trajectory_execution.allowed_start_tolerance": 0.60,
     }
 
     move_group = Node(

@@ -197,6 +197,8 @@ def _launch_runtime_nodes(context):
         parameters=[{
             "backend": LaunchConfiguration("backend"),
             "use_sim_time": use_sim_time,
+            "allow_pose_fallback": False,
+            "gazebo_physics_validation": use_sim_time,
         }],
         output="screen",
         emulate_tty=True,

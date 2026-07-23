@@ -1,62 +1,42 @@
-"""Tests for the perception node input-state logic."""
+"""Unit tests for colour-independent overhead perception."""
 
-import rclpy
-from sensor_msgs.msg import CameraInfo, Image
+import math
 
-from embodied_perception.perception_node import PerceptionNode
+import cv2
+import numpy
+
+from embodied_perception.colour_localizer import (
+    detect_sorting_items,
+    project_pixel_to_table,
+)
 
 
-def test_camera_input_state_and_output_frame() -> None:
-    """Camera callbacks should update readiness and output frame."""
-    rclpy.init()
+def test_detects_red_and_blue_cubes_and_target_zones() -> None:
+    """Shape separates compact cubes from larger flat coloured zones."""
+    image = numpy.zeros((480, 640, 3), dtype=numpy.uint8)
+    cv2.rectangle(image, (80, 100), (120, 140), (0, 0, 255), -1)
+    cv2.rectangle(image, (220, 90), (340, 180), (0, 0, 255), -1)
+    cv2.rectangle(image, (80, 300), (120, 340), (255, 0, 0), -1)
+    cv2.rectangle(image, (220, 280), (340, 370), (255, 0, 0), -1)
 
-    node = PerceptionNode()
+    detections = detect_sorting_items(image, 100.0, 1000.0)
 
-    try:
-        assert node._camera_inputs_ready() is False
-        assert node._get_output_frame() == (
-            "camera_color_optical_frame"
-        )
+    assert set(detections) == {
+        "red_cube", "red_target_zone", "blue_cube", "blue_target_zone"
+    }
+    assert detections["red_cube"].pixel == (100.0, 120.0)
+    assert detections["blue_target_zone"].category == "target_zone"
 
-        rgb_message = Image()
-        rgb_message.header.frame_id = "test_camera_frame"
 
-        depth_message = Image()
-        depth_message.header.frame_id = "test_camera_frame"
+def test_projects_camera_info_pixel_onto_base_link_table_plane() -> None:
+    """The camera ray must produce a tabletop coordinate, not image pixels."""
+    point = project_pixel_to_table(
+        (320.0, 240.0),
+        [500.0, 0.0, 320.0, 0.0, 500.0, 240.0, 0.0, 0.0, 1.0],
+        [0.2, -0.1, 1.0],
+        [math.pi, 0.0, 0.0],
+        0.03,
+    )
 
-        camera_info_message = CameraInfo()
-        camera_info_message.header.frame_id = (
-            "test_camera_frame"
-        )
-
-        node._handle_rgb_image(rgb_message)
-
-        assert node.rgb_message_count == 1
-        assert node._camera_inputs_ready() is False
-        assert node._get_output_frame() == (
-            "test_camera_frame"
-        )
-
-        node._handle_depth_image(depth_message)
-
-        assert node.depth_message_count == 1
-        assert node._camera_inputs_ready() is False
-
-        node._handle_camera_info(camera_info_message)
-
-        assert node.camera_info_message_count == 1
-        assert node._camera_inputs_ready() is True
-
-        node.require_depth = False
-        node.require_aux_rgb = True
-        node.latest_aux_rgb = None
-        assert node._camera_inputs_ready() is False
-        node._handle_aux_rgb_image(Image())
-        assert node.aux_rgb_message_count == 1
-        assert node._camera_inputs_ready() is True
-
-    finally:
-        node.destroy_node()
-
-        if rclpy.ok():
-            rclpy.shutdown()
+    assert point is not None
+    assert numpy.allclose(point, (0.2, -0.1, 0.03))

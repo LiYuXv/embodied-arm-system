@@ -2,9 +2,26 @@ perception_node:
   ros__parameters:
     use_sim_time: true
     rgb_topic: /camera_main/image_raw
-    aux_rgb_topic: /camera_aux/image_raw
-    depth_topic: ""
     camera_info_topic: /camera_main/camera_info
-    camera_frame: camera_main_link
-    require_depth: false
-    require_aux_rgb: true
+    base_frame: base_link
+    publish_rate_hz: 5.0
+    min_cube_area_px: 120.0
+    # A 10 cm zone at the far side of the compact tray projects to roughly
+    # 500--900 px², while the 4.5 cm cubes remain below this threshold.
+    min_zone_area_px: 250.0
+    morphology_kernel_size: 5
+    # camera_main calibration fitted against the four workbench markers,
+    # expressed in base_link after the spawned robot's yaw=pi transform.
+    camera_translation_base_m: [-1.270244, 0.570603, 0.458473]
+    camera_rotation_rpy: [-2.084455, 0.169347, -2.344289]
+    # The operation surface is base_link z=0.2015 m.
+    table_plane_z_m: 0.2015
+    cube_top_plane_z_m: 0.2415
+    target_zone_plane_z_m: 0.2095
+    # Four-point calibration of the final staggered compact board.  Its source
+    # points are current camera_main contour centres and its destination
+    # points are the corresponding base_link measurements from the static
+    # scene; pixels remain the sole runtime input, rather than fixed poses.
+    image_to_base_homography: [0.011679817586, 0.038269035091, -6.164150801294,
+                               0.004489959975, -0.027546018363, 2.639551343672,
+                               0.000337339241, -0.041559291884, 1.0]

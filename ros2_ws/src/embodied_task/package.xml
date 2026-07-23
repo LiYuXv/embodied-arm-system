@@ -10,11 +10,10 @@
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
   <depend>embodied_interfaces</depend>
-  <depend>sensor_msgs</depend>
   <depend>gazebo_msgs</depend>
-  <depend>cv_bridge</depend>
-  <depend>python3-opencv</depend>
-  <depend>python3-numpy</depend>
+  <depend>moveit_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>embodied_motion</depend>
   <depend>python3-yaml</depend>
   <depend>ament_index_python</depend>
 

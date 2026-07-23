@@ -63,16 +63,13 @@ class CommandParser:
 
     _IGNORED_CHARACTERS = "，。！？!?、"
 
-    _PICK_PLACE_RULES = {
-        "把红色方块抓到红色位置": (
-            "red_cube",
-            "red_target_zone",
-        ),
-        "将红色方块放到红色位置": (
-            "red_cube",
-            "red_target_zone",
-        ),
+    _COLOUR_TARGETS = {
+        "红色": ("red_cube", "red_target_zone"),
+        "蓝色": ("blue_cube", "blue_target_zone"),
     }
+    _PICK_PLACE_PREFIXES = ("把", "将")
+    _PICK_PLACE_VERBS = ("抓到", "放到", "移动到")
+    _PICK_PLACE_REGION_SUFFIXES = ("位置", "区域")
 
     @classmethod
     def normalize(cls, text: str) -> str:
@@ -91,16 +88,9 @@ class CommandParser:
         if not normalized_text:
             return None
 
-        for phrase, (target, target_region) in (
-            self._PICK_PLACE_RULES.items()
-        ):
-            if normalized_text == self.normalize(phrase):
-                return ParsedCommand(
-                    raw_text=text,
-                    action="pick_place",
-                    target=target,
-                    target_region=target_region,
-                )
+        pick_place = self._parse_pick_place(text, normalized_text)
+        if pick_place is not None:
+            return pick_place
 
         for target, phrases in self._NAMED_POSE_RULES.items():
             for phrase in phrases:
@@ -120,4 +110,27 @@ class CommandParser:
                         target=target,
                     )
 
+        return None
+
+    def _parse_pick_place(
+        self,
+        raw_text: str,
+        normalized_text: str,
+    ) -> Optional[ParsedCommand]:
+        """Parse colour-independent Chinese pick-and-place sentences."""
+        for colour, (target, target_region) in self._COLOUR_TARGETS.items():
+            object_phrase = f"{colour}方块"
+            for prefix in self._PICK_PLACE_PREFIXES:
+                for verb in self._PICK_PLACE_VERBS:
+                    for suffix in self._PICK_PLACE_REGION_SUFFIXES:
+                        expected = (
+                            f"{prefix}{object_phrase}{verb}{colour}{suffix}"
+                        )
+                        if normalized_text == expected:
+                            return ParsedCommand(
+                                raw_text=raw_text,
+                                action="pick_place",
+                                target=target,
+                                target_region=target_region,
+                            )
         return None

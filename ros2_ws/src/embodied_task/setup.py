@@ -32,6 +32,9 @@ setup(
     entry_points={
         'console_scripts': [
             'task_manager_node = embodied_task.task_manager_node:main',
+            'reachability_diagnosis = '
+            'embodied_task.reachability_diagnosis:main',
+            'path_preflight = embodied_task.path_preflight:main',
         ],
     },
 )

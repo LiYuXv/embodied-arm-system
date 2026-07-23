@@ -6,7 +6,7 @@ from ament_index_python.packages import get_package_prefix, get_package_share_di
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable, TimerAction
 from launch.conditions import IfCondition
-from launch.event_handlers import OnProcessExit
+from launch.event_handlers import OnProcessExit, OnProcessStart
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
@@ -46,6 +46,12 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
         launch_arguments={
             "world": world,
             "verbose": LaunchConfiguration("verbose"),
+            # Do not let the gravity-loaded A3 run before ros2_control has
+            # activated its position controllers.  Without this gate the
+            # robot visibly collapses away from INITIAL_POSITIONS during the
+            # spawn-to-controller race, and nearby dynamic cubes are already
+            # disturbed before a user has issued any task.
+            "pause": "true",
             # Start the client explicitly after gzserver has loaded the SDF;
             # starting both simultaneously leaves the Classic GUI stuck on
             # "Preparing your world" on slower desktops.
@@ -77,6 +83,13 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
         ],
         output="screen",
     )
+    unpause_physics = ExecuteProcess(
+        cmd=[
+            "ros2", "service", "call", "/unpause_physics",
+            "std_srvs/srv/Empty", "{}",
+        ],
+        output="screen",
+    )
     actions = [
         DeclareLaunchArgument("verbose", default_value="false"),
         DeclareLaunchArgument("gazebo_gui", default_value="true"),
@@ -100,7 +113,20 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
         ),
         robot_state_publisher,
         spawn_robot,
-        RegisterEventHandler(OnProcessExit(target_action=spawn_robot, on_exit=[spawn_controllers])),
+        RegisterEventHandler(
+            OnProcessExit(target_action=spawn_robot, on_exit=[spawn_controllers])
+        ),
+        # controller_manager switches controllers from Gazebo's simulation
+        # update callback, so it needs one physics tick to complete.  Start
+        # unpausing just after the spawner starts (not after it exits): this
+        # keeps the world frozen through robot spawn but avoids the paused
+        # switch timeout that otherwise leaves every controller inactive.
+        RegisterEventHandler(
+            OnProcessStart(
+                target_action=spawn_controllers,
+                on_start=[TimerAction(period=0.1, actions=[unpause_physics])],
+            )
+        ),
     ]
     if perception_config:
         actions.append(Node(
