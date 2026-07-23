@@ -7,6 +7,7 @@ import uuid
 import rclpy
 from embodied_interfaces.msg import TaskCommand
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from embodied_language.command_parser import CommandParser
 
@@ -21,13 +22,23 @@ class LanguageNode(Node):
 
         self.parser = CommandParser()
 
+        command_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            # A pick/place command is an edge-triggered user action.  It must
+            # never be replayed to a newly launched task manager from an old
+            # terminal instance, otherwise Gazebo can begin moving before the
+            # user has entered any command in the current run.
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.command_publisher = self.create_publisher(
             TaskCommand,
             "/task_command",
-            10,
+            command_qos,
         )
 
         self.input_queue: queue.Queue[str] = queue.Queue()
+        self.pending_task_command: TaskCommand | None = None
         self.running = True
 
         self.input_thread = threading.Thread(
@@ -67,6 +78,14 @@ class LanguageNode(Node):
 
     def _process_input_queue(self) -> None:
         """解析终端输入并发布任务命令."""
+        if self.pending_task_command is not None:
+            if self.command_publisher.get_subscription_count() == 0:
+                return
+            task_command = self.pending_task_command
+            self.pending_task_command = None
+            self._publish_task_command(task_command)
+            return
+
         try:
             text = self.input_queue.get_nowait()
         except queue.Empty:
@@ -89,7 +108,8 @@ class LanguageNode(Node):
             )
             self.get_logger().info(
                 "当前支持：回家、观察位置、准备位置、"
-                "准备抓取、打开夹爪、关闭夹爪"
+                "准备抓取、打开夹爪、关闭夹爪，以及把/将红色或蓝色方块"
+                "抓到/放到/移动到对应颜色的位置或区域"
             )
             return
 
@@ -97,14 +117,29 @@ class LanguageNode(Node):
             raw_text=parsed_command.raw_text,
             action=parsed_command.action,
             target=parsed_command.target,
+            target_region=parsed_command.target_region,
         )
 
+        # A terminal can submit its first instruction immediately after the
+        # system launch.  Do not lose that one volatile DDS sample before the
+        # task manager has discovered this publisher: retain the exact parsed
+        # command and publish it as soon as a subscriber is present.
+        if self.command_publisher.get_subscription_count() == 0:
+            self.pending_task_command = task_command
+            self.get_logger().info("等待 /task_command 订阅者后发布任务命令")
+            return
+
+        self._publish_task_command(task_command)
+
+    def _publish_task_command(self, task_command: TaskCommand) -> None:
+        """Publish one parsed command after task-layer discovery."""
         self.command_publisher.publish(task_command)
 
         self.get_logger().info(
             "任务命令已发布："
             f"action={task_command.action}, "
             f"target={task_command.target}, "
+            f"target_region={task_command.target_region}, "
             f"command_id={task_command.command_id}"
         )
 
@@ -113,6 +148,7 @@ class LanguageNode(Node):
         raw_text: str,
         action: str,
         target: str,
+        target_region: str,
     ) -> TaskCommand:
         """构造统一任务命令消息."""
         message = TaskCommand()
@@ -127,7 +163,7 @@ class LanguageNode(Node):
 
         message.action = action
         message.target = target
-        message.target_region = ""
+        message.target_region = target_region
 
         message.source = "terminal_rules"
 

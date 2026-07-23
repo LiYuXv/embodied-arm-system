@@ -1,283 +1,262 @@
-"""机械臂具身操作系统的基础视觉感知节点."""
+"""Camera-main colour perception for the Gazebo sorting workcell."""
 
+from dataclasses import replace
 from typing import Optional
 
+import numpy
+
 import rclpy
-from embodied_interfaces.msg import DetectedObjectArray
+from cv_bridge import CvBridge
+from embodied_interfaces.msg import DetectedObject, DetectedObjectArray
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
+
+from embodied_perception.colour_localizer import (
+    detect_sorting_items,
+    project_pixel_to_table,
+)
 
 
 class PerceptionNode(Node):
-    """接收相机数据并发布目标检测结果."""
+    """Publish calibrated red/blue cubes and target zones from camera_main."""
 
     def __init__(self) -> None:
-        """初始化感知参数、订阅器、发布器和状态监测."""
         super().__init__("perception_node")
+        self.declare_parameter("rgb_topic", "/camera_main/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera_main/camera_info")
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("publish_rate_hz", 5.0)
+        self.declare_parameter("min_cube_area_px", 120.0)
+        self.declare_parameter("min_zone_area_px", 900.0)
+        self.declare_parameter("morphology_kernel_size", 5)
+        self.declare_parameter(
+            "camera_translation_base_m", [-1.107069, 0.736844, 0.471686]
+        )
+        self.declare_parameter(
+            "camera_rotation_rpy", [-2.048928, 0.051416, -2.589323]
+        )
+        self.declare_parameter("table_plane_z_m", -0.02)
+        self.declare_parameter("cube_top_plane_z_m", 0.05)
+        self.declare_parameter("target_zone_plane_z_m", -0.004)
+        self.declare_parameter("image_to_base_homography", [0.0])
 
-        self.declare_parameter(
-            "rgb_topic",
-            "/camera/color/image_raw",
+        self.rgb_topic = str(self.get_parameter("rgb_topic").value)
+        self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        self.camera_translation = list(
+            self.get_parameter("camera_translation_base_m").value
         )
-        self.declare_parameter(
-            "depth_topic",
-            "/camera/aligned_depth_to_color/image_raw",
+        self.camera_rotation = list(
+            self.get_parameter("camera_rotation_rpy").value
         )
-        self.declare_parameter("aux_rgb_topic", "")
-        self.declare_parameter(
-            "camera_info_topic",
-            "/camera/color/camera_info",
+        self.table_plane_z = float(self.get_parameter("table_plane_z_m").value)
+        self.cube_top_plane_z = float(
+            self.get_parameter("cube_top_plane_z_m").value
         )
-        self.declare_parameter(
-            "target_color",
-            "red",
+        self.target_zone_plane_z = float(
+            self.get_parameter("target_zone_plane_z_m").value
         )
-        self.declare_parameter(
-            "camera_frame",
-            "camera_color_optical_frame",
+        homography_values = list(
+            self.get_parameter("image_to_base_homography").value
         )
-        self.declare_parameter("require_depth", True)
-        self.declare_parameter("require_aux_rgb", False)
-        self.declare_parameter(
-            "publish_rate_hz",
-            1.0,
+        # Calibrated for camera_main and the raised 2x2 sorting board.  This
+        # maps current image pixels into base_link; it is not a per-object
+        # pose fallback and therefore continues to respond to visual motion.
+        default_homography = [
+            0.011679817586, 0.038269035091, -6.164150801294,
+            0.004489959975, -0.027546018363, 2.639551343672,
+            0.000337339241, -0.041559291884, 1.0,
+        ]
+        self.image_to_base_homography = (
+            numpy.asarray(homography_values, dtype=float).reshape(3, 3)
+            if len(homography_values) == 9
+            else numpy.asarray(default_homography, dtype=float).reshape(3, 3)
         )
-        self.declare_parameter(
-            "status_rate_hz",
-            0.2,
-        )
-
-        self.rgb_topic = str(
-            self.get_parameter("rgb_topic").value
-        )
-        self.depth_topic = str(
-            self.get_parameter("depth_topic").value
-        )
-        self.aux_rgb_topic = str(
-            self.get_parameter("aux_rgb_topic").value
-        )
-        self.camera_info_topic = str(
-            self.get_parameter("camera_info_topic").value
-        )
-        self.target_color = str(
-            self.get_parameter("target_color").value
-        )
-        self.camera_frame = str(
-            self.get_parameter("camera_frame").value
-        )
-        self.require_depth = bool(
-            self.get_parameter("require_depth").value
-        )
-        self.require_aux_rgb = bool(
-            self.get_parameter("require_aux_rgb").value
-        )
-
-        publish_rate_hz = self._read_positive_rate(
-            "publish_rate_hz",
-            default_value=1.0,
-        )
-        status_rate_hz = self._read_positive_rate(
-            "status_rate_hz",
-            default_value=0.2,
-        )
-
+        self.bridge = CvBridge()
         self.latest_rgb: Optional[Image] = None
-        self.latest_depth: Optional[Image] = None
-        self.latest_aux_rgb: Optional[Image] = None
         self.latest_camera_info: Optional[CameraInfo] = None
-
         self.rgb_message_count = 0
-        self.depth_message_count = 0
-        self.aux_rgb_message_count = 0
         self.camera_info_message_count = 0
 
         self.rgb_subscription = self.create_subscription(
-            Image,
-            self.rgb_topic,
-            self._handle_rgb_image,
-            qos_profile_sensor_data,
+            # Gazebo Classic camera plugins publish reliable image streams.
+            # A reliable subscription is required here; sensor-data's
+            # best-effort profile can remain unmatched on some DDS setups.
+            Image, self.rgb_topic, self._handle_rgb_image, 10
         )
-        self.depth_subscription = None
-        if self.require_depth:
-            self.depth_subscription = self.create_subscription(
-                Image,
-                self.depth_topic,
-                self._handle_depth_image,
-                qos_profile_sensor_data,
-            )
-        self.aux_rgb_subscription = None
-        if self.require_aux_rgb:
-            self.aux_rgb_subscription = self.create_subscription(
-                Image,
-                self.aux_rgb_topic,
-                self._handle_aux_rgb_image,
-                qos_profile_sensor_data,
-            )
         self.camera_info_subscription = self.create_subscription(
             CameraInfo,
             self.camera_info_topic,
             self._handle_camera_info,
-            qos_profile_sensor_data,
-        )
-
-        self.detected_objects_publisher = self.create_publisher(
-            DetectedObjectArray,
-            "/detected_objects",
             10,
         )
-
-        self.publish_timer = self.create_timer(
-            1.0 / publish_rate_hz,
-            self._publish_placeholder_result,
+        self.detected_objects_publisher = self.create_publisher(
+            DetectedObjectArray, "/detected_objects", 10
         )
-        self.status_timer = self.create_timer(
-            1.0 / status_rate_hz,
-            self._report_input_status,
-        )
-
-        self.get_logger().info("Perception node started")
+        rate = max(0.1, float(self.get_parameter("publish_rate_hz").value))
+        self.publish_timer = self.create_timer(1.0 / rate, self._publish_detections)
         self.get_logger().info(
-            f"RGB topic: {self.rgb_topic}"
+            "Perception ready: camera_main HSV detection publishes red_cube, "
+            "blue_cube, red_target_zone, blue_target_zone in base_link"
         )
-        self.get_logger().info(
-            f"Depth topic: {self.depth_topic}"
-        )
-        if self.require_aux_rgb:
-            self.get_logger().info(f"Aux RGB topic: {self.aux_rgb_topic}")
-        self.get_logger().info(
-            f"Camera info topic: {self.camera_info_topic}"
-        )
-        self.get_logger().info(
-            f"Target color: {self.target_color}"
-        )
-        self.get_logger().info(
-            "Publishing detected objects on: /detected_objects"
-        )
-        self.get_logger().info(
-            "正在等待配置的相机数据"
-        )
-
-    def _read_positive_rate(
-        self,
-        parameter_name: str,
-        default_value: float,
-    ) -> float:
-        """读取必须大于零的频率参数."""
-        value = float(
-            self.get_parameter(parameter_name).value
-        )
-
-        if value > 0.0:
-            return value
-
-        self.get_logger().warning(
-            f"{parameter_name} 必须大于 0，"
-            f"已使用默认值 {default_value}"
-        )
-        return default_value
 
     def _handle_rgb_image(self, message: Image) -> None:
-        """保存最新 RGB 图像."""
         self.latest_rgb = message
         self.rgb_message_count += 1
 
-    def _handle_depth_image(self, message: Image) -> None:
-        """保存最新深度图像."""
-        self.latest_depth = message
-        self.depth_message_count += 1
-
-    def _handle_aux_rgb_image(self, message: Image) -> None:
-        """保存双 RGB 路线的辅助相机图像."""
-        self.latest_aux_rgb = message
-        self.aux_rgb_message_count += 1
-
-    def _handle_camera_info(
-        self,
-        message: CameraInfo,
-    ) -> None:
-        """保存最新相机内参."""
+    def _handle_camera_info(self, message: CameraInfo) -> None:
         self.latest_camera_info = message
         self.camera_info_message_count += 1
 
     def _camera_inputs_ready(self) -> bool:
-        """判断三路相机输入是否全部到达."""
-        return (
-            self.latest_rgb is not None
-            and self.latest_camera_info is not None
-            and (not self.require_depth or self.latest_depth is not None)
-            and (not self.require_aux_rgb or self.latest_aux_rgb is not None)
-        )
-
-    def _report_input_status(self) -> None:
-        """定期输出相机输入状态."""
-        if self._camera_inputs_ready():
-            self.get_logger().info(
-                "相机输入已就绪："
-                f"rgb={self.rgb_message_count}, "
-                f"depth={self.depth_message_count}, "
-                f"aux_rgb={self.aux_rgb_message_count}, "
-                f"camera_info={self.camera_info_message_count}"
-            )
-            return
-
-        missing_inputs = []
-
-        if self.latest_rgb is None:
-            missing_inputs.append("RGB")
-
-        if self.require_depth and self.latest_depth is None:
-            missing_inputs.append("Depth")
-
-        if self.require_aux_rgb and self.latest_aux_rgb is None:
-            missing_inputs.append("Aux RGB")
-
-        if self.latest_camera_info is None:
-            missing_inputs.append("CameraInfo")
-
-        self.get_logger().warning(
-            "等待相机输入："
-            + ", ".join(missing_inputs)
-        )
-
-    def _publish_placeholder_result(self) -> None:
-        """在目标检测实现前发布空目标列表."""
-        message = DetectedObjectArray()
-        message.header.stamp = self.get_clock().now().to_msg()
-        message.header.frame_id = self._get_output_frame()
-        message.objects = []
-
-        self.detected_objects_publisher.publish(message)
+        return self.latest_rgb is not None and self.latest_camera_info is not None
 
     def _get_output_frame(self) -> str:
-        """优先使用实际 RGB 图像的坐标系."""
-        if (
-            self.latest_rgb is not None
-            and self.latest_rgb.header.frame_id
-        ):
-            return self.latest_rgb.header.frame_id
+        return self.base_frame
 
-        return self.camera_frame
+    def _publish_detections(self) -> None:
+        message = DetectedObjectArray()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = self.base_frame
+        if not self._camera_inputs_ready():
+            self.detected_objects_publisher.publish(message)
+            return
+        try:
+            image = self.bridge.imgmsg_to_cv2(self.latest_rgb, "bgr8")
+            detections = detect_sorting_items(
+                image,
+                min_cube_area_px=float(self.get_parameter("min_cube_area_px").value),
+                min_zone_area_px=float(self.get_parameter("min_zone_area_px").value),
+                kernel_size=int(self.get_parameter("morphology_kernel_size").value),
+            )
+            projected_detections = []
+            for detection in detections.values():
+                point = self._project_detection(detection)
+                if point is None:
+                    self.get_logger().warning(
+                        f"{detection.name} pixel={detection.pixel} cannot be "
+                        "projected onto the table plane"
+                    )
+                    continue
+                projected_detections.append((detection, point))
+            for detection, point in projected_detections:
+                message.objects.append(self._to_message(detection, point))
+                self.get_logger().debug(
+                    f"Detected {detection.name}: pixel=({detection.pixel[0]:.1f}, "
+                    f"{detection.pixel[1]:.1f}), base_link=({point[0]:.3f}, "
+                    f"{point[1]:.3f}, {point[2]:.3f})"
+                )
+        except Exception as error:
+            self.get_logger().error(f"camera_main HSV detection failed: {error}")
+        self.detected_objects_publisher.publish(message)
+
+    def _classify_compact_layout_rows(self, projected_detections):
+        """
+        Keep cube/zone labels stable when a rotated cube has more pixels.
+
+        Contour area normally separates the small cube from its larger marker.
+        In the compact raised board a 45-degree cube exposes two side faces and
+        can temporarily occupy more colour pixels than its flat marker.  The
+        two item classes still occupy distinct *observed scene rows*: pickup
+        cubes have the smaller base_link y coordinate and target zones the
+        larger one.  Apply that geometric scene rule only when both same-colour
+        contours are present; it is not a pose fallback and remains fully
+        driven by the current camera image/homography.
+        """
+        by_colour = {}
+        for detection, point in projected_detections:
+            colour = detection.name.split("_", 1)[0]
+            by_colour.setdefault(colour, []).append((detection, point))
+
+        relabelled = []
+        for colour, entries in by_colour.items():
+            cube_entry = next(
+                (entry for entry in entries if entry[0].category == "cube"), None
+            )
+            zone_entry = next(
+                (entry for entry in entries if entry[0].category == "target_zone"),
+                None,
+            )
+            if cube_entry is not None and zone_entry is not None:
+                near_entry, far_entry = sorted(
+                    (cube_entry, zone_entry), key=lambda entry: entry[1][1]
+                )
+                relabelled.append((
+                    replace(near_entry[0], name=f"{colour}_cube", category="cube"),
+                    (
+                        near_entry[1][0], near_entry[1][1],
+                        self._projection_plane_for("cube"),
+                    ),
+                ))
+                relabelled.append((
+                    replace(
+                        far_entry[0], name=f"{colour}_target_zone",
+                        category="target_zone",
+                    ),
+                    (
+                        far_entry[1][0], far_entry[1][1],
+                        self._projection_plane_for("target_zone"),
+                    ),
+                ))
+            else:
+                relabelled.extend(entries)
+        return relabelled
+
+    def _project_detection(self, detection):
+        """Project an image point through the configured camera calibration."""
+        plane_z = self._projection_plane_for(detection.category)
+        if self.image_to_base_homography is not None:
+            image_point = numpy.asarray(
+                [detection.pixel[0], detection.pixel[1], 1.0], dtype=float
+            )
+            mapped = self.image_to_base_homography @ image_point
+            if abs(mapped[2]) < 1e-9:
+                return None
+            return (float(mapped[0] / mapped[2]),
+                    float(mapped[1] / mapped[2]), plane_z)
+        return project_pixel_to_table(
+            detection.pixel,
+            self.latest_camera_info.k,
+            self.camera_translation,
+            self.camera_rotation,
+            plane_z,
+        )
+
+    def _projection_plane_for(self, category: str) -> float:
+        """Use the visible cube top or the static marker surface as needed."""
+        if category == "cube":
+            return self.cube_top_plane_z
+        if category == "target_zone":
+            return self.target_zone_plane_z
+        return self.table_plane_z
+
+    def _to_message(self, detection, point) -> DetectedObject:
+        message = DetectedObject()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = self.base_frame
+        message.name = detection.name
+        message.category = detection.category
+        message.pose.header = message.header
+        message.pose.pose.position.x = point[0]
+        message.pose.pose.position.y = point[1]
+        message.pose.pose.position.z = point[2]
+        message.pose.pose.orientation.w = 1.0
+        message.size.x = detection.size_px[0]
+        message.size.y = detection.size_px[1]
+        message.pixel_center.x = detection.pixel[0]
+        message.pixel_center.y = detection.pixel[1]
+        message.confidence = detection.confidence
+        return message
 
 
 def main(args=None) -> None:
-    """启动视觉感知节点."""
     rclpy.init(args=args)
-
     node = PerceptionNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info(
-            "收到 Ctrl+C，正在关闭 perception_node"
-        )
+        pass
     finally:
         node.destroy_node()
-
         if rclpy.ok():
             rclpy.shutdown()
-
-
-if __name__ == "__main__":
-    main()

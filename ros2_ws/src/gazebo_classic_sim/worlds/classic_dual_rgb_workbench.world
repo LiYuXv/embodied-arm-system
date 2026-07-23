@@ -1,18 +1,131 @@
 <?xml version="1.0"?>
 <sdf version="1.6">
   <world name="sorting_workcell_dual_rgb">
-    <physics type="ode"><max_step_size>0.001</max_step_size><real_time_update_rate>1000</real_time_update_rate></physics><gravity>0 0 -9.81</gravity>
-    <scene><ambient>0.55 0.55 0.55 1</ambient><background>0.82 0.86 0.90 1</background><shadows>true</shadows></scene><light name="sun" type="directional"><cast_shadows>true</cast_shadows><pose>0 0 5 0 0 0</pose><diffuse>0.9 0.9 0.9 1</diffuse><direction>-0.4 0.2 -0.9</direction></light>
-    <model name="ground_plane"><static>true</static><link name="ground"><collision name="collision"><geometry><plane><normal>0 0 1</normal><size>8 8</size></plane></geometry></collision><visual name="visual"><geometry><plane><normal>0 0 1</normal><size>8 8</size></plane></geometry><material><ambient>0.70 0.70 0.70 1</ambient></material></visual></link></model>
-    <model name="workbench"><static>true</static><link name="table"><collision name="top_collision"><pose>0.55 0 0.78 0 0 0</pose><geometry><box><size>1.45 0.90 0.06</size></box></geometry></collision><visual name="top"><pose>0.55 0 0.78 0 0 0</pose><geometry><box><size>1.45 0.90 0.06</size></box></geometry><material><ambient>0.58 0.42 0.26 1</ambient></material></visual><visual name="leg1"><pose>-0.10 -0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual><visual name="leg2"><pose>-0.10 0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual><visual name="leg3"><pose>1.20 -0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual><visual name="leg4"><pose>1.20 0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual></link></model>
-    <model name="robot_mount"><static>true</static><pose>-0.08 0 0.82 0 0 0</pose><link name="mount"><visual name="visual"><geometry><cylinder><radius>0.09</radius><length>0.02</length></cylinder></geometry><material><ambient>0.10 0.11 0.12 1</ambient></material></visual></link></model>
-    <model name="work_mat"><static>true</static><pose>0.55 0 0.816 0 0 0</pose><link name="mat"><visual name="visual"><geometry><box><size>0.68 0.52 0.012</size></box></geometry><material><ambient>0.16 0.20 0.23 1</ambient></material></visual></link></model>
-    <model name="red_target_zone"><static>true</static><pose>1.05 -0.27 0.818 0 0 0</pose><link name="zone"><visual name="visual"><geometry><box><size>0.20 0.16 0.016</size></box></geometry><material><ambient>0.72 0.06 0.06 1</ambient></material></visual></link></model>
-    <model name="blue_target_zone"><static>true</static><pose>1.05 0.27 0.818 0 0 0</pose><link name="zone"><visual name="visual"><geometry><box><size>0.20 0.16 0.016</size></box></geometry><material><ambient>0.05 0.16 0.75 1</ambient></material></visual></link></model>
-    <model name="red_cube"><static>true</static><pose>0.43 -0.16 0.856 0 0 0</pose><link name="link"><visual name="visual"><geometry><box><size>0.07 0.07 0.07</size></box></geometry><material><ambient>0.90 0.04 0.04 1</ambient></material></visual></link></model>
-    <model name="green_cylinder"><static>true</static><pose>0.60 0 0.866 0 0 0</pose><link name="link"><visual name="visual"><geometry><cylinder><radius>0.04</radius><length>0.09</length></cylinder></geometry><material><ambient>0.04 0.75 0.14 1</ambient></material></visual></link></model>
-    <model name="blue_cube"><static>true</static><pose>0.75 0.16 0.856 0 0 0</pose><link name="link"><visual name="visual"><geometry><box><size>0.07 0.07 0.07</size></box></geometry><material><ambient>0.04 0.15 0.90 1</ambient></material></visual></link></model>
-    <model name="camera_main"><static>true</static><pose>1.25 -1.15 1.35 0 0 2.38</pose><link name="camera_main_link"><sensor name="camera_main_sensor" type="camera"><always_on>true</always_on><update_rate>30</update_rate><visualize>false</visualize><camera><horizontal_fov>1.047</horizontal_fov><image><width>640</width><height>480</height><format>R8G8B8</format></image><clip><near>0.10</near><far>5.0</far></clip></camera><plugin name="camera_main_ros" filename="libgazebo_ros_camera.so"><ros><namespace>/</namespace></ros><camera_name>camera_main</camera_name><frame_name>camera_main_link</frame_name></plugin></sensor></link></model>
-    <model name="camera_aux"><static>true</static><pose>-0.65 1.10 1.15 0 0 -0.80</pose><link name="camera_aux_link"><sensor name="camera_aux_sensor" type="camera"><always_on>true</always_on><update_rate>30</update_rate><visualize>false</visualize><camera><horizontal_fov>1.047</horizontal_fov><image><width>640</width><height>480</height><format>R8G8B8</format></image><clip><near>0.10</near><far>5.0</far></clip></camera><plugin name="camera_aux_ros" filename="libgazebo_ros_camera.so"><ros><namespace>/</namespace></ros><camera_name>camera_aux</camera_name><frame_name>camera_aux_link</frame_name></plugin></sensor></link></model>
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+    <gravity>0 0 -9.81</gravity>
+    <!-- Read-only Gazebo truth used by the task's physical-verification
+         guard.  It publishes model poses only; no task component writes to
+         Gazebo state or uses it to move/attach a cube. -->
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros><namespace>/gazebo</namespace></ros>
+      <update_rate>30.0</update_rate>
+    </plugin>
+    <scene>
+      <ambient>0.55 0.55 0.55 1</ambient>
+      <background>0.82 0.86 0.90 1</background>
+      <shadows>true</shadows>
+    </scene>
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 5 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <direction>-0.4 0.2 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="ground">
+        <collision name="collision"><geometry><plane><normal>0 0 1</normal><size>8 8</size></plane></geometry></collision>
+        <visual name="visual"><geometry><plane><normal>0 0 1</normal><size>8 8</size></plane></geometry><material><ambient>0.70 0.70 0.70 1</ambient></material></visual>
+      </link>
+    </model>
+    <model name="workbench">
+      <static>true</static>
+      <link name="table">
+        <collision name="top_collision"><pose>0.55 0 0.78 0 0 0</pose><geometry><box><size>1.45 0.90 0.06</size></box></geometry></collision>
+        <visual name="top"><pose>0.55 0 0.78 0 0 0</pose><geometry><box><size>1.45 0.90 0.06</size></box></geometry><material><ambient>0.58 0.42 0.26 1</ambient></material></visual>
+        <visual name="leg_front_left"><pose>-0.10 -0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+        <visual name="leg_back_left"><pose>-0.10 0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+        <visual name="leg_front_right"><pose>1.20 -0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+        <visual name="leg_back_right"><pose>1.20 0.37 0.375 0 0 0</pose><geometry><box><size>0.07 0.07 0.75</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+      </link>
+    </model>
+    <model name="robot_mount">
+      <static>true</static><pose>-0.08 0 0.82 0 0 0</pose>
+      <link name="mount"><visual name="visual"><geometry><cylinder><radius>0.09</radius><length>0.02</length></cylinder></geometry><material><ambient>0.10 0.11 0.12 1</ambient></material></visual></link>
+    </model>
+    <model name="work_mat">
+      <static>true</static><pose>0.55 0 0.816 0 0 0</pose>
+      <link name="mat"><visual name="visual"><geometry><box><size>0.68 0.52 0.012</size></box></geometry><material><ambient>0.16 0.20 0.23 1</ambient></material></visual></link>
+    </model>
+
+    <!-- Compact low-profile tray, expressed in world at (0.290, -0.115).
+         With the spawned yaw=pi its centre is directly in front of the
+         robot, not alongside it.  The board top is base_link z=0.2015 m.
+         The complete thin deck, not
+         isolated pedestals below a cube, provides the raised operation
+         surface.  This preserves clearance for the unmodified wrist while
+         keeping both dynamic cubes stably supported under side contact.
+         Together with the unmodified
+         gripper this places its TCP in the proven A3 corridor while keeping
+         the gripper housing above, rather than through, the operation board.
+         Its only collision volume is the 20 mm operation surface, leaving
+         its sides and the space below the board open to the arm. -->
+    <model name="sorting_platform">
+      <!-- Keep the established operation-surface height.  The board is
+           deliberately long across the robot, so pick/place travel is
+           forward (base_link x) and colour separation is lateral (y). -->
+      <static>true</static><pose>0.290 -0.115 1.0115 0 0 0</pose>
+      <link name="deck">
+        <!-- A continuous, thin physical top supports a cube after small
+             side contact.  It replaces the former narrow pickup pedestals
+             that let a cube pivot or fall when a jaw touched its edge. -->
+        <!-- The slightly thicker, continuous collision slab eliminates the
+             ODE thin-face tunnelling that let dynamic cubes drop through the
+             former 20 mm deck.  It remains a low 4 cm tray, not a tall box. -->
+        <collision name="deck_collision"><geometry><box><size>0.26 0.32 0.04</size></box></geometry><surface><friction><ode><mu>1.2</mu><mu2>1.2</mu2></ode></friction></surface></collision>
+        <visual name="deck_visual"><geometry><box><size>0.26 0.32 0.04</size></box></geometry><material><ambient>0.26 0.30 0.33 1</ambient><diffuse>0.31 0.35 0.38 1</diffuse></material></visual>
+        <visual name="rear_left_support"><pose>0.095 0.135 -0.11075 0 0 0</pose><geometry><box><size>0.012 0.012 0.1815</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+        <visual name="rear_right_support"><pose>0.095 -0.135 -0.11075 0 0 0</pose><geometry><box><size>0.012 0.012 0.1815</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+        <visual name="far_left_support"><pose>-0.095 0.135 -0.11075 0 0 0</pose><geometry><box><size>0.012 0.012 0.1815</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+        <visual name="far_right_support"><pose>-0.095 -0.135 -0.11075 0 0 0</pose><geometry><box><size>0.012 0.012 0.1815</size></box></geometry><material><ambient>0.16 0.18 0.20 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- Front/back rows are along world x (base_link forward after the
+         robot's yaw=pi spawn); red/blue columns are along y.  Thus each task
+         moves straight forward from its cube to its own marker instead of
+         making the wrist approach the tray from the side.  The 10 cm row and
+         column spacing keeps same-colour blobs distinct in camera_main. -->
+    <model name="red_target_zone">
+      <static>true</static><pose>0.340 -0.165 1.0095 0 0 0</pose>
+      <link name="zone"><visual name="visual"><geometry><box><size>0.07 0.07 0.016</size></box></geometry><material><ambient>0.72 0.06 0.06 1</ambient><diffuse>0.85 0.08 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="red_cube">
+      <!-- Start 2 mm above the deck, then settle under gravity.  Starting
+           exactly coplanar with an ODE collision face can miss the first
+           contact and let a dynamic cube tunnel through the thin deck. -->
+      <static>false</static><pose>0.240 -0.165 1.0535 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>0.035</mass><inertia><ixx>0.00000933</ixx><iyy>0.00000933</iyy><izz>0.00000933</izz></inertia></inertial>
+        <collision name="collision"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><surface><friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode><torsional><coefficient>0.8</coefficient></torsional></friction><contact><ode><kp>5000</kp><kd>30</kd><min_depth>0.0005</min_depth><max_vel>0.002</max_vel></ode></contact></surface></collision>
+        <visual name="visual"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><material><ambient>0.90 0.04 0.04 1</ambient><diffuse>0.90 0.04 0.04 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="blue_target_zone">
+      <static>true</static><pose>0.340 -0.065 1.0095 0 0 0</pose>
+      <link name="zone"><visual name="visual"><geometry><box><size>0.07 0.07 0.016</size></box></geometry><material><ambient>0.06 0.12 0.72 1</ambient><diffuse>0.08 0.18 0.90 1</diffuse></material></visual></link>
+    </model>
+    <model name="blue_cube">
+      <static>false</static><pose>0.240 -0.065 1.0535 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>0.035</mass><inertia><ixx>0.00000933</ixx><iyy>0.00000933</iyy><izz>0.00000933</izz></inertia></inertial>
+        <collision name="collision"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><surface><friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode><torsional><coefficient>0.8</coefficient></torsional></friction><contact><ode><kp>5000</kp><kd>30</kd><min_depth>0.0005</min_depth><max_vel>0.002</max_vel></ode></contact></surface></collision>
+        <visual name="visual"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><material><ambient>0.04 0.10 0.90 1</ambient><diffuse>0.06 0.18 0.95 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="camera_main">
+      <static>true</static><pose>1.00 -0.75 1.30 0 0.491101 2.117585</pose>
+      <link name="camera_main_link">
+        <sensor name="camera_main_sensor" type="camera">
+          <always_on>true</always_on><update_rate>30</update_rate><visualize>false</visualize>
+          <camera><horizontal_fov>1.35</horizontal_fov><image><width>640</width><height>480</height><format>R8G8B8</format></image><clip><near>0.10</near><far>5.0</far></clip></camera>
+          <plugin name="camera_main_ros" filename="libgazebo_ros_camera.so"><ros><namespace>/</namespace></ros><camera_name>camera_main</camera_name><frame_name>camera_main_link</frame_name></plugin>
+        </sensor>
+      </link>
+    </model>
   </world>
 </sdf>

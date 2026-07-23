@@ -65,6 +65,32 @@ def test_parse_gripper_commands(
 
 
 @pytest.mark.parametrize(
+    ("text", "target", "target_region"),
+    [
+        ("把红色方块抓到红色位置", "red_cube", "red_target_zone"),
+        ("将红色方块放到红色区域", "red_cube", "red_target_zone"),
+        ("把红色方块移动到红色区域", "red_cube", "red_target_zone"),
+        ("把蓝色方块抓到蓝色位置", "blue_cube", "blue_target_zone"),
+        ("将蓝色方块放到蓝色区域", "blue_cube", "blue_target_zone"),
+        ("把 蓝色 方块 移动到 蓝色 位置。", "blue_cube", "blue_target_zone"),
+    ],
+)
+def test_parse_colour_pick_place_commands(
+    parser: CommandParser,
+    text: str,
+    target: str,
+    target_region: str,
+) -> None:
+    """All supported colour, verb, and region wording maps consistently."""
+    result = parser.parse(text)
+
+    assert result is not None
+    assert result.action == "pick_place"
+    assert result.target == target
+    assert result.target_region == target_region
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "",

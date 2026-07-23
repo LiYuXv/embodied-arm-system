@@ -2,7 +2,7 @@
 
 本科毕业设计项目，面向 EDULITE_A3 机械臂，基于 ROS 2 Humble、MoveIt 2 和 RViz 构建自然语言交互、任务调度、视觉感知与机械臂控制一体化的具身操作系统。
 
-当前项目已经完成基础平台适配、机械臂运动执行、中文规则指令解析、任务层解耦、夹爪控制、感知模块骨架和系统一键启动。后续将在此基础上接入 RGB-D 仿真场景、目标检测与三维定位，并逐步扩展至大语言模型、VLA 模型和真实机械臂验证。
+当前项目已经完成基础平台适配、机械臂运动执行、中文规则指令解析、任务层解耦、夹爪控制、Gazebo Classic 双相机仿真和系统一键启动。后续将在此基础上扩展更稳健的目标检测、真实相机标定和大语言模型交互。
 
 ## 1. 当前系统架构
 
@@ -36,7 +36,9 @@ RGB 图像 ─────────────┐
                        /detected_objects
 ```
 
-感知模块目前已完成 RGB、Depth、CameraInfo 三路接口和坐标系传递，尚未实现实际目标检测，因此当前发布空的 `DetectedObjectArray`。后续任务层将结合 `/detected_objects` 完成目标定位与抓取任务调度。
+`embodied_perception` 使用 `camera_main` 的 HSV 分割、`CameraInfo` 和相机外参发布红/蓝方块及红/蓝目标区域到 `/detected_objects`。抓放任务以这些视觉坐标动态计算位姿；视觉结果缺失或过期时会明确终止，默认不会回退到 YAML 固定抓放坐标。
+
+> Gazebo Classic 物理抓放仍处于验收中。语言、视觉、动态位姿与启动链路已接入，但“真实夹起、搬运、释放”尚未完成红蓝最终回归，不能视为已完成。当前启动稳定性和已知问题见 [2026-07-23 开发记录](docs/dev_logs/2026-07-23-gazebo-startup-and-pick-place-status.md)。
 
 ## 2. 已实现功能
 
@@ -75,6 +77,10 @@ RGB 图像 ─────────────┐
 移动到预抓取位置
 打开夹爪
 关闭夹爪
+把红色方块抓到红色位置
+把红色方块放到红色区域
+把蓝色方块抓到蓝色位置
+把蓝色方块移动到蓝色区域
 ```
 
 解析器能够处理常见空格和中英文标点。无法识别的指令不会触发机械臂动作。
@@ -87,6 +93,7 @@ RGB 图像 ─────────────┐
 - 当前支持：
   - `go_named_pose`
   - `set_gripper`
+  - `pick_place`（打开夹爪 → 抓取 → 放置 → 抬起）
 - 在任务执行期间拒绝新的并发任务，避免多个指令同时占用运动执行器。
 
 ### 2.5 视觉感知骨架
@@ -191,7 +198,7 @@ source install/setup.bash
 
 ## 7. 启动完整系统
 
-一键启动完整系统：
+默认 mock 后端的一键启动：
 
 ```bash
 cd ~/embodied-arm-system/ros2_ws
@@ -216,6 +223,30 @@ source install/setup.bash
 ros2 run embodied_language language_node
 ```
 
+Gazebo Classic 双 RGB 仿真（固定工作台主相机和夹爪基座辅助相机）：
+
+```bash
+ros2 launch embodied_bringup system.launch.py \
+  backend:=gazebo \
+  camera_source:=dual_rgb_sim \
+  use_rviz:=true \
+  gazebo_gui:=true
+```
+
+可用启动参数如下：
+
+| 参数 | 可选值 | 说明 |
+|---|---|---|
+| `backend` | `mock`、`gazebo` | mock 使用原有 ros2_control；Gazebo 使用 Classic 控制器 |
+| `camera_source` | `none`、`rgbd_sim`、`dual_rgb_sim`、`dual_usb` | 选择唯一的相机/感知路线 |
+| `use_rviz` | `true`、`false` | 是否启动 RViz |
+| `open_language_terminal` | `true`、`false` | 是否打开终端语言节点 |
+| `gazebo_gui` | `true`、`false` | 是否显示 Gazebo Classic 客户端 |
+| `gazebo_master_uri` | URI | 独立 Classic master（默认 `http://127.0.0.1:11346`），避免遗留实例冲突 |
+| `show_camera_views` | `true`、`false` | 双 RGB 仿真时自动打开两路 `rqt_image_view` |
+
+`dual_usb` 路线还支持 `camera_main_device`、`camera_aux_device`、`camera_main_frame_id` 和 `camera_aux_frame_id`；默认设备使用稳定的 `/dev/v4l/by-path/...` 路径。Gazebo 后端的 Classic 启动负责 `robot_state_publisher`、`controller_manager` 和感知节点；一键启动仅额外启动 MoveIt 规划层，避免重复节点。
+
 启动后可输入：
 
 ```text
@@ -224,7 +255,12 @@ ros2 run embodied_language language_node
 打开夹爪
 关闭夹爪
 回家
+把红色方块抓到红色位置
 ```
+
+抓放位姿、工作台高度及主相机外参保存在 `embodied_task/config/pick_place.yaml`。算法先在 BGR 图像上转换 HSV，以两个红色阈值区间分割并形态学去噪；按轮廓面积区分方块和目标区域，再由像素中心、`CameraInfo` 内参和已标定的相机到 `base_link` 外参构建射线，与工作台平面求交得到机器人基坐标。默认使用已验证的 YAML 标定位姿；启用 `use_camera_localization` 后才以有效视觉结果更新位姿。任务不会调用 `/gazebo/set_model_state` 或以其他方式伪造抓放结果。
+
+抓放任务将任一必需位姿的 IK 或规划执行失败明确报告为任务失败，不会以命名位姿替代失败段。
 
 输入 `exit` 或 `quit` 可退出语言交互节点。
 
@@ -285,10 +321,9 @@ colcon test-result --verbose
 ## 10. 当前限制
 
 - 语言模块目前采用规则解析，尚未接入大语言模型；
-- 感知模块尚未实现颜色分割、目标检测和三维定位；
-- `/detected_objects` 尚未接入任务层；
-- 尚未实现完整的感知驱动抓取状态机；
-- RGB-D 仿真场景和相机方案仍待最终确定；
+- HSV 颜色分割仅覆盖当前红色方块/红色区域场景，仍需扩展多颜色和遮挡处理；
+- 单目平面求交依赖固定相机标定，真实部署前需要完成手眼标定；
+- `/detected_objects` 尚未作为任务层的通用多目标输入；
 - VLA 模型训练与微调尚未开始；
 - 真实机械臂迁移与安全验证尚未完成。
 

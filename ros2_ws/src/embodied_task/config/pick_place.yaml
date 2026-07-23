@@ -1,0 +1,67 @@
+# Visual XY is mandatory in normal operation.  These are shared physical
+# dimensions, not per-colour fixed grasp poses.  The raised thin tray's actual
+# top is base_link z=0.2015 m; adding half the cube height puts the finger
+# contact band through the cube centre (z=0.224 m), not at its upper edge.
+table_plane_z_m: 0.2015
+cube_support_plane_z_m: 0.2015
+cube_height_m: 0.040
+# Put the 42 mm-tall physical jaw band 20 mm above the cube midline.  Its
+# lower edge then remains above the continuous deck while still overlapping
+# 23 mm of the 45 mm cube side face.  This prevents the wrist/jaw lower edge
+# from sweeping the deck or cube before the two pads can close.
+grasp_band_height_offset_m: 0.020
+# The camera is millimetre-accurate but the physical jaw collision band has a
+# narrow contact window.  These are relative visual XY candidates, tried only
+# after a failed real-contact close; no fixed world/object pose is used.
+grasp_contact_offsets_m: [[0.0, 0.0], [0.003, 0.003], [-0.003, -0.003],
+                           [0.006, 0.006], [-0.006, -0.006],
+                           [0.003, -0.003], [-0.003, 0.003],
+                           [0.006, -0.006], [-0.006, 0.006],
+                           [0.010, 0.010], [-0.010, -0.010],
+                           [0.010, -0.010], [-0.010, 0.010]]
+# The compact 10 mm finger pads grip at the cube's mid-band.  Keep the open
+# jaws above the 45 mm cube before the final vertical descent, then use the
+# same clearance for lift/retreat.
+approach_height_m: 0.08
+# Default vertical clearance above the visual grasp centre.  Alternative side
+# approaches remain generated dynamically when a validated candidate exists.
+approach_vector_m: [0.0, 0.0, 0.080]
+# Descend beside the cube, then make the short physical side approach.  The
+# vector is in base_link and recomputed from each fresh visual detection.
+side_approach_vector_m: [0.0, 0.0, 0.0]
+lift_height_m: 0.08
+retreat_height_m: 0.08
+orientation_xyzw: [0.652818, 0.270495, 0.271278, 0.653505]
+# The compact raised layout has two collision-checked wrist corridors.  The
+# task selects by visual object/region; it never falls back to fixed XYZ.
+orientation_by_object:
+  red_cube: [0.652818, 0.270495, 0.271278, 0.653505]
+  red_target_zone: [0.652818, 0.270495, 0.271278, 0.653505]
+  blue_cube: [0.652818, 0.270495, 0.271278, 0.653505]
+  blue_target_zone: [0.652818, 0.270495, 0.271278, 0.653505]
+# The unmodified vendor URDF has no grasp_center link.  This is its existing
+# fixed geometry, derived from end_effector z=-0.074, gripper_base z=0.045 and
+# the jaw contact band's z=-0.2111; task code uses it only if that optional TF
+# frame is absent.  It does not alter the robot description.
+jaw_center_offset_m: [0.0, 0.0, -0.0921]
+
+# Only used when task_manager is explicitly launched with
+# allow_pose_fallback:=true.  It is intentionally not a normal task input.
+debug_pose_fallbacks:
+  red_cube: [-0.43, 0.18]
+  blue_cube: [-0.43, -0.18]
+  red_target_zone: [-0.75, 0.18]
+  blue_target_zone: [-0.75, -0.18]
+motion:
+  # Transit stays in the verified raised corridor.  Contact descents are kept
+  # slow so the physical jaw collision bodies do not impart an ODE impulse to
+  # the cube; lift uses an intermediate value while carrying real contact.
+  velocity_scale: 0.20
+  acceleration_scale: 0.20
+  # The Gazebo force servo needs a multi-second profile for the final 80 mm
+  # descent.  Faster profiles reached the controller's joint tolerance while
+  # the TF-measured TCP was still at the approach height.
+  contact_velocity_scale: 0.02
+  contact_acceleration_scale: 0.02
+  lift_velocity_scale: 0.03
+  lift_acceleration_scale: 0.03

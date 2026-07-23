@@ -10,12 +10,13 @@ robot:
   end_effector_link: end_effector
   end_effector_name: ee
 
-  # KDL's IK tip must be the last link after an active joint, not the fixed
-  # TCP child.  The transform is the URDF end_effector_joint transform from
-  # this link to end_effector.  Keep it in sync with el_a3.urdf.xacro.
-  ik_link: l5_l6_urdf_asm
+  # Keep the public TCP as the MoveIt constraint link.  KDL supports a fixed
+  # terminal segment and MoveIt can therefore keep the same end-effector
+  # frame for FK, IK and pose constraints.  Using the preceding active link
+  # here caused the motion layer to apply a second, incompatible TCP offset.
+  ik_link: end_effector
   tcp_offset_from_ik_link:
-    xyz: [0.0, 0.0, -0.074]
+    xyz: [0.0, 0.0, 0.0]
     rpy: [0.0, 0.0, 0.0]
 
 moveit:
@@ -105,12 +106,23 @@ named_poses:
 
 gripper_positions:
   open:
-    position: 1.5708
+    # Stay just inside the mechanical full-open stop.  This reduces the
+    # free jaw span by a few millimetres so the open fingers do not sweep the
+    # neighbouring cube, while still clearing a 40 mm cube comfortably.
+    position: 1.00
     duration_sec: 1.0
 
   close:
-    position: 0.0
-    duration_sec: 1.0
+    # The jaw mimic is force-driven in Gazebo.  Do not command its mechanical
+    # full-close stop: the slightly backed-off endpoint below keeps a 40 mm
+    # cube between both pads without the former closing impulse.
+    # Stop just before the previous full-close command.  At the simulated
+    # mimic ratio this requests a 32 mm carriage travel rather than 34 mm,
+    # avoiding the ejection impulse while retaining real two-pad contact.
+    position: 0.06
+    # Let both physics-driven jaw carriages reach contact and settle before
+    # the task begins its lift; this remains a real trajectory command.
+    duration_sec: 6.0
 
 motion:
   # 兼容当前 FollowJointTrajectory 命名位姿执行逻辑
@@ -118,6 +130,11 @@ motion:
 
   # MoveIt2 速度和加速度缩放
   default_velocity_scale: 0.2
+  # Preserve the reachable wrist branch through small Cartesian-like vertical
+  # descents.  KDL otherwise selects a second pose-equivalent L6 solution
+  # roughly 1.3 rad away after object_approach.
+  l6_pose_target: 0.0
+  l6_pose_tolerance: 0.35
   default_acceleration_scale: 0.2
 
   min_velocity_scale: 0.01
