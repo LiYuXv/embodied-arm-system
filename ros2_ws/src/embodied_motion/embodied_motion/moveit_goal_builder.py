@@ -15,7 +15,7 @@ from shape_msgs.msg import SolidPrimitive
 
 
 class MoveItGoalBuilder:
-    """构造并校验 EDULITE_A3 的 MoveGroup 规划目标。"""
+    """Build and validate EDULITE A3 MoveGroup goals."""
 
     def __init__(self, config: dict):
         robot_config = config["robot"]
@@ -107,8 +107,7 @@ class MoveItGoalBuilder:
         velocity_scale: float,
         acceleration_scale: float,
     ) -> MoveGroup.Goal:
-        """根据完整关节目标构造 MoveGroup Goal。"""
-
+        """Build a MoveGroup goal from a complete joint target."""
         if not joint_names:
             raise ValueError("joint_names must not be empty")
 
@@ -157,8 +156,7 @@ class MoveItGoalBuilder:
         velocity_scale: float,
         acceleration_scale: float,
     ) -> MoveGroup.Goal:
-        """根据末端位姿目标构造 MoveGroup Goal。"""
-
+        """Build a MoveGroup goal from an end-effector pose."""
         target_pose = copy.deepcopy(target_pose)
         frame_id = target_pose.header.frame_id.strip()
 
@@ -268,8 +266,7 @@ class MoveItGoalBuilder:
         velocity_scale: float,
         acceleration_scale: float,
     ) -> MoveGroup.Goal:
-        """构造关节目标和位姿目标共用的 MoveGroup Goal 字段。"""
-
+        """Build fields common to joint and pose MoveGroup goals."""
         velocity_scale = self._validate_scale(
             name="velocity_scale",
             value=velocity_scale,
@@ -332,8 +329,7 @@ class MoveItGoalBuilder:
         self,
         target_pose: PoseStamped,
     ) -> None:
-        """检查 Pose 中的数值和四元数是否合法。"""
-
+        """Validate finite pose values and a normalized quaternion."""
         position = target_pose.pose.position
         orientation = target_pose.pose.orientation
 
@@ -479,8 +475,7 @@ class MoveItGoalBuilder:
         minimum: float,
         maximum: float,
     ) -> float:
-        """检查速度或加速度缩放是否合法。"""
-
+        """Validate a velocity or acceleration scale."""
         value = float(value)
 
         if not math.isfinite(value):

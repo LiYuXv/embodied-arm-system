@@ -1,49 +1,58 @@
 # Visual XY is mandatory in normal operation.  These are shared physical
-# dimensions, not per-colour fixed grasp poses.  The raised thin tray's actual
-# top is base_link z=0.2015 m; adding half the cube height puts the finger
-# contact band through the cube centre (z=0.224 m), not at its upper edge.
-table_plane_z_m: 0.2015
-cube_support_plane_z_m: 0.2015
+# dimensions, not per-colour fixed grasp poses.  The low thin tray's actual
+# The operation deck is raised just enough that the existing jaw-pad midpoint
+# meets the cube centre without the lower pad edge touching the deck.
+table_plane_z_m: 0.0915
+cube_support_plane_z_m: 0.0915
 cube_height_m: 0.040
-# Put the 42 mm-tall physical jaw band 20 mm above the cube midline.  Its
-# lower edge then remains above the continuous deck while still overlapping
-# 23 mm of the 45 mm cube side face.  This prevents the wrist/jaw lower edge
-# from sweeping the deck or cube before the two pads can close.
-grasp_band_height_offset_m: 0.020
+# The pad collision body is 87 mm tall.  Its centre must sit above cube
+# centre: centred pads entered the operation deck during the vertical descent
+# and pushed the cube sideways before closing.  At +25 mm, the lower pad edge
+# remains 1 mm above the lowered deck while its opposing faces grip the cube's
+# upper half.  This is expressed relative to the live visual object centre.
+grasp_band_height_offset_m: 0.025
 # The camera is millimetre-accurate but the physical jaw collision band has a
 # narrow contact window.  These are relative visual XY candidates, tried only
 # after a failed real-contact close; no fixed world/object pose is used.
+## Physical Gazebo feedback for the edge-aligned wrist shows a repeatable
+## +8 mm TCP X bias during the final force-servo descent.  Apply its inverse
+## to the *fresh visual object centre* first, then retain symmetric local
+## retries; this is not a fixed world pickup coordinate.
 grasp_contact_offsets_m: [[0.0, 0.0], [0.003, 0.003], [-0.003, -0.003],
                            [0.006, 0.006], [-0.006, -0.006],
                            [0.003, -0.003], [-0.003, 0.003],
                            [0.006, -0.006], [-0.006, 0.006],
                            [0.010, 0.010], [-0.010, -0.010],
                            [0.010, -0.010], [-0.010, 0.010]]
-# The compact 10 mm finger pads grip at the cube's mid-band.  Keep the open
-# jaws above the 45 mm cube before the final vertical descent, then use the
-# same clearance for lift/retreat.
-approach_height_m: 0.08
-# Default vertical clearance above the visual grasp centre.  Alternative side
-# approaches remain generated dynamically when a validated candidate exists.
-approach_vector_m: [0.0, 0.0, 0.080]
-# Descend beside the cube, then make the short physical side approach.  The
-# vector is in base_link and recomputed from each fresh visual detection.
-side_approach_vector_m: [0.0, 0.0, 0.0]
-lift_height_m: 0.08
-retreat_height_m: 0.08
-orientation_xyzw: [0.652818, 0.270495, 0.271278, 0.653505]
-# The compact raised layout has two collision-checked wrist corridors.  The
-# task selects by visual object/region; it never falls back to fixed XYZ.
+# The jaw pads extend 43.5 mm below/above their centre.  A 5 mm approach put
+# the opened fingers through the cube's upper edge before the final descent,
+# physically pushing the live visual target away.  The A3 KDL branch reaches
+# a public TCP near 0.24 m.  Ten millimetres is inside that reachable branch
+# while doubling the former unsafe 5 mm direct-clearance band.
+approach_height_m: 0.010
+approach_vector_m: [0.0, 0.0, 0.010]
+# The A3 reaches the compact tray through a narrow wrist branch.  A 5 mm
+# strictly vertical break-away clears the operation board without crossing its
+# Cartesian singularity; the following collision-checked MoveIt transit then
+# raises and carries the physically grasped cube to the target region.
+lift_height_m: 0.005
+retreat_height_m: 0.005
+# Keep the gripper vertical, centred over the visually detected cube, with its
+# two finger pads parallel to the cube faces.  The approach and lift are thus
+# direct vertical lines in front of the robot instead of a lateral side-entry.
+orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+# A cube is pinched from directly above.  After the lift, MoveIt is allowed to
+# rotate the wrist into this established forward-facing placement attitude;
+# this keeps the distant target-row placement in the KDL reachable branch.
 orientation_by_object:
-  red_cube: [0.652818, 0.270495, 0.271278, 0.653505]
-  red_target_zone: [0.652818, 0.270495, 0.271278, 0.653505]
-  blue_cube: [0.652818, 0.270495, 0.271278, 0.653505]
-  blue_target_zone: [0.652818, 0.270495, 0.271278, 0.653505]
-# The unmodified vendor URDF has no grasp_center link.  This is its existing
-# fixed geometry, derived from end_effector z=-0.074, gripper_base z=0.045 and
-# the jaw contact band's z=-0.2111; task code uses it only if that optional TF
-# frame is absent.  It does not alter the robot description.
-jaw_center_offset_m: [0.0, 0.0, -0.0921]
+  red_cube: [0.0, 0.0, 0.0, 1.0]
+  red_target_zone: [0.0, 0.3826834, 0.0, 0.9238795]
+  blue_cube: [0.0, 0.0, 0.0, 1.0]
+  blue_target_zone: [0.0, 0.3826834, 0.0, 0.9238795]
+# The Classic adapter publishes grasp_center at the midpoint of the existing
+# jaw collision pads.  This remains a fallback only if that adapter TF is not
+# available; normal tasks read the same transform directly from TF.
+jaw_center_offset_m: [0.0, 0.0003, -0.0921]
 
 # Only used when task_manager is explicitly launched with
 # allow_pose_fallback:=true.  It is intentionally not a normal task input.
@@ -63,5 +72,8 @@ motion:
   # the TF-measured TCP was still at the approach height.
   contact_velocity_scale: 0.02
   contact_acceleration_scale: 0.02
-  lift_velocity_scale: 0.03
-  lift_acceleration_scale: 0.03
+  # A true frictional grasp needs a slower physical lift than free-space
+  # transit; motion_executor converts this scale into the Cartesian segment
+  # duration rather than ignoring it.
+  lift_velocity_scale: 0.01
+  lift_acceleration_scale: 0.01

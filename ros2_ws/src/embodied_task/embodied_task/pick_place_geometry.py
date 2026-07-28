@@ -48,10 +48,6 @@ def build_pick_place_poses(
         float(value)
         for value in config.get("approach_vector_m", (0.0, 0.0, approach_height))
     )
-    side_approach_vector = tuple(
-        float(value)
-        for value in config.get("side_approach_vector_m", (0.0, 0.0, 0.0))
-    )
     # The vendor jaw collision pad is 42 mm tall while the cube is 45 mm
     # tall.  On the raised support its exact mid-band leaves only millimetres
     # above the support top, so normal trajectory tolerance makes the fingers
@@ -75,13 +71,12 @@ def build_pick_place_poses(
 
     return {
         "object_approach": tcp_for_jaw_center(
-            object_x + side_approach_vector[0],
-            object_y + side_approach_vector[1],
+            object_x,
+            object_y,
             object_contact_z + approach_vector[2], object_orientation
         ),
         "object_side_pregrasp": tcp_for_jaw_center(
-            object_x + side_approach_vector[0],
-            object_y + side_approach_vector[1], object_contact_z,
+            object_x, object_y, object_contact_z,
             object_orientation
         ),
         "object_grasp": tcp_for_jaw_center(

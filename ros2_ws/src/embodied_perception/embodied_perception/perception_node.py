@@ -38,6 +38,7 @@ class PerceptionNode(Node):
         self.declare_parameter("table_plane_z_m", -0.02)
         self.declare_parameter("cube_top_plane_z_m", 0.05)
         self.declare_parameter("target_zone_plane_z_m", -0.004)
+        self.declare_parameter("cube_xy_calibration_offset_m", [0.0, 0.0])
         self.declare_parameter("image_to_base_homography", [0.0])
 
         self.rgb_topic = str(self.get_parameter("rgb_topic").value)
@@ -56,21 +57,24 @@ class PerceptionNode(Node):
         self.target_zone_plane_z = float(
             self.get_parameter("target_zone_plane_z_m").value
         )
+        self.cube_xy_calibration_offset = tuple(
+            float(value)
+            for value in self.get_parameter("cube_xy_calibration_offset_m").value
+        )
+        if len(self.cube_xy_calibration_offset) != 2:
+            raise ValueError("cube_xy_calibration_offset_m must contain [x, y]")
         homography_values = list(
             self.get_parameter("image_to_base_homography").value
         )
-        # Calibrated for camera_main and the raised 2x2 sorting board.  This
-        # maps current image pixels into base_link; it is not a per-object
-        # pose fallback and therefore continues to respond to visual motion.
-        default_homography = [
-            0.011679817586, 0.038269035091, -6.164150801294,
-            0.004489959975, -0.027546018363, 2.639551343672,
-            0.000337339241, -0.041559291884, 1.0,
-        ]
+        # A homography is valid only for the exact plane and camera pose from
+        # which it was calibrated.  Do not silently resurrect an old board
+        # homography when the parameter is deliberately disabled: that maps
+        # visible objects to stale coordinates and sends the arm to a wrong
+        # grasp point.  The calibrated camera ray is the general path.
         self.image_to_base_homography = (
             numpy.asarray(homography_values, dtype=float).reshape(3, 3)
             if len(homography_values) == 9
-            else numpy.asarray(default_homography, dtype=float).reshape(3, 3)
+            else None
         )
         self.bridge = CvBridge()
         self.latest_rgb: Optional[Image] = None
@@ -214,13 +218,25 @@ class PerceptionNode(Node):
                 return None
             return (float(mapped[0] / mapped[2]),
                     float(mapped[1] / mapped[2]), plane_z)
-        return project_pixel_to_table(
+        point = project_pixel_to_table(
             detection.pixel,
             self.latest_camera_info.k,
             self.camera_translation,
             self.camera_rotation,
             plane_z,
         )
+        # camera_main sees the small cube's top and one side at an oblique
+        # angle.  Its HSV contour centre therefore has a repeatable offset
+        # from the physical cube centre, unlike the flat target marker.  This
+        # is a calibration correction of the live image projection, not a
+        # task-level fallback coordinate.
+        if detection.category == "cube":
+            return (
+                point[0] + self.cube_xy_calibration_offset[0],
+                point[1] + self.cube_xy_calibration_offset[1],
+                point[2],
+            )
+        return point
 
     def _projection_plane_for(self, category: str) -> float:
         """Use the visible cube top or the static marker surface as needed."""

@@ -28,7 +28,7 @@ from embodied_motion.moveit_goal_builder import MoveItGoalBuilder
 
 
 class MotionExecutorNode(Node):
-    """EDULITE_A3 统一运动规划与执行节点。"""
+    """Plan and execute EDULITE A3 motions."""
 
     MOVEIT_ERROR_NAMES = {
         MoveItErrorCodes.SUCCESS: "SUCCESS",
@@ -889,13 +889,13 @@ class MotionExecutorNode(Node):
         execute_goal = ExecuteTrajectory.Goal()
         execute_goal.trajectory = response.solution
         # GetCartesianPath supplies a collision-checked geometric path but no
-        # usable timing for Classic's spline controller.  Its many zero-time
-        # waypoints made the controller oscillate even though a direct L6
-        # trajectory tracks correctly.  Keep MoveIt's full path validation,
-        # then execute its terminal joint state as one slow, physical FJT
-        # segment from the current state.
-        startpoint = execute_goal.trajectory.joint_trajectory.points[0]
-        endpoint = execute_goal.trajectory.joint_trajectory.points[-1]
+        # timing.  Preserve its full, genuinely Cartesian sequence and give
+        # every sampled joint waypoint a monotonic timestamp for Classic's
+        # spline controller.  Collapsing this to one terminal joint point
+        # caused the physical PID arm to settle above the cube on a vertical
+        # descent even though the endpoint was valid.
+        path_points = execute_goal.trajectory.joint_trajectory.points
+        endpoint = path_points[-1]
         self.get_logger().info(
             "Cartesian endpoint joint target: "
             + ", ".join(
@@ -906,13 +906,40 @@ class MotionExecutorNode(Node):
                 )
             )
         )
-        startpoint.time_from_start = Duration(sec=0, nanosec=0)
-        startpoint.velocities = []
-        startpoint.accelerations = []
-        endpoint.time_from_start = Duration(sec=5, nanosec=0)
-        endpoint.velocities = []
-        endpoint.accelerations = []
-        execute_goal.trajectory.joint_trajectory.points = [startpoint, endpoint]
+        # Honour the task's contact/lift velocity scale.  A fixed five-second
+        # duration made a supposedly slow physical lift execute at the same
+        # speed as every transit, so Gazebo's frictional jaw contact had no
+        # settling margin.  The reference 15 cm Cartesian segment takes five
+        # seconds at 0.03; retain a bounded duration for robustness.
+        duration_sec = max(3.0, min(20.0, 0.15 / max(velocity_scale, 0.01)))
+        duration_whole = int(duration_sec)
+        duration_nanos = int((duration_sec - duration_whole) * 1_000_000_000)
+        timed_points = []
+        point_count = len(path_points)
+        # Omit MoveIt's first geometric sample: it is an approximation of the
+        # planning-scene state, whereas JTC must start from actual feedback.
+        # The first retained point gets a positive time, so no zero-time jump
+        # is injected into the physical controller.
+        for index, point in enumerate(path_points[1:], start=1):
+            ratio = index / max(point_count - 1, 1)
+            point_duration = duration_sec * ratio
+            seconds = int(point_duration)
+            nanoseconds = int(round((point_duration - seconds) * 1_000_000_000))
+            if nanoseconds >= 1_000_000_000:
+                seconds += 1
+                nanoseconds -= 1_000_000_000
+            point.time_from_start = Duration(sec=seconds, nanosec=nanoseconds)
+            point.velocities = []
+            point.accelerations = []
+            timed_points.append(point)
+        if not timed_points:
+            endpoint.time_from_start = Duration(
+                sec=duration_whole, nanosec=duration_nanos
+            )
+            endpoint.velocities = []
+            endpoint.accelerations = []
+            timed_points = [endpoint]
+        execute_goal.trajectory.joint_trajectory.points = timed_points
         handle = await self.execute_trajectory_client.send_goal_async(execute_goal)
         if not handle.accepted:
             return False, "ExecuteTrajectory rejected Cartesian path", GoalStatus.STATUS_ABORTED

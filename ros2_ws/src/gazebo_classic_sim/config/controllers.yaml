@@ -49,5 +49,12 @@ gripper_controller:
     allow_nonzero_velocity_at_trajectory_end: false
     constraints:
       stopped_velocity_tolerance: 0.03
-      goal_time: 0.5
-      L7_joint: {goal: 0.03}
+      # L7 is only the gripper driver coordinate.  During a real two-pad
+      # contact it stops slightly short of the requested driver zero even
+      # though the physical jaws are holding the cube.  Task success remains
+      # gated by both jaw contacts and a measured Gazebo cube lift, so this
+      # tolerance cannot turn a missed grasp into success.
+      # Closing stops against a real cube.  Give the driver enough time to
+      # settle without treating an allowed contact preload as a timeout.
+      goal_time: 8.0
+      L7_joint: {goal: 0.08}

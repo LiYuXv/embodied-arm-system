@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.task import Future
 from rclpy.time import Time
 from shape_msgs.msg import SolidPrimitive
+from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
 
 from embodied_task.pick_place_geometry import PoseSpec, build_pick_place_poses
@@ -47,7 +48,10 @@ class TaskManagerNode(Node):
         self.declare_parameter("max_tcp_position_error_m", 0.050)
         self.declare_parameter("min_object_region_separation_m", 0.040)
         self.declare_parameter("gazebo_physics_validation", False)
-        self.declare_parameter("minimum_lift_delta_m", 0.035)
+        # The physical break-away segment is 5 mm.  Requiring 35 mm made a
+        # genuine lift mathematically impossible; 3 mm still proves that the
+        # dynamic cube followed most of the commanded real motion.
+        self.declare_parameter("minimum_lift_delta_m", 0.003)
         self.declare_parameter("maximum_region_center_error_m", 0.025)
         self.pick_place_config = self._load_pick_place_config()
         self.tf_buffer = Buffer()
@@ -72,6 +76,9 @@ class TaskManagerNode(Node):
         )
         self.right_contact_subscription = self.create_subscription(
             ContactsState, "/gripper_contacts/right", self._handle_right_contacts, 10
+        )
+        self.joint_state_subscription = self.create_subscription(
+            JointState, "/joint_states", self._handle_joint_states, 30
         )
         self.named_pose_client = self.create_client(
             MoveNamedPose, "/motion/go_named_pose"
@@ -99,6 +106,13 @@ class TaskManagerNode(Node):
         self._initial_target_world_position: Optional[List[float]] = None
         self._left_target_contact = False
         self._right_target_contact = False
+        self._left_target_contact_force_n = 0.0
+        self._right_target_contact_force_n = 0.0
+        self._left_target_contact_force_vector = (0.0, 0.0, 0.0)
+        self._right_target_contact_force_vector = (0.0, 0.0, 0.0)
+        self._jaw_velocity = {"left_jaw_joint": None, "right_jaw_joint": None}
+        self._jaw_stable_since: Optional[float] = None
+        self._grasp_settle_deadline: Optional[float] = None
         self._grasp_candidates: List[Dict[str, PoseSpec]] = []
         self._grasp_candidate_index = 0
         self._post_grasp_steps: List[TaskStep] = []
@@ -128,6 +142,13 @@ class TaskManagerNode(Node):
             for name, pose in zip(message.name, message.pose)
         }
 
+    def _handle_joint_states(self, message: JointState) -> None:
+        """Track the true physics jaw velocities, not merely driver L7."""
+        velocity_by_name = dict(zip(message.name, message.velocity))
+        for name in self._jaw_velocity:
+            if name in velocity_by_name:
+                self._jaw_velocity[name] = velocity_by_name[name]
+
     def _handle_left_contacts(self, message: ContactsState) -> None:
         """Record only real Gazebo contact between the left jaw and task cube."""
         # Contact sensors can publish an empty sample between ODE updates.
@@ -136,6 +157,7 @@ class TaskManagerNode(Node):
             self._left_target_contact
             or self._message_contacts_physical_target(message)
         )
+        self._update_contact_force("left", message)
 
     def _handle_right_contacts(self, message: ContactsState) -> None:
         """Record only real Gazebo contact between the right jaw and task cube."""
@@ -143,6 +165,7 @@ class TaskManagerNode(Node):
             self._right_target_contact
             or self._message_contacts_physical_target(message)
         )
+        self._update_contact_force("right", message)
 
     def _message_contacts_physical_target(self, message: ContactsState) -> bool:
         target = self._physical_target_name
@@ -153,6 +176,33 @@ class TaskManagerNode(Node):
             target_collision in (state.collision1_name, state.collision2_name)
             for state in message.states
         )
+
+    def _target_contact_force_vector(self, message: ContactsState) -> tuple[float, float, float]:
+        """Return the largest resultant target-contact force vector."""
+        target = self._physical_target_name
+        if not target:
+            return 0.0, 0.0, 0.0
+        target_collision = f"{target}::link::collision"
+        forces = []
+        for state in message.states:
+            if target_collision not in (state.collision1_name, state.collision2_name):
+                continue
+            force = state.total_wrench.force
+            magnitude = sqrt(force.x * force.x + force.y * force.y + force.z * force.z)
+            forces.append((magnitude, force.x, force.y, force.z))
+        _, x, y, z = max(forces, default=(0.0, 0.0, 0.0, 0.0))
+        return x, y, z
+
+    def _update_contact_force(self, side: str, message: ContactsState) -> None:
+        """Keep the peak target contact vector through the close settle time."""
+        x, y, z = self._target_contact_force_vector(message)
+        magnitude = sqrt(x * x + y * y + z * z)
+        if side == "left" and magnitude > self._left_target_contact_force_n:
+            self._left_target_contact_force_n = magnitude
+            self._left_target_contact_force_vector = (x, y, z)
+        elif side == "right" and magnitude > self._right_target_contact_force_n:
+            self._right_target_contact_force_n = magnitude
+            self._right_target_contact_force_vector = (x, y, z)
 
     def _handle_task_command(self, message: TaskCommand) -> None:
         self.get_logger().info(
@@ -283,6 +333,10 @@ class TaskManagerNode(Node):
         self.current_command_id = command_id
         self._left_target_contact = False
         self._right_target_contact = False
+        self._left_target_contact_force_n = 0.0
+        self._right_target_contact_force_n = 0.0
+        self._left_target_contact_force_vector = (0.0, 0.0, 0.0)
+        self._right_target_contact_force_vector = (0.0, 0.0, 0.0)
         self._post_grasp_steps = [
             TaskStep(
                 "pose", poses["region_approach"], "移动到目标区域上方",
@@ -299,6 +353,11 @@ class TaskManagerNode(Node):
             ),
         ]
         self.pending_steps = [
+            # Gazebo's controller state can take several cycles to converge
+            # after spawn.  Start every visual task from the declared safe
+            # home state, then generate every manipulation pose from vision.
+            # This is not a fixed pre-pick waypoint.
+            TaskStep("named", "home", "回到安全初始位姿"),
             TaskStep(
                 "scene_add", (target_name, object_xy), "将目标方块加入 MoveIt 碰撞场景"
             ),
@@ -311,7 +370,7 @@ class TaskManagerNode(Node):
                 "scene_remove", target_name, "允许目标方块进入夹持接触区",
             ),
             TaskStep(
-                "pose", self._grasp_candidates[0]["object_grasp"], "垂直下降到抓取点",
+                "pose", self._grasp_candidates[0]["object_grasp"], "垂直下降到目标方块抓取点",
                 contact_velocity, contact_acceleration, "linear",
             ),
             TaskStep("gripper", "close", "关闭夹爪抓取"),
@@ -609,6 +668,8 @@ class TaskManagerNode(Node):
                 step.value, step.velocity_scale, step.acceleration_scale,
                 step.motion_type,
             )
+        elif step.operation == "named":
+            self._call_pick_place_named(str(step.value))
         else:
             self._abort_pick_place(f"不支持的抓放步骤：{step.operation}")
 
@@ -620,11 +681,41 @@ class TaskManagerNode(Node):
             # A previous candidate must not satisfy this candidate's check.
             self._left_target_contact = False
             self._right_target_contact = False
+            self._left_target_contact_force_n = 0.0
+            self._right_target_contact_force_n = 0.0
+            self._left_target_contact_force_vector = (0.0, 0.0, 0.0)
+            self._right_target_contact_force_vector = (0.0, 0.0, 0.0)
+            self._jaw_stable_since = None
+            self._grasp_settle_deadline = None
         request = SetGripper.Request()
         request.position_name = position_name
         self.gripper_client.call_async(request).add_done_callback(
             self._handle_pick_place_service_result
         )
+
+    def _call_pick_place_named(self, pose_name: str) -> None:
+        """Move to the safe named posture before a vision-driven task."""
+        if not self.named_pose_client.wait_for_service(2.0):
+            self._abort_pick_place("命名位姿服务不可用")
+            return
+        request = MoveNamedPose.Request()
+        request.pose_name = pose_name
+        self.named_pose_client.call_async(request).add_done_callback(
+            self._handle_pick_place_named_result
+        )
+
+    def _handle_pick_place_named_result(self, future: Future) -> None:
+        try:
+            response = future.result()
+            if response is None or not response.success:
+                self._abort_pick_place(
+                    response.message if response is not None else "命名位姿没有返回结果"
+                )
+                return
+        except Exception as error:
+            self._abort_pick_place(f"命名位姿调用异常：{error}")
+            return
+        self._settle_timer = self.create_timer(0.75, self._continue_after_gripper)
 
     def _handle_pick_place_service_result(self, future: Future) -> None:
         try:
@@ -639,12 +730,16 @@ class TaskManagerNode(Node):
             return
         if self.active_step_label == "关闭夹爪抓取":
             self._log_gazebo_cube_position("闭合结束、抬升前")
-            # The trajectory action reports before the next Gazebo contact
-            # sample.  Evaluate after a bounded physical settling interval,
-            # never immediately from stale/empty sensor state.
-            self.get_logger().info("夹爪闭合完成；等待 Gazebo 接触传感器刷新")
+            # The trajectory action only reports the driver L7.  The two
+            # independently force-driven carriages can still be moving when
+            # L7 reaches its endpoint.  Do not interpret a transient impact
+            # as a grasp: wait for both *actual* jaw velocities to settle.
+            self._grasp_settle_deadline = monotonic() + 4.0
+            self.get_logger().info(
+                "夹爪驱动关节闭合完成；等待左右真实手指静止并刷新 Gazebo 接触"
+            )
             self._grasp_contact_timer = self.create_timer(
-                0.50, self._evaluate_grasp_contact
+                0.10, self._evaluate_grasp_contact
             )
             return
         # Gazebo publishes the final arm/gripper state a few cycles after the
@@ -653,14 +748,51 @@ class TaskManagerNode(Node):
         self._settle_timer = self.create_timer(0.75, self._continue_after_gripper)
 
     def _evaluate_grasp_contact(self) -> None:
-        """Allow lift only after real left and right jaw contact was observed."""
+        """Allow lift only after a settled, real two-pad physical grasp."""
+        velocities = tuple(self._jaw_velocity.values())
+        have_jaw_feedback = all(value is not None for value in velocities)
+        jaws_still = have_jaw_feedback and all(
+            abs(float(value)) <= 0.01 for value in velocities
+        )
+        now = monotonic()
+        if jaws_still:
+            self._jaw_stable_since = self._jaw_stable_since or now
+        else:
+            self._jaw_stable_since = None
+
+        stable_for = (
+            0.0 if self._jaw_stable_since is None
+            else now - self._jaw_stable_since
+        )
+        if stable_for < 0.40:
+            if self._grasp_settle_deadline is not None and now >= self._grasp_settle_deadline:
+                if self._grasp_contact_timer is not None:
+                    self._grasp_contact_timer.cancel()
+                    self.destroy_timer(self._grasp_contact_timer)
+                    self._grasp_contact_timer = None
+                self._abort_pick_place(
+                    "夹爪驱动到位后左右真实手指仍未静止；已停止，未执行抬升。"
+                    "jaw_velocity=%s" % (velocities,)
+                )
+            return
+
         if self._grasp_contact_timer is not None:
             self._grasp_contact_timer.cancel()
             self.destroy_timer(self._grasp_contact_timer)
             self._grasp_contact_timer = None
         self.get_logger().info(
-            "夹持接触结果：left=%s right=%s"
-            % (self._left_target_contact, self._right_target_contact)
+            "夹持接触结果（手指已静止 %.2f s，velocity=%s）："
+            "left=%s (%.3f N, [%.3f, %.3f, %.3f]) "
+            "right=%s (%.3f N, [%.3f, %.3f, %.3f])"
+            % (
+                stable_for, velocities,
+                self._left_target_contact,
+                self._left_target_contact_force_n,
+                *self._left_target_contact_force_vector,
+                self._right_target_contact,
+                self._right_target_contact_force_n,
+                *self._right_target_contact_force_vector,
+            )
         )
         if not (self._left_target_contact and self._right_target_contact):
             if self._schedule_next_grasp_candidate():
@@ -670,7 +802,11 @@ class TaskManagerNode(Node):
                 "未执行抬升"
             )
             return
-        self._settle_timer = self.create_timer(0.30, self._continue_after_gripper)
+        # The jaw carriages are independently force-servoed in Gazebo.  Let
+        # their bounded PD controller dissipate its final contact motion
+        # before a vertical lift; starting after a single sensor sample can
+        # turn an otherwise valid two-pad pinch into a slide on the deck.
+        self._settle_timer = self.create_timer(1.20, self._continue_after_gripper)
 
     def _schedule_next_grasp_candidate(self) -> bool:
         """Retry a small visual-relative grasp offset before any lift occurs."""
@@ -689,7 +825,6 @@ class TaskManagerNode(Node):
                 "pose", candidate["object_approach"], "移动到候选抓取点上方",
                 float(motion.get("contact_velocity_scale", motion["velocity_scale"])),
                 float(motion.get("contact_acceleration_scale", motion["acceleration_scale"])),
-                "linear",
             ),
             TaskStep(
                 "pose", candidate["object_grasp"], "垂直下降到候选抓取点",
@@ -707,6 +842,12 @@ class TaskManagerNode(Node):
         ] + self._post_grasp_steps
         self._left_target_contact = False
         self._right_target_contact = False
+        self._left_target_contact_force_n = 0.0
+        self._right_target_contact_force_n = 0.0
+        self._left_target_contact_force_vector = (0.0, 0.0, 0.0)
+        self._right_target_contact_force_vector = (0.0, 0.0, 0.0)
+        self._jaw_stable_since = None
+        self._grasp_settle_deadline = None
         self._settle_timer = self.create_timer(0.75, self._continue_after_gripper)
         return True
 

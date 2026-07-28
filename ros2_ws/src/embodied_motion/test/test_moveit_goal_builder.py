@@ -45,16 +45,15 @@ def test_pose_goal_uses_a_spherical_position_region(builder):
     position = constraints.position_constraints[0]
 
     assert position.header.frame_id == "base_link"
-    assert position.link_name == "end_effector"
+    assert position.link_name == "l5_l6_urdf_asm"
     primitive = position.constraint_region.primitives[0]
     region_pose = position.constraint_region.primitive_poses[0]
     assert primitive.type == SolidPrimitive.SPHERE
     assert primitive.dimensions == pytest.approx([0.001])
     assert region_pose.position.x == pytest.approx(pose.pose.position.x)
     assert region_pose.position.y == pytest.approx(pose.pose.position.y)
-    # The KDL chain now terminates at the public TCP, so no second offset is
-    # applied while constraints are constructed.
-    assert region_pose.position.z == pytest.approx(pose.pose.position.z)
+    # The public TCP is fixed 74 mm below KDL's active planning tip.
+    assert region_pose.position.z == pytest.approx(pose.pose.position.z + 0.074)
     assert region_pose.orientation.w == 1.0
 
 
@@ -66,7 +65,7 @@ def test_pose_goal_uses_complete_orientation_constraint(builder):
     orientation = goal.request.goal_constraints[0].orientation_constraints[0]
 
     assert orientation.header.frame_id == "base_link"
-    assert orientation.link_name == "end_effector"
+    assert orientation.link_name == "l5_l6_urdf_asm"
     assert orientation.orientation.w == 1.0
     assert orientation.absolute_x_axis_tolerance == pytest.approx(0.01)
     assert orientation.absolute_y_axis_tolerance == pytest.approx(0.01)

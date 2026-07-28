@@ -1,16 +1,48 @@
 """Shared launch construction for mutually exclusive Gazebo Classic routes."""
 
 import os
+import socket
+from urllib.parse import urlparse
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable, TimerAction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, LogInfo, OpaqueFunction, RegisterEventHandler, SetEnvironmentVariable, TimerAction
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit, OnProcessStart
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+def _require_unused_gazebo_master(context):
+    """Fail before spawning anything into an already-running Gazebo world.
+
+    Classic's factory service is shared by every client connected to a master.
+    If a second launch reuses an existing master, its robot is spawned into the
+    first scene and can look like a disassembled arm or randomly moved cubes.
+    Refuse that ambiguous state rather than silently joining it.
+    """
+    uri = LaunchConfiguration("gazebo_master_uri").perform(context)
+    parsed = urlparse(uri)
+    host = parsed.hostname
+    port = parsed.port
+    if not host or port is None:
+        raise RuntimeError(
+            "gazebo_master_uri must be an absolute URI such as "
+            "http://127.0.0.1:11346"
+        )
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            raise RuntimeError(
+                f"Gazebo master {uri} is already in use. Stop the existing "
+                "system launch before starting a new one; refusing to spawn "
+                "a second robot into that world."
+            )
+    except ConnectionRefusedError:
+        return [LogInfo(msg=f"Gazebo master {uri} is free; starting a fresh workcell.")]
+    except socket.timeout:
+        return [LogInfo(msg=f"Gazebo master {uri} has no reachable listener; starting a fresh workcell.")]
 
 
 def build_classic_launch(world_name, camera_mode="none", perception_config=None):
@@ -105,6 +137,7 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
             "GAZEBO_MASTER_URI",
             LaunchConfiguration("gazebo_master_uri"),
         ),
+        OpaqueFunction(function=_require_unused_gazebo_master),
         gazebo,
         TimerAction(
             period=4.0,

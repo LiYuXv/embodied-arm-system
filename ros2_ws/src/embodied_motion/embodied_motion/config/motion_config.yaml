@@ -10,13 +10,13 @@ robot:
   end_effector_link: end_effector
   end_effector_name: ee
 
-  # Keep the public TCP as the MoveIt constraint link.  KDL supports a fixed
-  # terminal segment and MoveIt can therefore keep the same end-effector
-  # frame for FK, IK and pose constraints.  Using the preceding active link
-  # here caused the motion layer to apply a second, incompatible TCP offset.
-  ik_link: end_effector
+  # KDL solves the arm group only through its last active link.  Keep the
+  # public action in end_effector coordinates, then convert that TCP target
+  # to the configured KDL tip below before building MoveIt constraints.
+  ik_link: l5_l6_urdf_asm
   tcp_offset_from_ik_link:
-    xyz: [0.0, 0.0, 0.0]
+    # URDF fixed joint: l5_l6_urdf_asm -> end_effector.
+    xyz: [0.0, 0.0, -0.074]
     rpy: [0.0, 0.0, 0.0]
 
 moveit:
@@ -106,20 +106,22 @@ named_poses:
 
 gripper_positions:
   open:
-    # Stay just inside the mechanical full-open stop.  This reduces the
-    # free jaw span by a few millimetres so the open fingers do not sweep the
-    # neighbouring cube, while still clearing a 40 mm cube comfortably.
-    position: 1.00
+    # Leave a clear but not extreme opening before the vertical approach.
+    # With the vendor 0.05 jaw offset, L7=1.20 gives about 80 mm free space
+    # for the 40 mm cube and avoids driving the visual jaw meshes to their
+    # mechanical limit.
+    position: 1.20
     duration_sec: 1.0
 
   close:
-    # The jaw mimic is force-driven in Gazebo.  Do not command its mechanical
-    # full-close stop: the slightly backed-off endpoint below keeps a 40 mm
-    # cube between both pads without the former closing impulse.
-    # Stop just before the previous full-close command.  At the simulated
-    # mimic ratio this requests a 32 mm carriage travel rather than 34 mm,
-    # avoiding the ejection impulse while retaining real two-pad contact.
-    position: 0.06
+    # Do not command the L7 mechanical stop.  L7=0 drove the 40 mm cube into
+    # a nominal 3.4 mm gap and physically expelled it from the tray.  With
+    # the vendor mapping q_jaw=0.05-0.031831*L7, 0.50 rad gives a 35.2 mm
+    # finger gap: a modest 4.8 mm two-sided preload, held by the bounded
+    # Gazebo force servo rather than a kinematic attachment.
+    # The controller's contact-tolerant 8 s settling window is configured in
+    # gazebo_classic_sim/config/controllers.yaml.
+    position: 0.50
     # Let both physics-driven jaw carriages reach contact and settle before
     # the task begins its lift; this remains a real trajectory command.
     duration_sec: 6.0
@@ -130,11 +132,11 @@ motion:
 
   # MoveIt2 速度和加速度缩放
   default_velocity_scale: 0.2
-  # Preserve the reachable wrist branch through small Cartesian-like vertical
-  # descents.  KDL otherwise selects a second pose-equivalent L6 solution
-  # roughly 1.3 rad away after object_approach.
+  # Do not constrain L6 to the home branch: the frontal grasp's valid KDL
+  # solution uses a different wrist angle.  All joint limits and collision
+  # checks remain enforced by MoveIt.
   l6_pose_target: 0.0
-  l6_pose_tolerance: 0.35
+  l6_pose_tolerance: 3.14159
   default_acceleration_scale: 0.2
 
   min_velocity_scale: 0.01

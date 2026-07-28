@@ -11,6 +11,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
+    SetEnvironmentVariable,
     TimerAction,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -245,9 +246,25 @@ def generate_launch_description():
             description="Execution backend: mock or gazebo.",
         ),
         DeclareLaunchArgument(
+            "ros_domain_id",
+            default_value="88",
+            description=(
+                "Dedicated ROS 2 domain for this workcell.  It prevents old "
+                "language/task nodes in the default domain from replaying "
+                "commands into a newly started Gazebo session."
+            ),
+        ),
+        SetEnvironmentVariable(
+            "ROS_DOMAIN_ID", LaunchConfiguration("ros_domain_id")
+        ),
+        DeclareLaunchArgument(
             "camera_source",
-            default_value="none",
-            description="Camera route: none, rgbd_sim, dual_rgb_sim, dual_usb.",
+            default_value="dual_rgb_sim",
+            description=(
+                "Camera route: none, rgbd_sim, dual_rgb_sim, dual_usb. "
+                "Gazebo defaults to dual_rgb_sim so the one-command launch "
+                "includes the required camera_main perception pipeline."
+            ),
         ),
         DeclareLaunchArgument(
             "use_rviz",

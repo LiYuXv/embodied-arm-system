@@ -18,17 +18,18 @@ ARM_JOINTS = ("L1_joint", "L2_joint", "L3_joint", "L4_joint", "L5_joint", "L6_jo
 JAW_JOINTS = ("left_jaw_joint", "right_jaw_joint")
 INITIAL_POSITIONS = {
     "L1_joint": 0.0,
-    # Start in the same collision-free working posture as the public
-    # ``ready`` named pose.  The former all-zero posture left the wrist
-    # folded through the work area until a separate command was sent.
+    # Start in the public, collision-free ``home`` posture.  The old startup
+    # value silently used ``ready``, so Gazebo appeared to begin in a task
+    # posture before the user had supplied any instruction.
     "L2_joint": 0.785,
-    "L3_joint": -1.570,
+    "L3_joint": -0.785,
     "L4_joint": 0.0,
-    "L5_joint": 0.785,
+    "L5_joint": 0.0,
     "L6_joint": 0.0,
     "L7_joint": 1.5708,
 }
 JAW_OPEN_POSITION = 0.0
+
 YELLOW_ARM_LINKS = (
     "base_link", "l1_link_urdf_asm", "l1_urdf_urdf_asm", "l2_l3_urdf_asm",
     "l3_lnik_urdf_asm", "l4_l5_urdf_asm", "l5_l6_urdf_asm", "end_effector",
@@ -50,9 +51,9 @@ def command_interface(name, initial_value=None):
     """Create a command interface with the same initial hold target.
 
     GazeboSystem does not copy a state-interface initial value into its command
-    buffer.  With position PID gains enabled, omitting this parameter makes a
-    gravity-loaded robot immediately drive from the configured ready posture
-    toward zero before the first FollowJointTrajectory goal arrives.
+    buffer.  Omitting this parameter makes the robot drive from the configured
+    ready posture toward zero before the first FollowJointTrajectory goal
+    arrives.
     """
     element = etree.Element("command_interface")
     element.set("name", name)
@@ -217,18 +218,22 @@ def add_classic_materials(robot):
         gazebo = etree.SubElement(robot, "gazebo", reference=link_name)
         etree.SubElement(gazebo, "material").text = "Gazebo/DarkGrey"
         etree.SubElement(gazebo, "gravity").text = "false"
-    # The movable cubes use ODE friction as well.  Keep the jaw pads compliant
-    # enough that a 45 g cube is not launched by the two physical fingers at
-    # first contact; holding force comes from friction after the contact has
-    # settled, not from a deeply penetrating position servo.
-    for link_name in ("left_jaw_link", "right_jaw_link"):
-        gazebo = etree.SubElement(robot, "gazebo", reference=link_name)
-        etree.SubElement(gazebo, "mu1").text = "3.0"
-        etree.SubElement(gazebo, "mu2").text = "3.0"
-        etree.SubElement(gazebo, "kp").text = "5000"
-        etree.SubElement(gazebo, "kd").text = "30"
-        etree.SubElement(gazebo, "minDepth").text = "0.0005"
-        etree.SubElement(gazebo, "maxVel").text = "0.002"
+        # Gazebo Classic merges URDF extension values only from one
+        # <gazebo reference="link"> element.  Put visual/gravity and ODE
+        # contact values in this same element; emitting a second reference
+        # silently left the jaw collision pads at Gazebo's default friction.
+        if link_name in ("left_jaw_link", "right_jaw_link"):
+            # The jaw collision boxes represent rubber contact pads; a
+            # A modest rubber-like coefficient is sufficient for the 30 g
+            # cube.  The former value of 8 made a slightly misaligned pad
+            # behave like a hook, so the ODE contact correction could eject
+            # the cube instead of allowing it to settle between both pads.
+            etree.SubElement(gazebo, "mu1").text = "3.0"
+            etree.SubElement(gazebo, "mu2").text = "3.0"
+            etree.SubElement(gazebo, "kp").text = "5000"
+            etree.SubElement(gazebo, "kd").text = "30"
+            etree.SubElement(gazebo, "minDepth").text = "0.0005"
+            etree.SubElement(gazebo, "maxVel").text = "0.002"
 
 
 def add_gripper_contact_sensors(robot):
@@ -263,6 +268,22 @@ def add_gripper_contact_sensors(robot):
         etree.SubElement(plugin, "frame_name").text = link_name
 
 
+def add_grasp_center_frame(robot):
+    """Add a massless semantic frame at the midpoint of the two jaw pads.
+
+    This is an adapter-only fixed frame: it does not alter vendor meshes,
+    joints, collisions or the physical gripper.  It lets task code obtain the
+    TCP-to-contact-centre transform from TF instead of maintaining a
+    direction-sensitive hand-written offset.
+    """
+    etree.SubElement(robot, "link", name="grasp_center")
+    joint = etree.SubElement(robot, "joint", name="grasp_center_joint", type="fixed")
+    etree.SubElement(joint, "parent", link="gripper_base_link")
+    etree.SubElement(joint, "child", link="grasp_center")
+    # Midpoint of the existing left/right jaw collision-pad centres.
+    etree.SubElement(joint, "origin", xyz="0 0.0003 -0.2111", rpy="0 0 0")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--controllers", required=True)
@@ -288,6 +309,7 @@ def main():
 
     add_classic_materials(robot)
     add_gripper_contact_sensors(robot)
+    add_grasp_center_frame(robot)
 
     if args.camera_mode == "rgbd":
         add_rgbd_camera(robot)
@@ -339,24 +361,25 @@ def main():
     etree.SubElement(mimic_plugin, "left_joint").text = "left_jaw_joint"
     etree.SubElement(mimic_plugin, "right_joint").text = "right_jaw_joint"
     etree.SubElement(mimic_plugin, "multiplier").text = "-0.031831"
-    # At q=0.05 the vendor jaw collision pads leave only a 3.4 mm gap and
-    # deeply penetrate a 45 mm sorting cube.  q=0.022 merely touches both
-    # sides (its free gap is still about 59 mm), so it cannot transmit enough
-    # normal force to lift the cube.  q=0.030 leaves a nominal 43 mm gap: a
-    # small, physical 2 mm compression of a 45 mm cube, well below the former
-    # full-closure impulse while providing a frictional hold.  The measured
-    # PD settling lag is about 1.5 mm per carriage, so request 34 mm to obtain
-    # the intended 30 mm held position under contact.
-    etree.SubElement(mimic_plugin, "offset").text = "0.034"
+    # Preserve the vendor's actual jaw kinematic mapping.  Reducing this
+    # offset to 0.038 made a ``close`` command stop with a roughly 61 mm
+    # physical finger gap around a 40 mm cube: the pads could report contact
+    # on an edge yet could not preload the two opposite faces for a frictional
+    # lift.  The effort controller below, rather than a changed geometry or
+    # a kinematic SetPosition call, bounds the contact load safely.
+    etree.SubElement(mimic_plugin, "offset").text = "0.05"
     etree.SubElement(mimic_plugin, "lower_limit").text = "0.0"
     etree.SubElement(mimic_plugin, "upper_limit").text = "0.05"
     # The mimic plugin applies bounded physical effort, never a kinematic
-    # SetPosition.  Four newtons per jaw are already far above the cube's
-    # 0.44 N weight once mu=3 contact is established, while avoiding the
-    # impulse that previously ejected the light cube at full closure.
-    etree.SubElement(mimic_plugin, "position_kp").text = "600.0"
-    etree.SubElement(mimic_plugin, "velocity_kd").text = "8.0"
-    etree.SubElement(mimic_plugin, "max_force").text = "8.0"
+    # attachment.  A 30 g cube needs only about 0.05 N normal force per pad
+    # at mu=3 to resist gravity.  Each vendor prismatic jaw also has 1 N of
+    # static slide friction, so the earlier 0.6 N cap could not close either
+    # carriage at all.  A 1.5 N cap is just above that physical threshold:
+    # after slide friction it leaves roughly 0.5 N per pad, with ample
+    # friction margin and far below the former 8 N ejection impulse.
+    etree.SubElement(mimic_plugin, "position_kp").text = "250.0"
+    etree.SubElement(mimic_plugin, "velocity_kd").text = "20.0"
+    etree.SubElement(mimic_plugin, "max_force").text = "1.5"
 
     sys.stdout.write(etree.tostring(robot, encoding="unicode"))
 
