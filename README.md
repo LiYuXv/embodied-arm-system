@@ -1,12 +1,14 @@
 # 基于自然语言交互的机械臂具身操作系统设计与实现
 
-本科毕业设计项目，面向 EDULITE_A3 机械臂，基于 ROS 2 Humble、MoveIt 2 和 RViz 构建自然语言交互、任务调度、视觉感知与机械臂控制一体化的具身操作系统。
+本科毕业设计项目，面向 EDULITE_A3 机械臂，基于 Ubuntu 22.04、ROS 2 Humble、MoveIt 2、RViz 2 与 Gazebo Classic 构建自然语言交互、视觉感知、任务调度和机械臂操作一体化系统。
 
-当前项目已经完成基础平台适配、机械臂运动执行、中文规则指令解析、任务层解耦、夹爪控制、Gazebo Classic 双相机仿真和系统一键启动。后续将在此基础上扩展更稳健的目标检测、真实相机标定和大语言模型交互。
+当前已完成第一个核心里程碑：
+
+> 中文指令 → 红蓝目标视觉定位 → MoveIt 运动规划 → Gazebo 夹取、搬运与放置 → 回到安全位姿
+
+红色和蓝色方块均已在同一 Gazebo 场景中完成顺序抓放验收。下一阶段将在稳定的基础抓放链路上开展大语言模型交互、LeRobot/VLA 方案调研与真实机械臂迁移。
 
 ## 1. 当前系统架构
-
-当前已经打通的控制链路：
 
 ```text
 中文终端输入
@@ -14,58 +16,46 @@
 embodied_language
 规则解析并发布 TaskCommand
     ↓ /task_command
-embodied_task
-任务调度与并发保护
+embodied_task ← /detected_objects
+任务状态机、视觉目标选择与并发保护
     ↓
 embodied_motion
-MoveIt 运动规划 / 夹爪控制
+MoveIt 规划、笛卡尔运动与夹爪控制
     ↓
 EDULITE_A3 + ros2_control
     ↓
-RViz 仿真执行
+Gazebo Classic / RViz
 ```
 
-当前视觉感知链路：
+视觉链路：
 
 ```text
-RGB 图像 ─────────────┐
-深度图像 ─────────────┼→ embodied_perception
-相机内参 ─────────────┘        ↓
-                         输入状态监测
-                               ↓
-                       /detected_objects
+camera_main RGB 图像 + CameraInfo + 相机外参
+    ↓
+embodied_perception
+HSV 分割、轮廓筛选、像素反投影与平面求交
+    ↓
+red_cube / blue_cube / red_target_zone / blue_target_zone
+    ↓ /detected_objects
+embodied_task
 ```
 
-`embodied_perception` 使用 `camera_main` 的 HSV 分割、`CameraInfo` 和相机外参发布红/蓝方块及红/蓝目标区域到 `/detected_objects`。抓放任务以这些视觉坐标动态计算位姿；视觉结果缺失或过期时会明确终止，默认不会回退到 YAML 固定抓放坐标。
+正常抓放任务使用实时视觉坐标计算目标位姿。视觉结果缺失、过期或必要规划段失败时，任务会明确失败；默认不会使用固定世界坐标伪造成功。
 
-> Gazebo Classic 物理抓放仍处于验收中。语言、视觉、动态位姿与启动链路已接入，但“真实夹起、搬运、释放”尚未完成红蓝最终回归，不能视为已完成。当前启动稳定性和已知问题见 [2026-07-23 开发记录](docs/dev_logs/2026-07-23-gazebo-startup-and-pick-place-status.md)。
+详细完成记录见 [2026-07-30 红蓝方块抓放闭环完成](docs/dev_logs/2026-07-30-pick-place-completion.md)。
 
 ## 2. 已实现功能
 
 ### 2.1 EDULITE_A3 基础平台
 
-- 完成 EDULITE_A3 ROS 2 工程编译与依赖配置；
-- 成功启动 RViz、MoveIt 2 和 ros2_control；
-- 完成机械臂模型加载、运动规划和仿真执行验证；
-- 验证 `arm_controller`、`gripper_controller` 和 `joint_state_broadcaster` 正常运行。
+- 完成 EDULITE_A3 ROS 2 工程和 MoveIt 2 配置接入；
+- 支持 RViz 规划验证与 Gazebo Classic 动力学仿真；
+- 验证 `arm_controller`、`gripper_controller` 和 `joint_state_broadcaster`；
+- 使用安全初始姿态，避免全零伸展构型作为抓放规划起点。
 
-### 2.2 运动执行层
+### 2.2 中文语言交互
 
-- 提供统一命名位姿服务 `/motion/go_named_pose`；
-- 提供夹爪控制服务 `/motion/set_gripper`；
-- 支持机械臂与夹爪执行互斥保护；
-- 当前已验证命名位姿：
-  - `home`
-  - `observe`
-  - `ready`
-  - `pre_pick`
-- 当前已验证夹爪状态：
-  - `open`
-  - `close`
-
-### 2.3 中文语言交互
-
-当前使用规则解析器将中文指令转换为结构化 `TaskCommand`，支持以下类型的表达：
+当前规则解析器将中文指令转换为结构化 `TaskCommand`，支持：
 
 ```text
 回家
@@ -74,49 +64,79 @@ RGB 图像 ─────────────┐
 移动到观察位置
 移动到准备位置
 准备抓取
-移动到预抓取位置
 打开夹爪
 关闭夹爪
-把红色方块抓到红色位置
-把红色方块放到红色区域
-把蓝色方块抓到蓝色位置
+把红色方块放到红色位置
+把红色方块抓到红色区域
+把蓝色方块放到蓝色位置
 把蓝色方块移动到蓝色区域
 ```
 
-解析器能够处理常见空格和中英文标点。无法识别的指令不会触发机械臂动作。
+解析器可处理常见空格和中英文标点；无法识别的输入不会触发机械臂动作。
 
-### 2.4 任务调度层
+### 2.3 视觉感知
 
-- 订阅 `/task_command`；
-- 将语言理解与机械臂运动执行解耦；
-- 根据任务动作调用对应运动服务；
-- 当前支持：
-  - `go_named_pose`
-  - `set_gripper`
-  - `pick_place`（打开夹爪 → 抓取 → 放置 → 抬起）
-- 在任务执行期间拒绝新的并发任务，避免多个指令同时占用运动执行器。
+- 使用固定工作台主相机 `camera_main` 获取 RGB 图像和 `CameraInfo`；
+- 通过 HSV 阈值、形态学处理和轮廓面积区分红蓝方块与红蓝目标区域；
+- 将像素中心反投影为空间射线，并与对应物体表面平面求交；
+- 在 `base_link` 坐标系发布 `DetectedObjectArray`；
+- 支持检测结果时间有效性检查；
+- 红、蓝方块与两个目标区域可同时稳定识别。
 
-### 2.5 视觉感知骨架
+### 2.4 任务调度与抓放状态机
 
-- 订阅 RGB 图像；
-- 订阅对齐后的深度图像；
-- 订阅相机内参 `CameraInfo`；
-- 监测三路相机数据是否到达；
-- 统计各输入话题的消息数量；
-- 无相机时仍可正常启动；
-- 发布 `/detected_objects`；
-- 输出消息优先继承实际 RGB 图像的 `frame_id`；
-- 已通过模拟 RGB-D 消息完成接口验证。
+`embodied_task` 订阅 `/task_command` 与 `/detected_objects`，支持：
 
-### 2.6 系统一键启动
+- `go_named_pose`；
+- `set_gripper`；
+- `pick_place`；
+- 任务执行期间的并发保护；
+- 规划或执行失败时的明确失败反馈。
 
-`embodied_bringup` 可以统一启动：
+已验证抓放流程：
 
 ```text
-MoveIt / ros2_control / RViz
+安全位姿
+→ 打开夹爪
+→ 目标上方
+→ 抓取接触位姿
+→ 闭合夹爪
+→ 抬升
+→ 安全搬运
+→ 目标区域上方
+→ 释放
+→ 撤离
+→ 回 home
+```
+
+### 2.5 运动执行
+
+- `/motion/go_named_pose`：执行命名关节位姿；
+- `/motion/set_gripper`：控制夹爪开合；
+- `/motion/move_to_pose`：通过 MoveIt 执行末端位姿目标；
+- 支持不同阶段的速度和加速度缩放；
+- 接近、抓取、抬升、搬运和放置使用连续规划与执行结果；
+- 抓取和放置姿态允许 L6 根据底座转角进行补偿，而不是固定为 0。
+
+### 2.6 Gazebo Classic 工作场景
+
+- 双 RGB 仿真路线：固定主相机和腕部辅助相机；
+- 紧凑薄托盘、红蓝动态方块和红蓝静态目标区域；
+- 夹爪左右指爪使用受力控制的 mimic 插件；
+- 方块具有质量、惯性、碰撞和摩擦参数；
+- 使用独立 `GAZEBO_MASTER_URI`，减少旧实例冲突。
+
+为提高 Gazebo Classic 搬运阶段的稳定性，仿真中提供了受距离阈值约束的临时抓取附着插件：夹爪到达目标并闭合后创建临时 fixed joint，释放阶段解除。该机制不会修改方块世界坐标，也不调用 `/gazebo/set_model_state`，但属于仿真稳定化措施，真实机械臂迁移时需要由实际夹持力、摩擦和接触反馈替代。
+
+### 2.7 一键启动
+
+`embodied_bringup` 可统一启动：
+
+```text
+Gazebo Classic / MoveIt / ros2_control / RViz
+→ perception_node
 → motion_executor_node
 → task_manager_node
-→ perception_node
 → language_node
 ```
 
@@ -127,6 +147,7 @@ MoveIt / ros2_control / RViz
 - Python 3.10
 - MoveIt 2
 - RViz 2
+- Gazebo Classic 11
 - ros2_control
 - EDULITE_A3
 - VS Code
@@ -137,20 +158,23 @@ MoveIt / ros2_control / RViz
 embodied-arm-system/
 ├── README.md
 ├── docs/
-│   ├── dev_logs/                   # 按日期记录的开发日志
+│   ├── dev_logs/                         # 按日期记录的开发日志
+│   ├── gazebo_classic_spike.md
 │   └── EDULITE_A3平台搭建记录.md
-├── papers/                         # 论文、综述与阅读记录
+├── papers/                               # 论文、综述与阅读记录
 ├── third_party/
-│   └── EDULITE_A3/                 # 机械臂基础平台子模块
+│   └── EDULITE_A3/                       # 基础平台子模块
 └── ros2_ws/
     └── src/
-        ├── embodied_interfaces/    # 自定义消息、服务和动作接口
-        ├── embodied_language/      # 中文指令解析与 TaskCommand 发布
-        ├── embodied_task/          # 任务调度与并发保护
-        ├── embodied_motion/        # 机械臂和夹爪运动执行
-        ├── embodied_perception/    # RGB-D 输入与感知结果发布
-        ├── embodied_scene_sync/    # 仿真场景同步预留模块
-        └── embodied_bringup/       # 完整系统启动入口
+        ├── embodied_interfaces/          # 自定义消息、服务和动作接口
+        ├── embodied_language/            # 中文指令解析
+        ├── embodied_perception/          # 红蓝目标视觉定位
+        ├── embodied_task/                # 抓放任务状态机
+        ├── embodied_motion/              # MoveIt 与夹爪运动执行
+        ├── embodied_bringup/             # 完整系统启动入口
+        ├── gazebo_classic_sim/           # Classic 场景、控制器与相机
+        ├── gazebo_classic_gripper_mimic/ # 指爪受力跟随插件
+        └── gazebo_classic_grasp_attachment/ # 仿真搬运稳定化插件
 ```
 
 ## 5. 主要 ROS 2 接口
@@ -158,13 +182,15 @@ embodied-arm-system/
 | 类型 | 名称 | 作用 |
 |---|---|---|
 | Topic | `/task_command` | 发布结构化语言任务 |
-| Topic | `/detected_objects` | 发布感知目标列表 |
+| Topic | `/detected_objects` | 发布红蓝方块与目标区域坐标 |
 | Service | `/motion/go_named_pose` | 执行机械臂命名位姿 |
 | Service | `/motion/set_gripper` | 控制夹爪开合 |
+| Action | `/motion/move_to_pose` | 执行末端位姿目标 |
 | Action | `/arm_controller/follow_joint_trajectory` | 执行机械臂关节轨迹 |
 | Action | `/gripper_controller/follow_joint_trajectory` | 执行夹爪轨迹 |
+| Service | `/grasp_attachment/set_enabled` | Gazebo 搬运阶段临时附着/释放 |
 
-主要自定义接口包括：
+主要自定义接口：
 
 ```text
 TaskCommand.msg
@@ -186,117 +212,104 @@ cd embodied-arm-system
 git submodule update --init --recursive
 ```
 
-确保 EDULITE_A3 基础平台已经完成编译，并且当前终端能够找到 `el_a3_moveit_config` 等基础功能包。
-
-编译本项目工作空间：
+编译基础平台后，编译本项目工作空间：
 
 ```bash
 cd ~/embodied-arm-system/ros2_ws
+source ~/embodied-arm-system/third_party/EDULITE_A3/el_a3_ros/install/setup.bash
 colcon build --symlink-install
 source install/setup.bash
 ```
 
-## 7. 启动完整系统
+## 7. 启动完整抓放系统
 
-默认 mock 后端的一键启动：
+推荐的 Gazebo Classic 双 RGB 路线：
 
 ```bash
 cd ~/embodied-arm-system/ros2_ws
+source ~/embodied-arm-system/third_party/EDULITE_A3/el_a3_ros/install/setup.bash
 source install/setup.bash
-ros2 launch embodied_bringup system.launch.py
-```
 
-默认情况下，系统会尝试使用 GNOME Terminal 打开独立的中文语言交互窗口。
+export ROS_DOMAIN_ID=124
 
-不自动打开语言终端：
-
-```bash
 ros2 launch embodied_bringup system.launch.py \
-  open_language_terminal:=false
+  backend:=gazebo \
+  camera_source:=dual_rgb_sim \
+  use_rviz:=true \
+  gazebo_gui:=true \
+  show_camera_views:=true \
+  gazebo_master_uri:=http://127.0.0.1:11421
 ```
 
-此时可在另一个终端手动启动：
+启动前应确认没有遗留的同项目 `gzserver` 实例，避免多个相机发布者向同一话题发送图像。
 
-```bash
-cd ~/embodied-arm-system/ros2_ws
-source install/setup.bash
-ros2 run embodied_language language_node
-```
-
-Gazebo Classic 双 RGB 仿真（固定工作台主相机和夹爪基座辅助相机）：
+默认情况下，系统会尝试在 GNOME Terminal 中启动语言节点。也可以设置：
 
 ```bash
 ros2 launch embodied_bringup system.launch.py \
   backend:=gazebo \
   camera_source:=dual_rgb_sim \
-  use_rviz:=true \
-  gazebo_gui:=true
+  open_language_terminal:=false
 ```
 
-可用启动参数如下：
+随后在另一个终端运行：
 
-| 参数 | 可选值 | 说明 |
-|---|---|---|
-| `backend` | `mock`、`gazebo` | mock 使用原有 ros2_control；Gazebo 使用 Classic 控制器 |
-| `camera_source` | `none`、`rgbd_sim`、`dual_rgb_sim`、`dual_usb` | 选择唯一的相机/感知路线 |
-| `use_rviz` | `true`、`false` | 是否启动 RViz |
-| `open_language_terminal` | `true`、`false` | 是否打开终端语言节点 |
-| `gazebo_gui` | `true`、`false` | 是否显示 Gazebo Classic 客户端 |
-| `gazebo_master_uri` | URI | 独立 Classic master（默认 `http://127.0.0.1:11346`），避免遗留实例冲突 |
-| `show_camera_views` | `true`、`false` | 双 RGB 仿真时自动打开两路 `rqt_image_view` |
+```bash
+cd ~/embodied-arm-system/ros2_ws
+source ~/embodied-arm-system/third_party/EDULITE_A3/el_a3_ros/install/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=124
+ros2 run embodied_language language_node
+```
 
-`dual_usb` 路线还支持 `camera_main_device`、`camera_aux_device`、`camera_main_frame_id` 和 `camera_aux_frame_id`；默认设备使用稳定的 `/dev/v4l/by-path/...` 路径。Gazebo 后端的 Classic 启动负责 `robot_state_publisher`、`controller_manager` 和感知节点；一键启动仅额外启动 MoveIt 规划层，避免重复节点。
-
-启动后可输入：
+输入：
 
 ```text
-移动到观察位置
-准备抓取
-打开夹爪
-关闭夹爪
-回家
-把红色方块抓到红色位置
+把红色方块放到红色位置
+把蓝色方块放到蓝色位置
 ```
-
-抓放位姿、工作台高度及主相机外参保存在 `embodied_task/config/pick_place.yaml`。算法先在 BGR 图像上转换 HSV，以两个红色阈值区间分割并形态学去噪；按轮廓面积区分方块和目标区域，再由像素中心、`CameraInfo` 内参和已标定的相机到 `base_link` 外参构建射线，与工作台平面求交得到机器人基坐标。默认使用已验证的 YAML 标定位姿；启用 `use_camera_localization` 后才以有效视觉结果更新位姿。任务不会调用 `/gazebo/set_model_state` 或以其他方式伪造抓放结果。
-
-抓放任务将任一必需位姿的 IK 或规划执行失败明确报告为任务失败，不会以命名位姿替代失败段。
 
 输入 `exit` 或 `quit` 可退出语言交互节点。
 
-## 8. 单独验证感知节点
+### 常用启动参数
 
-启动感知节点：
+| 参数 | 可选值 | 说明 |
+|---|---|---|
+| `backend` | `mock`、`gazebo` | 选择运动后端 |
+| `camera_source` | `none`、`rgbd_sim`、`dual_rgb_sim`、`dual_usb` | 选择唯一相机路线 |
+| `use_rviz` | `true`、`false` | 是否启动 RViz |
+| `open_language_terminal` | `true`、`false` | 是否自动打开语言终端 |
+| `gazebo_gui` | `true`、`false` | 是否显示 Gazebo 客户端 |
+| `gazebo_master_uri` | URI | 独立 Gazebo Classic master |
+| `show_camera_views` | `true`、`false` | 是否打开双路图像窗口 |
+
+## 8. 运行状态检查
+
+检查主相机是否只有一个发布者：
 
 ```bash
-cd ~/embodied-arm-system/ros2_ws
-source install/setup.bash
-ros2 run embodied_perception perception_node
+ros2 topic info /camera_main/image_raw -v
 ```
 
-查看检测结果话题：
+检查视觉结果：
 
 ```bash
-ros2 topic info /detected_objects
 ros2 topic echo /detected_objects --once
 ```
 
-默认相机话题：
+检查 Gazebo 实例：
 
-```text
-RGB:        /camera/color/image_raw
-Depth:      /camera/aligned_depth_to_color/image_raw
-CameraInfo: /camera/color/camera_info
+```bash
+pgrep -af "gzserver|gzclient"
 ```
 
-在三路相机数据都到达后，节点会输出输入已就绪状态；没有相机数据时，节点会保持运行并提示当前缺失的输入。
+正常情况下应只有一个 `gzserver`、一个 `gzclient` 和一个 `/camera_main/image_raw` 发布者。
 
 ## 9. 自动测试
 
-运行核心功能包测试：
-
 ```bash
 cd ~/embodied-arm-system/ros2_ws
+source ~/embodied-arm-system/third_party/EDULITE_A3/el_a3_ros/install/setup.bash
 source install/setup.bash
 
 colcon test \
@@ -311,34 +324,33 @@ colcon test \
 colcon test-result --verbose
 ```
 
-截至 2026-07-13，已完成的阶段性验证包括：
+PR #8 合并前完成的最终验收包括：
 
-- 语言、任务和启动模块：35 项测试，0 error，0 failure，3 skipped；
-- 感知模块：3 passed，1 skipped，0 failed；
-- 中文指令到仿真机械臂与夹爪执行的完整链路验证；
-- RGB、Depth、CameraInfo 模拟输入和感知输出坐标系验证。
+- `embodied_task` 构建通过；
+- 单元测试 `7 passed`；
+- Python 编译检查通过；
+- `git diff --check` 通过；
+- 同一 Gazebo 场景中红色、蓝色任务顺序执行成功；
+- 两个任务均完成视觉定位、夹取、抬升、搬运、释放、撤离和回 home。
 
 ## 10. 当前限制
 
-- 语言模块目前采用规则解析，尚未接入大语言模型；
-- HSV 颜色分割仅覆盖当前红色方块/红色区域场景，仍需扩展多颜色和遮挡处理；
-- 单目平面求交依赖固定相机标定，真实部署前需要完成手眼标定；
-- `/detected_objects` 尚未作为任务层的通用多目标输入；
-- VLA 模型训练与微调尚未开始；
-- 真实机械臂迁移与安全验证尚未完成。
+- 语言模块仍为规则解析，尚未接入大语言模型；
+- 视觉算法主要针对当前红蓝颜色、固定尺寸与固定工作台；
+- 单目平面求交依赖已标定的固定主相机与已知表面高度；
+- 抓取附着插件属于 Gazebo Classic 稳定化方案，不能直接代表真实夹持物理；
+- 尚未形成通用多物体、多任务规划接口；
+- LeRobot/VLA 数据采集、训练与微调尚未开始；
+- 真实 EDULITE_A3 迁移、手眼标定和安全验证尚未完成。
 
-## 11. 后续计划
+## 11. 下一阶段
 
-1. 确定 RGB-D 仿真环境与相机方案；
-2. 接入 `cv_bridge`，完成 ROS 图像到 OpenCV 图像转换；
-3. 实现基础颜色目标分割；
-4. 结合深度图和相机内参计算目标三维位置；
-5. 发布实际 `DetectedObjectArray`；
-6. 将视觉目标接入任务调度层；
-7. 实现接近、抓取、抬起和放置任务状态机；
-8. 将规则解析器升级为大语言模型任务规划接口；
-9. 评估并接入 VLA 模型；
-10. 将仿真系统迁移到真实 EDULITE_A3 机械臂。
+1. 固化当前抓放基线，保留可复现实验命令、日志与视频；
+2. 调研并搭建 LeRobot 数据采集与回放流程；
+3. 设计规则解析与大语言模型任务规划的统一接口；
+4. 评估 VLA 模型接入方式与最小可行训练任务；
+5. 完成真实相机标定和真实机械臂安全迁移；
+6. 将系统实现、实验结果和局限整理为论文内容。
 
 ## 12. 毕设目标
 
