@@ -28,6 +28,19 @@ def test_detects_red_and_blue_cubes_and_target_zones() -> None:
     assert detections["blue_target_zone"].category == "target_zone"
 
 
+def test_keeps_partially_visible_target_zone() -> None:
+    """A small visible marker fragment must still be a distinct target."""
+    image = numpy.zeros((240, 320, 3), dtype=numpy.uint8)
+    cv2.rectangle(image, (30, 40), (70, 80), (255, 0, 0), -1)
+    # 20 x 20 pixels is below the nominal 900 px zone threshold, as happens
+    # when camera_main's wrist view hides part of the flat blue marker.
+    cv2.rectangle(image, (180, 40), (200, 60), (255, 0, 0), -1)
+
+    detections = detect_sorting_items(image, 120.0, 900.0)
+
+    assert set(detections) == {"blue_cube", "blue_target_zone"}
+
+
 def test_projects_camera_info_pixel_onto_base_link_table_plane() -> None:
     """The camera ray must produce a tabletop coordinate, not image pixels."""
     point = project_pixel_to_table(

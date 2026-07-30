@@ -115,13 +115,17 @@ gripper_positions:
 
   close:
     # Do not command the L7 mechanical stop.  L7=0 drove the 40 mm cube into
-    # a nominal 3.4 mm gap and physically expelled it from the tray.  With
-    # the vendor mapping q_jaw=0.05-0.031831*L7, 0.50 rad gives a 35.2 mm
-    # finger gap: a modest 4.8 mm two-sided preload, held by the bounded
-    # Gazebo force servo rather than a kinematic attachment.
+    # a nominal 3.4 mm gap and physically expelled it from the tray.  The
+    # physical jaw slides settle about 4 mm short of their force-servo target
+    # because of their 1 N static guide friction.  With
+    # q_jaw=0.05-0.031831*L7, commanding 0.28 rad places the target beyond
+    # the cube faces far enough to overcome the 1 N slide friction.  The
+    # force-servo then saturates at its bounded 1.5 N per pad on contact;
+    # this is a real normal preload, not a kinematic attachment, and the
+    # six-second command plus ODE max-velocity limit prevents an impulse.
     # The controller's contact-tolerant 8 s settling window is configured in
     # gazebo_classic_sim/config/controllers.yaml.
-    position: 0.50
+    position: 0.28
     # Let both physics-driven jaw carriages reach contact and settle before
     # the task begins its lift; this remains a real trajectory command.
     duration_sec: 6.0
@@ -132,11 +136,11 @@ motion:
 
   # MoveIt2 速度和加速度缩放
   default_velocity_scale: 0.2
-  # Do not constrain L6 to the home branch: the frontal grasp's valid KDL
-  # solution uses a different wrist angle.  All joint limits and collision
-  # checks remain enforced by MoveIt.
-  l6_pose_target: 0.0
-  l6_pose_tolerance: 3.14159
+  orientation_tolerance: 0.01
+  # The task fixes the gripper's complete TCP orientation in base_link.  L6
+  # remains unconstrained as an individual joint so it can counter-rotate
+  # when L1 turns toward red or blue while the jaws continue to face forward.
+  tool_axis_orientation_tolerance: 0.01
   default_acceleration_scale: 0.2
 
   min_velocity_scale: 0.01

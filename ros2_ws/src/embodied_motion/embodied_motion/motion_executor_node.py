@@ -880,6 +880,10 @@ class MotionExecutorNode(Node):
         request.max_step = 0.005
         request.jump_threshold = 0.0
         request.avoid_collisions = True
+        # Keep the requested TCP orientation in the world frame.  L6 must be
+        # free to counter-rotate as L1 turns toward either colour lane;
+        # constraining L6 itself makes the jaws rotate with the arm and makes
+        # the mirrored blue pose unnecessarily unreachable.
         response = await self.cartesian_path_client.call_async(request)
         if response.fraction < 0.999:
             message = f"Cartesian path fraction={response.fraction:.3f}"
@@ -906,12 +910,19 @@ class MotionExecutorNode(Node):
                 )
             )
         )
-        # Honour the task's contact/lift velocity scale.  A fixed five-second
-        # duration made a supposedly slow physical lift execute at the same
-        # speed as every transit, so Gazebo's frictional jaw contact had no
-        # settling margin.  The reference 15 cm Cartesian segment takes five
-        # seconds at 0.03; retain a bounded duration for robustness.
-        duration_sec = max(3.0, min(20.0, 0.15 / max(velocity_scale, 0.01)))
+        # Honour the task's contact/lift velocity scale *and* the actual
+        # Cartesian distance.  The previous formula timed every segment as if
+        # it were 15 cm long: the 5 mm break-away lift therefore took 15 s at
+        # scale 0.01 and looked stationary before the task switched to a
+        # fallback grasp candidate.  ``max_step`` bounds each geometric
+        # segment to 5 mm, so its point count is a conservative distance
+        # estimate.  At scale 0.03, a 15 cm segment still takes five seconds;
+        # short contact motions retain a three-second minimum for ODE.
+        geometric_distance_m = max(len(path_points) - 1, 1) * request.max_step
+        duration_sec = max(
+            3.0,
+            min(20.0, geometric_distance_m / max(velocity_scale, 0.01)),
+        )
         duration_whole = int(duration_sec)
         duration_nanos = int((duration_sec - duration_whole) * 1_000_000_000)
         timed_points = []

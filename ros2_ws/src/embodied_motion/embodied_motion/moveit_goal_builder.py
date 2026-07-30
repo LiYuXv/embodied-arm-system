@@ -63,11 +63,11 @@ class MoveItGoalBuilder:
         self.orientation_tolerance = float(
             motion_config["orientation_tolerance"]
         )
-        self.l6_pose_target = float(motion_config.get("l6_pose_target", 0.0))
-        self.l6_pose_tolerance = float(
-            motion_config.get("l6_pose_tolerance", math.pi)
+        self.tool_axis_orientation_tolerance = float(
+            motion_config.get(
+                "tool_axis_orientation_tolerance", self.orientation_tolerance
+            )
         )
-
         # 速度和加速度限制
         self.min_velocity_scale = float(
             motion_config["min_velocity_scale"]
@@ -221,14 +221,17 @@ class MoveItGoalBuilder:
             ik_target_pose.pose.orientation
         )
 
-        orientation_constraint.absolute_x_axis_tolerance = (
-            self.orientation_tolerance
+        # Express the error as a rotation vector so the tolerances follow the
+        # target tool frame.  In this parameterization the target's local Z
+        # component is precisely axial tool roll: it can be left free while
+        # X/Y continue to constrain the L5-controlled approach direction.
+        orientation_constraint.parameterization = (
+            OrientationConstraint.ROTATION_VECTOR
         )
-        orientation_constraint.absolute_y_axis_tolerance = (
-            self.orientation_tolerance
-        )
+        orientation_constraint.absolute_x_axis_tolerance = self.orientation_tolerance
+        orientation_constraint.absolute_y_axis_tolerance = self.orientation_tolerance
         orientation_constraint.absolute_z_axis_tolerance = (
-            self.orientation_tolerance
+            self.tool_axis_orientation_tolerance
         )
         orientation_constraint.weight = 1.0
 
@@ -238,26 +241,12 @@ class MoveItGoalBuilder:
         goal_constraints.orientation_constraints = [
             orientation_constraint
         ]
-        # Keep pose-equivalent IK solutions on the wrist branch used by the
-        # current ready/approach corridor.  This is a goal constraint (not a
-        # collision exemption): all normal scene collision checks still run.
-        l6_constraint = JointConstraint()
-        l6_constraint.joint_name = "L6_joint"
-        l6_constraint.position = self.l6_pose_target
-        l6_constraint.tolerance_above = self.l6_pose_tolerance
-        l6_constraint.tolerance_below = self.l6_pose_tolerance
-        l6_constraint.weight = 1.0
-        goal_constraints.joint_constraints = [l6_constraint]
-
         goal = self._build_base_goal(
             velocity_scale=velocity_scale,
             acceleration_scale=acceleration_scale,
         )
 
         goal.request.goal_constraints = [goal_constraints]
-        goal.request.path_constraints.joint_constraints = [
-            copy.deepcopy(l6_constraint)
-        ]
 
         return goal
 

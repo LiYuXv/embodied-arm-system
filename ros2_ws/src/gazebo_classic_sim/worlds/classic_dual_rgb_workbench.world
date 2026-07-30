@@ -1,6 +1,24 @@
 <?xml version="1.0"?>
 <sdf version="1.6">
   <world name="sorting_workcell_dual_rgb">
+    <!-- Explicit, reversible fixed-joint grasp.  It is enabled by the task
+         only after a close action and released before opening at the zone. -->
+    <plugin name="grasp_attachment" filename="libgazebo_classic_grasp_attachment.so">
+      <ros><namespace>/</namespace></ros>
+      <parent_model>el_a3</parent_model>
+      <!-- Gazebo folds the empty grasp-centre helper during URDF conversion.
+           Attach to the surviving L6 wrist body instead: its origin lies on
+           the gripper centre axis, so changing wrist pitch cannot make the
+           cube orbit around one jaw.  The fixed joint still preserves the
+           cube's actual pose at close time. -->
+      <parent_link>l5_l6_urdf_asm</parent_link>
+      <target_model>red_cube</target_model>
+      <target_model>blue_cube</target_model>
+      <!-- The grasp centre is about 19.1 cm below this wrist origin.  The
+           other cube is about 27.7 cm away when the gripper is centred on a
+           target, so this threshold admits only the currently grasped cube. -->
+      <max_distance_m>0.250</max_distance_m>
+    </plugin>
     <physics type="ode">
       <max_step_size>0.001</max_step_size>
       <real_time_update_rate>1000</real_time_update_rate>
@@ -120,12 +138,11 @@
            z=1.0315.  Keep the 16 mm marker *on* that top (rather than 22 mm
            inside the deck), otherwise the board occludes it from camera_main
            and HSV can never publish a target zone. -->
-      <!-- A 14 cm pick/place row separation leaves a real image gap between
-           same-colour contours at camera_main's oblique view.  At 10 cm the
-           cube and marker projected into one HSV blob even though they did
-           not overlap in world coordinates. -->
-      <static>true</static><pose>0.340 -0.100 0.9295 0 0 0</pose>
-      <link name="zone"><visual name="visual"><geometry><box><size>0.07 0.07 0.016</size></box></geometry><material><ambient>0.72 0.06 0.06 1</ambient><diffuse>0.85 0.08 0.08 1</diffuse></material></visual></link>
+      <!-- "Front" follows the arm's reach direction: continue past the
+           cube along +X by 10 cm, rather than placing a marker behind it or
+           to either side.  The compact marker stays visually distinct. -->
+      <static>true</static><pose>0.300 -0.100 0.9295 0 0 0</pose>
+      <link name="zone"><visual name="visual"><geometry><box><size>0.05 0.05 0.016</size></box></geometry><material><ambient>0.72 0.06 0.06 1</ambient><diffuse>0.85 0.08 0.08 1</diffuse></material></visual></link>
     </model>
     <model name="red_cube">
       <!-- Start 2 mm above the deck, then settle under gravity.  Starting
@@ -134,19 +151,22 @@
       <static>false</static><pose>0.200 -0.100 0.9435 0 0 0</pose>
       <link name="link">
         <inertial><mass>0.030</mass><inertia><ixx>0.000008000</ixx><iyy>0.000008000</iyy><izz>0.000008000</izz></inertia></inertial>
-        <collision name="collision"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><surface><friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode><torsional><coefficient>0.3</coefficient></torsional></friction><contact><ode><kp>12000</kp><kd>120</kd><min_depth>0.0005</min_depth><max_vel>0.010</max_vel></ode></contact></surface></collision>
+        <collision name="collision"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><surface><friction><ode><mu>8.0</mu><mu2>8.0</mu2></ode><torsional><coefficient>0.3</coefficient></torsional></friction><contact><ode><kp>12000</kp><kd>120</kd><min_depth>0.0005</min_depth><max_vel>0.010</max_vel></ode></contact></surface></collision>
         <visual name="visual"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><material><ambient>0.90 0.04 0.04 1</ambient><diffuse>0.90 0.04 0.04 1</diffuse></material></visual>
       </link>
     </model>
     <model name="blue_target_zone">
-      <static>true</static><pose>0.340 0.000 0.9295 0 0 0</pose>
-      <link name="zone"><visual name="visual"><geometry><box><size>0.07 0.07 0.016</size></box></geometry><material><ambient>0.06 0.12 0.72 1</ambient><diffuse>0.08 0.18 0.90 1</diffuse></material></visual></link>
+      <!-- Keep blue near the robot's front-centre reachable corridor.  Its
+           12 cm separation from the unchanged red lane leaves clearance for
+           the already placed cube and the forward-facing open gripper. -->
+      <static>true</static><pose>0.300 0.020 0.9295 0 0 0</pose>
+      <link name="zone"><visual name="visual"><geometry><box><size>0.05 0.05 0.016</size></box></geometry><material><ambient>0.06 0.12 0.72 1</ambient><diffuse>0.08 0.18 0.90 1</diffuse></material></visual></link>
     </model>
     <model name="blue_cube">
-      <static>false</static><pose>0.200 0.000 0.9435 0 0 0</pose>
+      <static>false</static><pose>0.200 0.020 0.9435 0 0 0</pose>
       <link name="link">
         <inertial><mass>0.030</mass><inertia><ixx>0.000008000</ixx><iyy>0.000008000</iyy><izz>0.000008000</izz></inertia></inertial>
-        <collision name="collision"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><surface><friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode><torsional><coefficient>0.3</coefficient></torsional></friction><contact><ode><kp>12000</kp><kd>120</kd><min_depth>0.0005</min_depth><max_vel>0.010</max_vel></ode></contact></surface></collision>
+        <collision name="collision"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><surface><friction><ode><mu>8.0</mu><mu2>8.0</mu2></ode><torsional><coefficient>0.3</coefficient></torsional></friction><contact><ode><kp>12000</kp><kd>120</kd><min_depth>0.0005</min_depth><max_vel>0.010</max_vel></ode></contact></surface></collision>
         <visual name="visual"><geometry><box><size>0.040 0.040 0.040</size></box></geometry><material><ambient>0.04 0.10 0.90 1</ambient><diffuse>0.06 0.18 0.95 1</diffuse></material></visual>
       </link>
     </model>

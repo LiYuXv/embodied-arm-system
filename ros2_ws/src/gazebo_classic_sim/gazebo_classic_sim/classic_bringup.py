@@ -54,6 +54,7 @@ def build_classic_launch(world_name, camera_mode="none", perception_config=None)
     plugin_dirs = [
         os.path.join(get_package_prefix("gazebo_ros2_control"), "lib"),
         os.path.join(get_package_prefix("gazebo_classic_gripper_mimic"), "lib"),
+        os.path.join(get_package_prefix("gazebo_classic_grasp_attachment"), "lib"),
         os.path.join(get_package_prefix("gazebo_plugins"), "lib"),
         os.environ.get("GAZEBO_PLUGIN_PATH", ""),
     ]

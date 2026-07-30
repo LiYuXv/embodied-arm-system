@@ -5,12 +5,10 @@
 table_plane_z_m: 0.0915
 cube_support_plane_z_m: 0.0915
 cube_height_m: 0.040
-# The pad collision body is 87 mm tall.  Its centre must sit above cube
-# centre: centred pads entered the operation deck during the vertical descent
-# and pushed the cube sideways before closing.  At +25 mm, the lower pad edge
-# remains 1 mm above the lowered deck while its opposing faces grip the cube's
-# upper half.  This is expressed relative to the live visual object centre.
-grasp_band_height_offset_m: 0.025
+# The adapter uses 38 mm high physical side pads.  Align their centre with the
+# live cube centre: their lower edge stays 1 mm above the deck and they touch
+# opposing cube faces rather than the top edge.
+grasp_band_height_offset_m: 0.0
 # The camera is millimetre-accurate but the physical jaw collision band has a
 # narrow contact window.  These are relative visual XY candidates, tried only
 # after a failed real-contact close; no fixed world/object pose is used.
@@ -18,49 +16,66 @@ grasp_band_height_offset_m: 0.025
 ## +8 mm TCP X bias during the final force-servo descent.  Apply its inverse
 ## to the *fresh visual object centre* first, then retain symmetric local
 ## retries; this is not a fixed world pickup coordinate.
-grasp_contact_offsets_m: [[0.0, 0.0], [0.003, 0.003], [-0.003, -0.003],
+grasp_contact_offsets_m: [[0.0, 0.0], [0.003, 0.003], [-0.003, 0.0],
+                           [-0.003, -0.003],
                            [0.006, 0.006], [-0.006, -0.006],
                            [0.003, -0.003], [-0.003, 0.003],
                            [0.006, -0.006], [-0.006, 0.006],
                            [0.010, 0.010], [-0.010, -0.010],
                            [0.010, -0.010], [-0.010, 0.010]]
-# The jaw pads extend 43.5 mm below/above their centre.  A 5 mm approach put
-# the opened fingers through the cube's upper edge before the final descent,
-# physically pushing the live visual target away.  The A3 KDL branch reaches
-# a public TCP near 0.24 m.  Ten millimetres is inside that reachable branch
-# while doubling the former unsafe 5 mm direct-clearance band.
+# Ten millimetres above the side-pad grasp band clears the cube before the
+# final descent while remaining in the verified A3 TCP corridor.
 approach_height_m: 0.010
 approach_vector_m: [0.0, 0.0, 0.010]
+# After the short break-away lift, travel to a genuinely elevated placement
+# waypoint.  This keeps the flat cube clear of the workbench before the final
+# straight descent instead of sweeping it sideways at contact height.
+placement_approach_height_m: 0.100
+# Release a few millimetres above the target centre so the cube drops onto the
+# marker instead of relying on a side collision to spring back into place.
+placement_drop_height_m: 0.010
 # The A3 reaches the compact tray through a narrow wrist branch.  A 5 mm
 # strictly vertical break-away clears the operation board without crossing its
 # Cartesian singularity; the following collision-checked MoveIt transit then
 # raises and carries the physically grasped cube to the target region.
 lift_height_m: 0.005
 retreat_height_m: 0.005
-# Keep the gripper vertical, centred over the visually detected cube, with its
-# two finger pads parallel to the cube faces.  The approach and lift are thus
-# direct vertical lines in front of the robot instead of a lateral side-entry.
-orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-# A cube is pinched from directly above.  After the lift, MoveIt is allowed to
-# rotate the wrist into this established forward-facing placement attitude;
-# this keeps the distant target-row placement in the KDL reachable branch.
+# Start with the gripper bar facing forward across the tray: +90 degrees about
+# the end-effector's local Z axis.  Keeping this same L6-controlled roll from
+# grasp through placement avoids twisting an already attached cube.  L6 is
+# still not fixed as an individual joint; it compensates for the current L1.
+orientation_xyzw: [0.0, 0.0, 0.7071068, 0.7071068]
 orientation_by_object:
-  red_cube: [0.0, 0.0, 0.0, 1.0]
-  red_target_zone: [0.0, 0.3826834, 0.0, 0.9238795]
-  blue_cube: [0.0, 0.0, 0.0, 1.0]
-  blue_target_zone: [0.0, 0.3826834, 0.0, 0.9238795]
+  red_cube: [0.0, 0.0, 0.7071068, 0.7071068]
+  red_target_zone: [0.2705981, 0.2705981, 0.6532815, 0.6532815]
+  blue_cube: [0.0, 0.0, 0.7071068, 0.7071068]
+  blue_target_zone: [0.2705981, 0.2705981, 0.6532815, 0.6532815]
+# Keep the established +45 degree L5-controlled tilt, then post-multiply a
+# +90 degree rotation about the end-effector's own Z axis.  This changes only
+# the L6-controlled jaw roll: the gripper bar faces forward across the tray
+# instead of presenting its side, while L6 remains free to compensate for L1.
+placement_orientation_xyzw: [0.2705981, 0.2705981, 0.6532815, 0.6532815]
+# Gazebo's runtime fixed attachment preserves the real grasped offset, which
+# is 50 mm shorter in base X and 8 mm higher in base Y than the idealised
+# grasp_center projection after the +45 degree placement tilt.  Shift only the
+# commanded placement centre so the released cube, not the TCP, lands on the
+# unchanged visual target marker.
+# The previous release was still a little too far forward along base_link X.
+# Pull the commanded release point back by 10 mm while leaving the lateral
+# correction and all grasp poses unchanged.
+placement_region_correction_m: [-0.010, 0.012]
 # The Classic adapter publishes grasp_center at the midpoint of the existing
 # jaw collision pads.  This remains a fallback only if that adapter TF is not
 # available; normal tasks read the same transform directly from TF.
-jaw_center_offset_m: [0.0, 0.0003, -0.0921]
+jaw_center_offset_m: [0.0, 0.0003, -0.1171]
 
 # Only used when task_manager is explicitly launched with
 # allow_pose_fallback:=true.  It is intentionally not a normal task input.
 debug_pose_fallbacks:
   red_cube: [-0.43, 0.18]
   blue_cube: [-0.43, -0.18]
-  red_target_zone: [-0.75, 0.18]
-  blue_target_zone: [-0.75, -0.18]
+  red_target_zone: [-0.38, 0.10]
+  blue_target_zone: [-0.38, -0.10]
 motion:
   # Transit stays in the verified raised corridor.  Contact descents are kept
   # slow so the physical jaw collision bodies do not impart an ODE impulse to

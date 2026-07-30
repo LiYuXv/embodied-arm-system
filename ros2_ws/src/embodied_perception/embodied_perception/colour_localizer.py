@@ -73,6 +73,17 @@ def detect_sorting_items(
             if contour is not cube_contour
             and cv2.contourArea(contour) >= min_zone_area_px
         ]
+        # A target marker is deliberately flat and can be partly hidden by
+        # the wrist or a cube in camera_main's oblique view.  Do not discard
+        # the only *other* same-colour object merely because that visible
+        # fragment is smaller than the nominal marker-area threshold.  The
+        # regular cube threshold and the separate-contour requirement still
+        # reject speckles; the normal large-marker rule above remains the
+        # preferred path whenever it is available.
+        if not zone_candidates:
+            zone_candidates = [
+                contour for contour in candidates if contour is not cube_contour
+            ]
         if zone_candidates:
             zone = _make_detection(
                 colour, max(zone_candidates, key=_zone_shape_score), "target_zone"

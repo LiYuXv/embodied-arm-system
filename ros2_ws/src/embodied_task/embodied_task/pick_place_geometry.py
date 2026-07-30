@@ -18,7 +18,7 @@ def build_pick_place_poses(
     config: Dict[str, object],
 ) -> Dict[str, PoseSpec]:
     """
-    Build all six TCP poses from the current visual XY coordinates.
+    Build all TCP poses from the current visual XY coordinates.
 
     ``jaw_center_offset_m`` is the rigid vector from the public MoveIt TCP to
     the centre between the two finger contact pads.  The selected downward
@@ -31,13 +31,15 @@ def build_pick_place_poses(
         float(value)
         for value in config.get("object_orientation_xyzw", config["orientation_xyzw"])
     )
-    region_orientation = tuple(
-        float(value)
-        for value in config.get("region_orientation_xyzw", object_orientation)
-    )
     table_z = float(config["table_plane_z_m"])
     cube_height = float(config["cube_height_m"])
     approach_height = float(config["approach_height_m"])
+    placement_approach_height = float(
+        config.get("placement_approach_height_m", approach_height)
+    )
+    placement_drop_height = float(
+        config.get("placement_drop_height_m", 0.0)
+    )
     lift_height = float(config["lift_height_m"])
     retreat_height = float(config["retreat_height_m"])
     grasp_band_height_offset = float(
@@ -48,11 +50,8 @@ def build_pick_place_poses(
         float(value)
         for value in config.get("approach_vector_m", (0.0, 0.0, approach_height))
     )
-    # The vendor jaw collision pad is 42 mm tall while the cube is 45 mm
-    # tall.  On the raised support its exact mid-band leaves only millimetres
-    # above the support top, so normal trajectory tolerance makes the fingers
-    # strike the pad before the cube.  A small, scene-configured upward shift
-    # keeps the grasp inside the cube side faces while preserving clearance.
+    # The Classic adapter uses a 38 mm collision pad centred on the cube side
+    # band, leaving one millimetre of deck clearance at the grasp height.
     object_contact_z = table_z + cube_height / 2.0 + grasp_band_height_offset
     place_contact_z = table_z + cube_height / 2.0 + grasp_band_height_offset
 
@@ -87,13 +86,14 @@ def build_pick_place_poses(
         ),
         "region_approach": tcp_for_jaw_center(
             region_x + approach_vector[0], region_y + approach_vector[1],
-            place_contact_z + approach_vector[2], region_orientation
+            place_contact_z + placement_approach_height, object_orientation
         ),
         "region_place": tcp_for_jaw_center(
-            region_x, region_y, place_contact_z, region_orientation
+            region_x, region_y, place_contact_z + placement_drop_height,
+            object_orientation
         ),
         "region_retreat": tcp_for_jaw_center(
-            region_x, region_y, place_contact_z + retreat_height, region_orientation
+            region_x, region_y, place_contact_z + retreat_height, object_orientation
         ),
     }
 

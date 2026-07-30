@@ -31,6 +31,38 @@ def test_all_pick_place_poses_follow_current_visual_coordinates() -> None:
     assert poses["object_grasp"].position[2] == 0.157
 
 
+def test_placement_drop_height_is_above_target_contact_height() -> None:
+    config = dict(CONFIG)
+    config["placement_drop_height_m"] = 0.01
+    poses = build_pick_place_poses((-0.40, 0.18), (-0.72, 0.18), config)
+
+    assert poses["region_place"].position[2] > 0.157
+
+
+def test_placement_stays_level_and_uses_an_elevated_waypoint() -> None:
+    """The grasp attitude is retained through a high placement approach."""
+    config = dict(CONFIG)
+    config["placement_approach_height_m"] = 0.20
+    # qy(+45 deg) * qz(+90 deg): preserve the L5-controlled tool tilt while
+    # rotating the gripper bar forward about its local L6 axis.
+    placement_orientation = [
+        0.2705981, 0.2705981, 0.6532815, 0.6532815
+    ]
+    # TaskManager applies the selected placement attitude to the complete
+    # placement segment through object_orientation_xyzw so it cannot jump
+    # between approach, contact, and retreat.
+    config["object_orientation_xyzw"] = placement_orientation
+    config["region_orientation_xyzw"] = placement_orientation
+    poses = build_pick_place_poses((-0.40, 0.18), (-0.72, 0.18), config)
+
+    assert poses["region_approach"].orientation_xyzw == poses["object_grasp"].orientation_xyzw
+    assert poses["region_approach"].orientation_xyzw == poses["region_place"].orientation_xyzw
+    assert poses["region_place"].orientation_xyzw == tuple(
+        placement_orientation
+    )
+    assert poses["region_approach"].position[2] > poses["region_place"].position[2]
+
+
 def test_visual_update_recomputes_every_corresponding_xy() -> None:
     """A new detection changes both grasp and placement pose families."""
     first = build_pick_place_poses((-0.40, 0.18), (-0.72, 0.18), CONFIG)

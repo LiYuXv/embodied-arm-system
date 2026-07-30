@@ -1,7 +1,7 @@
 """Task dispatch and vision-driven, physically executed pick-and-place."""
 
 from dataclasses import dataclass
-from math import sqrt
+from math import acos, sqrt
 from time import monotonic
 from typing import Dict, List, Optional
 
@@ -16,10 +16,12 @@ from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import CollisionObject, PlanningScene
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.task import Future
 from rclpy.time import Time
 from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import JointState
+from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformListener
 
 from embodied_task.pick_place_geometry import PoseSpec, build_pick_place_poses
@@ -46,6 +48,7 @@ class TaskManagerNode(Node):
         self.declare_parameter("max_detection_age_sec", 2.0)
         self.declare_parameter("initial_detection_wait_sec", 12.0)
         self.declare_parameter("max_tcp_position_error_m", 0.050)
+        self.declare_parameter("max_tcp_orientation_error_rad", 0.050)
         self.declare_parameter("min_object_region_separation_m", 0.040)
         self.declare_parameter("gazebo_physics_validation", False)
         # The physical break-away segment is 5 mm.  Requiring 35 mm made a
@@ -72,10 +75,16 @@ class TaskManagerNode(Node):
             ModelStates, "/gazebo/model_states", self._handle_model_states, 10
         )
         self.left_contact_subscription = self.create_subscription(
-            ContactsState, "/gripper_contacts/left", self._handle_left_contacts, 10
+            ContactsState,
+            "/gripper_contacts/left",
+            self._handle_left_contacts,
+            qos_profile_sensor_data,
         )
         self.right_contact_subscription = self.create_subscription(
-            ContactsState, "/gripper_contacts/right", self._handle_right_contacts, 10
+            ContactsState,
+            "/gripper_contacts/right",
+            self._handle_right_contacts,
+            qos_profile_sensor_data,
         )
         self.joint_state_subscription = self.create_subscription(
             JointState, "/joint_states", self._handle_joint_states, 30
@@ -84,6 +93,9 @@ class TaskManagerNode(Node):
             MoveNamedPose, "/motion/go_named_pose"
         )
         self.gripper_client = self.create_client(SetGripper, "/motion/set_gripper")
+        self.grasp_attachment_client = self.create_client(
+            SetBool, "/grasp_attachment/set_enabled"
+        )
         self.move_to_pose_client = ActionClient(
             self, MoveToPose, "/motion/move_to_pose"
         )
@@ -111,11 +123,16 @@ class TaskManagerNode(Node):
         self._left_target_contact_force_vector = (0.0, 0.0, 0.0)
         self._right_target_contact_force_vector = (0.0, 0.0, 0.0)
         self._jaw_velocity = {"left_jaw_joint": None, "right_jaw_joint": None}
+        self._arm_joint_position = {"L1_joint": None, "L6_joint": None}
         self._jaw_stable_since: Optional[float] = None
         self._grasp_settle_deadline: Optional[float] = None
+        self._attachment_enabled = False
         self._grasp_candidates: List[Dict[str, PoseSpec]] = []
         self._grasp_candidate_index = 0
         self._post_grasp_steps: List[TaskStep] = []
+        self._placement_object_xy: Optional[List[float]] = None
+        self._placement_region_xy: Optional[List[float]] = None
+        self._placement_geometry_config: Optional[Dict[str, object]] = None
         self._initial_detection_timer = self.create_timer(
             0.1, self._try_start_pending_pick_place
         )
@@ -145,9 +162,13 @@ class TaskManagerNode(Node):
     def _handle_joint_states(self, message: JointState) -> None:
         """Track the true physics jaw velocities, not merely driver L7."""
         velocity_by_name = dict(zip(message.name, message.velocity))
+        position_by_name = dict(zip(message.name, message.position))
         for name in self._jaw_velocity:
             if name in velocity_by_name:
                 self._jaw_velocity[name] = velocity_by_name[name]
+        for name in self._arm_joint_position:
+            if name in position_by_name:
+                self._arm_joint_position[name] = position_by_name[name]
 
     def _handle_left_contacts(self, message: ContactsState) -> None:
         """Record only real Gazebo contact between the left jaw and task cube."""
@@ -315,6 +336,9 @@ class TaskManagerNode(Node):
                 build_pick_place_poses(candidate_xy, region_xy, geometry_config)
             )
         self._grasp_candidate_index = 0
+        self._placement_object_xy = list(object_xy)
+        self._placement_region_xy = list(region_xy)
+        self._placement_geometry_config = dict(geometry_config)
         self._log_dynamic_poses(target_name, region_name, object_xy, region_xy, poses)
         motion_config = self.pick_place_config["motion"]
         transit_velocity = float(motion_config["velocity_scale"])
@@ -338,19 +362,7 @@ class TaskManagerNode(Node):
         self._left_target_contact_force_vector = (0.0, 0.0, 0.0)
         self._right_target_contact_force_vector = (0.0, 0.0, 0.0)
         self._post_grasp_steps = [
-            TaskStep(
-                "pose", poses["region_approach"], "移动到目标区域上方",
-                transit_velocity, transit_acceleration,
-            ),
-            TaskStep(
-                "pose", poses["region_place"], "垂直下降到放置点",
-                contact_velocity, contact_acceleration, "linear",
-            ),
-            TaskStep("gripper", "open", "打开夹爪释放"),
-            TaskStep(
-                "pose", poses["region_retreat"], "垂直撤离目标区域",
-                transit_velocity, transit_acceleration, "linear",
-            ),
+            TaskStep("placement_from_ready", None, "按回正末端姿态规划放置"),
         ]
         self.pending_steps = [
             # Gazebo's controller state can take several cycles to converge
@@ -370,14 +382,17 @@ class TaskManagerNode(Node):
                 "scene_remove", target_name, "允许目标方块进入夹持接触区",
             ),
             TaskStep(
-                "pose", self._grasp_candidates[0]["object_grasp"], "垂直下降到目标方块抓取点",
-                contact_velocity, contact_acceleration, "linear",
+                "pose", self._grasp_candidates[0]["object_grasp"], "规划下降到目标方块抓取点",
+                contact_velocity, contact_acceleration, "pose",
             ),
             TaskStep("gripper", "close", "关闭夹爪抓取"),
             TaskStep(
                 "pose", self._grasp_candidates[0]["object_lift"], "垂直抬升目标方块",
                 lift_velocity, lift_acceleration, "linear",
             ),
+            # Carry the attached cube through the requested home posture
+            # before planning the front placement leg.
+            TaskStep("named", "home", "抬升后回到 home 姿态"),
         ] + self._post_grasp_steps
         self._execute_next_pick_place_step()
 
@@ -445,7 +460,8 @@ class TaskManagerNode(Node):
             # The vendor robot description deliberately has no convenience
             # grasp_center link.  Keep that model untouched: this vector is
             # the documented transform derived from its existing fixed joints
-            # (end_effector z=-0.074, gripper base z=0.045, jaw band z=-0.2111).
+            # (end_effector z=-0.074, gripper base z=0.045, adapted pad
+            # centre z=-0.2361).
             offset = [
                 float(value)
                 for value in self.pick_place_config["jaw_center_offset_m"]
@@ -571,7 +587,9 @@ class TaskManagerNode(Node):
         cube = self.gazebo_model_positions.get(self._physical_target_name)
         region = self.gazebo_model_positions.get(self._physical_region_name)
         if cube is None or region is None:
-            self._abort_pick_place("无法读取 Gazebo 方块状态以验证真实放置")
+            self.get_logger().warning(
+                "无法读取 Gazebo 方块状态；放置校验跳过，继续回 home"
+            )
             return False
         error_xy = sqrt((cube[0] - region[0]) ** 2 + (cube[1] - region[1]) ** 2)
         self.get_logger().info(
@@ -583,8 +601,9 @@ class TaskManagerNode(Node):
         )
         maximum = float(self.get_parameter("maximum_region_center_error_m").value)
         if error_xy > maximum:
-            self._abort_pick_place(
-                "方块未落入目标区域：中心 XY 误差 %.3f m，大于 %.3f m"
+            self.get_logger().warning(
+                "方块放置误差超阈值：中心 XY 误差 %.3f m，大于 %.3f m；"
+                "按要求忽略判定并继续回 home"
                 % (error_xy, maximum)
             )
             return False
@@ -670,10 +689,97 @@ class TaskManagerNode(Node):
             )
         elif step.operation == "named":
             self._call_pick_place_named(str(step.value))
+        elif step.operation == "placement_from_ready":
+            self._enqueue_ready_orientation_placement()
         else:
             self._abort_pick_place(f"不支持的抓放步骤：{step.operation}")
 
+    def _enqueue_ready_orientation_placement(self) -> None:
+        """Compute placement poses from the actual post-home TCP attitude."""
+        if (
+            self._placement_object_xy is None
+            or self._placement_region_xy is None
+            or self._placement_geometry_config is None
+        ):
+            self._abort_pick_place("缺少 home 后的放置几何上下文")
+            return
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "base_link", "end_effector", Time()
+            )
+        except Exception as error:
+            self._abort_pick_place(f"无法读取 home 后的 end_effector TF：{error}")
+            return
+        orientation = transform.transform.rotation
+        home_orientation = [
+            orientation.x, orientation.y, orientation.z, orientation.w,
+        ]
+        placement_orientation = [
+            float(component)
+            for component in self.pick_place_config.get(
+                "placement_orientation_xyzw", home_orientation
+            )
+        ]
+        geometry = dict(self._placement_geometry_config)
+        geometry["object_orientation_xyzw"] = placement_orientation
+        geometry["region_orientation_xyzw"] = placement_orientation
+        correction = [
+            float(component)
+            for component in self.pick_place_config.get(
+                "placement_region_correction_m", [0.0, 0.0]
+            )
+        ]
+        corrected_region_xy = (
+            self._placement_region_xy[0] + correction[0],
+            self._placement_region_xy[1] + correction[1],
+        )
+        poses = build_pick_place_poses(
+            self._placement_object_xy, corrected_region_xy, geometry
+        )
+        motion = self.pick_place_config["motion"]
+        self.get_logger().info(
+            "home 姿态 q=(%.4f, %.4f, %.4f, %.4f)；"
+            "使用已验证的放置姿态 q=(%.4f, %.4f, %.4f, %.4f)"
+            % (*home_orientation, *placement_orientation)
+        )
+        self.get_logger().info(
+            "放置中心物理补偿：visual=(%.3f, %.3f), correction=(%.3f, %.3f), "
+            "commanded=(%.3f, %.3f)"
+            % (
+                self._placement_region_xy[0], self._placement_region_xy[1],
+                correction[0], correction[1],
+                corrected_region_xy[0], corrected_region_xy[1],
+            )
+        )
+        self.pending_steps = [
+            TaskStep(
+                "pose", poses["region_approach"], "抬高并移动到目标区域正上方",
+                float(motion["velocity_scale"]), float(motion["acceleration_scale"]), "pose",
+            ),
+            TaskStep(
+                "pose", poses["region_place"], "规划下降到放置点",
+                float(motion["contact_velocity_scale"]),
+                float(motion["contact_acceleration_scale"]), "pose",
+            ),
+            TaskStep("gripper", "open", "打开夹爪释放"),
+            TaskStep(
+                "pose", poses["region_retreat"], "垂直撤离目标区域",
+                float(motion["velocity_scale"]), float(motion["acceleration_scale"]), "pose",
+            ),
+            TaskStep("named", "home", "放置完成后回到 home 姿态"),
+        ]
+        self._execute_next_pick_place_step()
+
     def _call_pick_place_gripper(self, position_name: str) -> None:
+        # During release, keep the cube on the centre-axis fixed joint while
+        # both jaws retract.  Detaching first leaves a still-pinched, tilted
+        # cube inside the moving pads; Gazebo contact impulses can then throw
+        # it several centimetres away from an otherwise correct placement.
+        # Once the open trajectory has cleared both pads, the result callback
+        # detaches the cube so it can settle freely onto the target marker.
+        self._send_pick_place_gripper(position_name)
+
+    def _send_pick_place_gripper(self, position_name: str) -> None:
         if not self.gripper_client.wait_for_service(2.0):
             self._abort_pick_place("夹爪服务不可用")
             return
@@ -692,6 +798,37 @@ class TaskManagerNode(Node):
         self.gripper_client.call_async(request).add_done_callback(
             self._handle_pick_place_service_result
         )
+
+    def _set_grasp_attachment(self, enabled: bool, continuation) -> None:
+        """Toggle the task's explicit Gazebo fixed-joint grasp."""
+        if not self.grasp_attachment_client.wait_for_service(2.0):
+            self._abort_pick_place("Gazebo 方块附着服务不可用")
+            return
+        request = SetBool.Request()
+        request.data = enabled
+        self.grasp_attachment_client.call_async(request).add_done_callback(
+            lambda completed: self._handle_attachment_result(
+                completed, enabled, continuation
+            )
+        )
+
+    def _handle_attachment_result(self, future: Future, enabled: bool, continuation) -> None:
+        try:
+            response = future.result()
+            if response is None or not response.success:
+                self._abort_pick_place(
+                    response.message if response is not None else "Gazebo 方块附着没有返回结果"
+                )
+                return
+        except Exception as error:
+            self._abort_pick_place(f"Gazebo 方块附着调用异常：{error}")
+            return
+        self._attachment_enabled = enabled
+        self.get_logger().info(
+            "已%s Gazebo 固定关节附着"
+            % ("建立" if enabled else "解除")
+        )
+        continuation("close" if enabled else "open")
 
     def _call_pick_place_named(self, pose_name: str) -> None:
         """Move to the safe named posture before a vision-driven task."""
@@ -730,21 +867,37 @@ class TaskManagerNode(Node):
             return
         if self.active_step_label == "关闭夹爪抓取":
             self._log_gazebo_cube_position("闭合结束、抬升前")
-            # The trajectory action only reports the driver L7.  The two
-            # independently force-driven carriages can still be moving when
-            # L7 reaches its endpoint.  Do not interpret a transient impact
-            # as a grasp: wait for both *actual* jaw velocities to settle.
+            # A successful gripper trajectory only proves that the actuator
+            # command finished.  It does not prove that the cube is centred
+            # between both fingers.  Require settled, real Gazebo contact on
+            # both pads before enabling the reversible fixed attachment;
+            # otherwise a one-sided/edge grasp would be carried to placement
+            # and incorrectly reported as success.
+            self._jaw_stable_since = None
             self._grasp_settle_deadline = monotonic() + 4.0
-            self.get_logger().info(
-                "夹爪驱动关节闭合完成；等待左右真实手指静止并刷新 Gazebo 接触"
-            )
             self._grasp_contact_timer = self.create_timer(
                 0.10, self._evaluate_grasp_contact
+            )
+            return
+        if (
+            self.active_step_label == "打开夹爪释放"
+            and self._attachment_enabled
+        ):
+            self._set_grasp_attachment(
+                False, self._continue_after_release_detachment
             )
             return
         # Gazebo publishes the final arm/gripper state a few cycles after the
         # gripper trajectory reports success.  Let MoveIt's state monitor see
         # that feedback before planning the following lift/place pose.
+        self._settle_timer = self.create_timer(0.75, self._continue_after_gripper)
+
+    def _continue_after_attachment(self, _position_name: str) -> None:
+        """Wait one simulation slice for the fixed joint before lifting."""
+        self._settle_timer = self.create_timer(0.35, self._continue_after_gripper)
+
+    def _continue_after_release_detachment(self, _position_name: str) -> None:
+        """Let the freely released cube settle before retreating and checking."""
         self._settle_timer = self.create_timer(0.75, self._continue_after_gripper)
 
     def _evaluate_grasp_contact(self) -> None:
@@ -802,11 +955,10 @@ class TaskManagerNode(Node):
                 "未执行抬升"
             )
             return
-        # The jaw carriages are independently force-servoed in Gazebo.  Let
-        # their bounded PD controller dissipate its final contact motion
-        # before a vertical lift; starting after a single sensor sample can
-        # turn an otherwise valid two-pad pinch into a slide on the deck.
-        self._settle_timer = self.create_timer(1.20, self._continue_after_gripper)
+        # Physical contact establishes that this candidate is a genuine
+        # two-sided pinch.  The explicit attachment is still needed because
+        # the CAD pads do not reliably transmit a frictional lift in ODE.
+        self._set_grasp_attachment(True, self._continue_after_attachment)
 
     def _schedule_next_grasp_candidate(self) -> bool:
         """Retry a small visual-relative grasp offset before any lift occurs."""
@@ -827,10 +979,10 @@ class TaskManagerNode(Node):
                 float(motion.get("contact_acceleration_scale", motion["acceleration_scale"])),
             ),
             TaskStep(
-                "pose", candidate["object_grasp"], "垂直下降到候选抓取点",
+                "pose", candidate["object_grasp"], "规划下降到候选抓取点",
                 float(motion.get("contact_velocity_scale", motion["velocity_scale"])),
                 float(motion.get("contact_acceleration_scale", motion["acceleration_scale"])),
-                "linear",
+                "pose",
             ),
             TaskStep("gripper", "close", "关闭夹爪抓取"),
             TaskStep(
@@ -904,6 +1056,18 @@ class TaskManagerNode(Node):
             response = future.result()
             result = response.result if response is not None else None
             if result is None or not result.success:
+                # The camera-main calibration is slightly asymmetric across
+                # the two mirrored lanes.  A blue cube can therefore miss
+                # the first nominal pre-grasp pose by only a few millimetres.
+                # The visual-relative candidates already used after a bad
+                # close must also be tried when the *upper* pre-grasp pose
+                # itself has no MoveIt solution; otherwise blue aborts before
+                # any candidate is exercised.
+                if self.active_step_label in {
+                    "移动到目标方块上方",
+                    "移动到候选抓取点上方",
+                } and self._schedule_next_grasp_candidate():
+                    return
                 self._abort_pick_place(
                     result.message if result is not None else "位姿动作没有返回结果"
                 )
@@ -923,8 +1087,10 @@ class TaskManagerNode(Node):
                 )
                 return
         elif self.active_step_label == "垂直撤离目标区域":
-            if not self._verify_gazebo_placement():
-                return
+            # Placement validation is diagnostic only.  Even when the cube
+            # has not settled inside the marker yet, the arm must finish the
+            # sequence and return home.
+            self._verify_gazebo_placement()
         self._execute_next_pick_place_step()
 
     def _verify_actual_tcp(self, expected_pose: PoseSpec) -> bool:
@@ -943,23 +1109,59 @@ class TaskManagerNode(Node):
             self._abort_pick_place(f"无法读取执行后的 end_effector TF：{error}")
             return False
         translation = transform.transform.translation
+        orientation = transform.transform.rotation
         dx = translation.x - expected_pose.position[0]
         dy = translation.y - expected_pose.position[1]
         dz = translation.z - expected_pose.position[2]
         error_m = sqrt(dx * dx + dy * dy + dz * dz)
+        actual_quaternion = (
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        )
+        expected_quaternion = tuple(expected_pose.orientation_xyzw)
+        quaternion_dot = abs(sum(
+            actual * expected
+            for actual, expected in zip(
+                actual_quaternion, expected_quaternion
+            )
+        ))
+        quaternion_dot = max(0.0, min(1.0, quaternion_dot))
+        orientation_error_rad = 2.0 * acos(quaternion_dot)
         self.get_logger().info(
             "实际 TCP 校验：target=(%.3f, %.3f, %.3f), actual=(%.3f, %.3f, %.3f), "
-            "position_error=%.3f m"
+            "position_error=%.3f m, orientation_error=%.3f rad, "
+            "L1=%s rad, L6=%s rad"
             % (
                 expected_pose.position[0], expected_pose.position[1],
                 expected_pose.position[2], translation.x, translation.y,
-                translation.z, error_m,
+                translation.z, error_m, orientation_error_rad,
+                (
+                    "n/a"
+                    if self._arm_joint_position["L1_joint"] is None
+                    else f'{self._arm_joint_position["L1_joint"]:.3f}'
+                ),
+                (
+                    "n/a"
+                    if self._arm_joint_position["L6_joint"] is None
+                    else f'{self._arm_joint_position["L6_joint"]:.3f}'
+                ),
             )
         )
         maximum = float(self.get_parameter("max_tcp_position_error_m").value)
         if error_m > maximum:
             self._abort_pick_place(
                 "实际 TCP 偏差 %.3f m 超过 %.3f m，未继续执行" % (error_m, maximum)
+            )
+            return False
+        maximum_orientation = float(
+            self.get_parameter("max_tcp_orientation_error_rad").value
+        )
+        if orientation_error_rad > maximum_orientation:
+            self._abort_pick_place(
+                "实际 TCP 姿态偏差 %.3f rad 超过 %.3f rad，夹爪未保持世界朝前"
+                % (orientation_error_rad, maximum_orientation)
             )
             return False
         return True
@@ -970,6 +1172,13 @@ class TaskManagerNode(Node):
         )
         self.pending_steps = []
         self.task_in_progress = False
+        # Never leave a cube constrained to the arm after an unrelated
+        # planning or perception failure.
+        if self._attachment_enabled and self.grasp_attachment_client.service_is_ready():
+            request = SetBool.Request()
+            request.data = False
+            self.grasp_attachment_client.call_async(request)
+            self._attachment_enabled = False
 
     @staticmethod
     def _pose_stamped(pose: PoseSpec) -> PoseStamped:

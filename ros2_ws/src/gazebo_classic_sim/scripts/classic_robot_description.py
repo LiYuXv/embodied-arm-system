@@ -16,6 +16,8 @@ from ament_index_python.packages import get_package_share_directory
 
 ARM_JOINTS = ("L1_joint", "L2_joint", "L3_joint", "L4_joint", "L5_joint", "L6_joint")
 JAW_JOINTS = ("left_jaw_joint", "right_jaw_joint")
+JAW_PAD_CENTER_Z = -0.2361
+JAW_PAD_SIZE_M = (0.010, 0.042, 0.038)
 INITIAL_POSITIONS = {
     "L1_joint": 0.0,
     # Start in the public, collision-free ``home`` posture.  The old startup
@@ -223,17 +225,36 @@ def add_classic_materials(robot):
         # contact values in this same element; emitting a second reference
         # silently left the jaw collision pads at Gazebo's default friction.
         if link_name in ("left_jaw_link", "right_jaw_link"):
-            # The jaw collision boxes represent rubber contact pads; a
-            # A modest rubber-like coefficient is sufficient for the 30 g
-            # cube.  The former value of 8 made a slightly misaligned pad
-            # behave like a hook, so the ODE contact correction could eject
-            # the cube instead of allowing it to settle between both pads.
-            etree.SubElement(gazebo, "mu1").text = "3.0"
-            etree.SubElement(gazebo, "mu2").text = "3.0"
-            etree.SubElement(gazebo, "kp").text = "5000"
-            etree.SubElement(gazebo, "kd").text = "30"
-            etree.SubElement(gazebo, "minDepth").text = "0.0005"
-            etree.SubElement(gazebo, "maxVel").text = "0.002"
+            # The adapted collision is a thin rubber side pad.  Select the
+            # pad-local vertical direction explicitly as ODE's primary
+            # friction axis so a two-sided pinch can transmit a lift force.
+            etree.SubElement(gazebo, "mu1").text = "8.0"
+            etree.SubElement(gazebo, "mu2").text = "8.0"
+            etree.SubElement(gazebo, "fdir1").text = "0 0 1"
+            etree.SubElement(gazebo, "kp").text = "30000"
+            etree.SubElement(gazebo, "kd").text = "100"
+            etree.SubElement(gazebo, "minDepth").text = "0.002"
+            etree.SubElement(gazebo, "maxVel").text = "0"
+
+
+def configure_gripper_side_pads(robot):
+    """Configure deck-clear, side-facing physical pads on vendor jaw links."""
+    # Keep each pad's inner face at the same closing-plane location as the
+    # vendor 32 mm box: reducing the box thickness by 22 mm requires moving
+    # its centre 11 mm toward the gripper centre.
+    for link_name, pad_x in (
+        ("left_jaw_link", "0.0567"),
+        ("right_jaw_link", "-0.0567"),
+    ):
+        link = robot.find(f"link[@name='{link_name}']")
+        collision = link.find("collision") if link is not None else None
+        origin = collision.find("origin") if collision is not None else None
+        geometry = collision.find("geometry") if collision is not None else None
+        box = geometry.find("box") if geometry is not None else None
+        if origin is None or box is None:
+            raise RuntimeError(f"missing box collision on {link_name}")
+        origin.set("xyz", f"{pad_x} 0.0003 {JAW_PAD_CENTER_Z}")
+        box.set("size", " ".join(f"{value:.3f}" for value in JAW_PAD_SIZE_M))
 
 
 def add_gripper_contact_sensors(robot):
@@ -281,7 +302,9 @@ def add_grasp_center_frame(robot):
     etree.SubElement(joint, "parent", link="gripper_base_link")
     etree.SubElement(joint, "child", link="grasp_center")
     # Midpoint of the existing left/right jaw collision-pad centres.
-    etree.SubElement(joint, "origin", xyz="0 0.0003 -0.2111", rpy="0 0 0")
+    etree.SubElement(
+        joint, "origin", xyz=f"0 0.0003 {JAW_PAD_CENTER_Z}", rpy="0 0 0"
+    )
 
 
 def main():
@@ -307,6 +330,7 @@ def main():
     for control in list(robot.findall("ros2_control")):
         robot.remove(control)
 
+    configure_gripper_side_pads(robot)
     add_classic_materials(robot)
     add_gripper_contact_sensors(robot)
     add_grasp_center_frame(robot)
