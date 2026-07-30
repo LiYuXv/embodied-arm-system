@@ -2,6 +2,8 @@
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -9,7 +11,7 @@ MAIN_DEVICE = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:6.1:1.0-video-index0"
 AUX_DEVICE = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:6.2:1.0-video-index0"
 
 
-def camera_node(name, device, image_topic):
+def camera_node(name, device, frame_id, image_topic):
     """Create one by-path physical camera source using the local V4L2 bridge."""
     return Node(
         package="gazebo_classic_sim",
@@ -19,7 +21,7 @@ def camera_node(name, device, image_topic):
             "video_device": device,
             "image_topic": image_topic,
             "camera_info_topic": image_topic.rsplit("/", 1)[0] + "/camera_info",
-            "frame_id": name + "_optical_frame",
+            "frame_id": frame_id,
             "use_sim_time": False,
         }],
         output="screen",
@@ -36,7 +38,37 @@ def generate_launch_description():
         output="screen",
     )
     return LaunchDescription([
-        camera_node("camera_main", MAIN_DEVICE, "/camera_main/image_raw"),
-        camera_node("camera_aux", AUX_DEVICE, "/camera_aux/image_raw"),
+        DeclareLaunchArgument(
+            "camera_main_device",
+            default_value=MAIN_DEVICE,
+            description="V4L2 device path for the fixed main camera.",
+        ),
+        DeclareLaunchArgument(
+            "camera_aux_device",
+            default_value=AUX_DEVICE,
+            description="V4L2 device path for the wrist auxiliary camera.",
+        ),
+        DeclareLaunchArgument(
+            "camera_main_frame_id",
+            default_value="camera_main_optical_frame",
+            description="Frame id stamped on camera_main USB images.",
+        ),
+        DeclareLaunchArgument(
+            "camera_aux_frame_id",
+            default_value="camera_aux_optical_frame",
+            description="Frame id stamped on camera_aux USB images.",
+        ),
+        camera_node(
+            "camera_main",
+            LaunchConfiguration("camera_main_device"),
+            LaunchConfiguration("camera_main_frame_id"),
+            "/camera_main/image_raw",
+        ),
+        camera_node(
+            "camera_aux",
+            LaunchConfiguration("camera_aux_device"),
+            LaunchConfiguration("camera_aux_frame_id"),
+            "/camera_aux/image_raw",
+        ),
         perception,
     ])

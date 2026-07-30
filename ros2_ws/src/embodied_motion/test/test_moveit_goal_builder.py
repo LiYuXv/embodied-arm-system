@@ -52,15 +52,13 @@ def test_pose_goal_uses_a_spherical_position_region(builder):
     assert primitive.dimensions == pytest.approx([0.001])
     assert region_pose.position.x == pytest.approx(pose.pose.position.x)
     assert region_pose.position.y == pytest.approx(pose.pose.position.y)
-    # The configured TCP lies 74 mm along the IK-link negative Z axis.
-    assert region_pose.position.z == pytest.approx(
-        pose.pose.position.z + 0.074
-    )
+    # The public TCP is fixed 74 mm below KDL's active planning tip.
+    assert region_pose.position.z == pytest.approx(pose.pose.position.z + 0.074)
     assert region_pose.orientation.w == 1.0
 
 
-def test_pose_goal_uses_complete_orientation_constraint(builder):
-    """The pose goal constrains every orientation axis for 6-DOF IK."""
+def test_pose_goal_locks_world_orientation_without_locking_l6(builder):
+    """Keep the full TCP attitude while allowing L6 to compensate for L1."""
     pose = make_pose()
     goal = builder.build_pose_goal(pose, 0.2, 0.2)
 
@@ -69,9 +67,12 @@ def test_pose_goal_uses_complete_orientation_constraint(builder):
     assert orientation.header.frame_id == "base_link"
     assert orientation.link_name == "l5_l6_urdf_asm"
     assert orientation.orientation.w == 1.0
+    assert orientation.parameterization == orientation.ROTATION_VECTOR
     assert orientation.absolute_x_axis_tolerance == pytest.approx(0.01)
     assert orientation.absolute_y_axis_tolerance == pytest.approx(0.01)
     assert orientation.absolute_z_axis_tolerance == pytest.approx(0.01)
+    assert goal.request.goal_constraints[0].joint_constraints == []
+    assert goal.request.path_constraints.joint_constraints == []
     assert goal.request.start_state.is_diff is True
 
 

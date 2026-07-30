@@ -10,11 +10,12 @@ robot:
   end_effector_link: end_effector
   end_effector_name: ee
 
-  # KDL's IK tip must be the last link after an active joint, not the fixed
-  # TCP child.  The transform is the URDF end_effector_joint transform from
-  # this link to end_effector.  Keep it in sync with el_a3.urdf.xacro.
+  # KDL solves the arm group only through its last active link.  Keep the
+  # public action in end_effector coordinates, then convert that TCP target
+  # to the configured KDL tip below before building MoveIt constraints.
   ik_link: l5_l6_urdf_asm
   tcp_offset_from_ik_link:
+    # URDF fixed joint: l5_l6_urdf_asm -> end_effector.
     xyz: [0.0, 0.0, -0.074]
     rpy: [0.0, 0.0, 0.0]
 
@@ -105,12 +106,29 @@ named_poses:
 
 gripper_positions:
   open:
-    position: 1.5708
+    # Leave a clear but not extreme opening before the vertical approach.
+    # With the vendor 0.05 jaw offset, L7=1.20 gives about 80 mm free space
+    # for the 40 mm cube and avoids driving the visual jaw meshes to their
+    # mechanical limit.
+    position: 1.20
     duration_sec: 1.0
 
   close:
-    position: 0.0
-    duration_sec: 1.0
+    # Do not command the L7 mechanical stop.  L7=0 drove the 40 mm cube into
+    # a nominal 3.4 mm gap and physically expelled it from the tray.  The
+    # physical jaw slides settle about 4 mm short of their force-servo target
+    # because of their 1 N static guide friction.  With
+    # q_jaw=0.05-0.031831*L7, commanding 0.28 rad places the target beyond
+    # the cube faces far enough to overcome the 1 N slide friction.  The
+    # force-servo then saturates at its bounded 1.5 N per pad on contact;
+    # this is a real normal preload, not a kinematic attachment, and the
+    # six-second command plus ODE max-velocity limit prevents an impulse.
+    # The controller's contact-tolerant 8 s settling window is configured in
+    # gazebo_classic_sim/config/controllers.yaml.
+    position: 0.28
+    # Let both physics-driven jaw carriages reach contact and settle before
+    # the task begins its lift; this remains a real trajectory command.
+    duration_sec: 6.0
 
 motion:
   # 兼容当前 FollowJointTrajectory 命名位姿执行逻辑
@@ -118,6 +136,11 @@ motion:
 
   # MoveIt2 速度和加速度缩放
   default_velocity_scale: 0.2
+  orientation_tolerance: 0.01
+  # The task fixes the gripper's complete TCP orientation in base_link.  L6
+  # remains unconstrained as an individual joint so it can counter-rotate
+  # when L1 turns toward red or blue while the jaws continue to face forward.
+  tool_axis_orientation_tolerance: 0.01
   default_acceleration_scale: 0.2
 
   min_velocity_scale: 0.01

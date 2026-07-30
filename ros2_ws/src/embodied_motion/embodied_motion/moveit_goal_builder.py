@@ -15,7 +15,7 @@ from shape_msgs.msg import SolidPrimitive
 
 
 class MoveItGoalBuilder:
-    """构造并校验 EDULITE_A3 的 MoveGroup 规划目标。"""
+    """Build and validate EDULITE A3 MoveGroup goals."""
 
     def __init__(self, config: dict):
         robot_config = config["robot"]
@@ -63,7 +63,11 @@ class MoveItGoalBuilder:
         self.orientation_tolerance = float(
             motion_config["orientation_tolerance"]
         )
-
+        self.tool_axis_orientation_tolerance = float(
+            motion_config.get(
+                "tool_axis_orientation_tolerance", self.orientation_tolerance
+            )
+        )
         # 速度和加速度限制
         self.min_velocity_scale = float(
             motion_config["min_velocity_scale"]
@@ -103,8 +107,7 @@ class MoveItGoalBuilder:
         velocity_scale: float,
         acceleration_scale: float,
     ) -> MoveGroup.Goal:
-        """根据完整关节目标构造 MoveGroup Goal。"""
-
+        """Build a MoveGroup goal from a complete joint target."""
         if not joint_names:
             raise ValueError("joint_names must not be empty")
 
@@ -153,8 +156,7 @@ class MoveItGoalBuilder:
         velocity_scale: float,
         acceleration_scale: float,
     ) -> MoveGroup.Goal:
-        """根据末端位姿目标构造 MoveGroup Goal。"""
-
+        """Build a MoveGroup goal from an end-effector pose."""
         target_pose = copy.deepcopy(target_pose)
         frame_id = target_pose.header.frame_id.strip()
 
@@ -219,14 +221,17 @@ class MoveItGoalBuilder:
             ik_target_pose.pose.orientation
         )
 
-        orientation_constraint.absolute_x_axis_tolerance = (
-            self.orientation_tolerance
+        # Express the error as a rotation vector so the tolerances follow the
+        # target tool frame.  In this parameterization the target's local Z
+        # component is precisely axial tool roll: it can be left free while
+        # X/Y continue to constrain the L5-controlled approach direction.
+        orientation_constraint.parameterization = (
+            OrientationConstraint.ROTATION_VECTOR
         )
-        orientation_constraint.absolute_y_axis_tolerance = (
-            self.orientation_tolerance
-        )
+        orientation_constraint.absolute_x_axis_tolerance = self.orientation_tolerance
+        orientation_constraint.absolute_y_axis_tolerance = self.orientation_tolerance
         orientation_constraint.absolute_z_axis_tolerance = (
-            self.orientation_tolerance
+            self.tool_axis_orientation_tolerance
         )
         orientation_constraint.weight = 1.0
 
@@ -236,7 +241,6 @@ class MoveItGoalBuilder:
         goal_constraints.orientation_constraints = [
             orientation_constraint
         ]
-
         goal = self._build_base_goal(
             velocity_scale=velocity_scale,
             acceleration_scale=acceleration_scale,
@@ -251,8 +255,7 @@ class MoveItGoalBuilder:
         velocity_scale: float,
         acceleration_scale: float,
     ) -> MoveGroup.Goal:
-        """构造关节目标和位姿目标共用的 MoveGroup Goal 字段。"""
-
+        """Build fields common to joint and pose MoveGroup goals."""
         velocity_scale = self._validate_scale(
             name="velocity_scale",
             value=velocity_scale,
@@ -315,8 +318,7 @@ class MoveItGoalBuilder:
         self,
         target_pose: PoseStamped,
     ) -> None:
-        """检查 Pose 中的数值和四元数是否合法。"""
-
+        """Validate finite pose values and a normalized quaternion."""
         position = target_pose.pose.position
         orientation = target_pose.pose.orientation
 
@@ -462,8 +464,7 @@ class MoveItGoalBuilder:
         minimum: float,
         maximum: float,
     ) -> float:
-        """检查速度或加速度缩放是否合法。"""
-
+        """Validate a velocity or acceleration scale."""
         value = float(value)
 
         if not math.isfinite(value):

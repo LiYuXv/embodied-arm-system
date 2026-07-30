@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'embodied_task'
@@ -10,6 +13,10 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (
+            os.path.join('share', package_name, 'config'),
+            glob('config/*.yaml'),
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,6 +32,9 @@ setup(
     entry_points={
         'console_scripts': [
             'task_manager_node = embodied_task.task_manager_node:main',
+            'reachability_diagnosis = '
+            'embodied_task.reachability_diagnosis:main',
+            'path_preflight = embodied_task.path_preflight:main',
         ],
     },
 )

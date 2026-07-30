@@ -7,10 +7,12 @@ import yaml
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from control_msgs.action import FollowJointTrajectory
+from builtin_interfaces.msg import Duration
 from embodied_interfaces.action import MoveToPose
 from embodied_interfaces.srv import MoveNamedPose, SetGripper
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import MoveItErrorCodes
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import MoveItErrorCodes, RobotState
+from moveit_msgs.srv import GetCartesianPath
 from rclpy.action import (
     ActionClient,
     ActionServer,
@@ -26,7 +28,7 @@ from embodied_motion.moveit_goal_builder import MoveItGoalBuilder
 
 
 class MotionExecutorNode(Node):
-    """EDULITE_A3 统一运动规划与执行节点。"""
+    """Plan and execute EDULITE A3 motions."""
 
     MOVEIT_ERROR_NAMES = {
         MoveItErrorCodes.SUCCESS: "SUCCESS",
@@ -87,6 +89,7 @@ class MotionExecutorNode(Node):
         "",
         "pose",
         "ptp",
+        "linear",
     }
 
     def __init__(self) -> None:
@@ -108,6 +111,17 @@ class MotionExecutorNode(Node):
             self,
             MoveGroup,
             self.move_group_action_name,
+            callback_group=self.callback_group,
+        )
+        self.cartesian_path_client = self.create_client(
+            GetCartesianPath,
+            "/compute_cartesian_path",
+            callback_group=self.callback_group,
+        )
+        self.execute_trajectory_client = ActionClient(
+            self,
+            ExecuteTrajectory,
+            self.execute_trajectory_action_name,
             callback_group=self.callback_group,
         )
 
@@ -203,6 +217,9 @@ class MotionExecutorNode(Node):
 
         self.move_group_action_name = str(
             moveit_config["move_group_action"]
+        )
+        self.execute_trajectory_action_name = str(
+            moveit_config["execute_trajectory_action"]
         )
 
         self.arm_joint_names = [
@@ -644,12 +661,24 @@ class MotionExecutorNode(Node):
                 )
             )
 
-            move_group_goal = (
-                self.goal_builder.build_pose_goal(
-                    target_pose=request.target_pose,
-                    velocity_scale=velocity_scale,
-                    acceleration_scale=acceleration_scale,
+            if request.motion_type.strip().lower() == "linear":
+                success, message, action_status = await self._execute_linear_path(
+                    request.target_pose, velocity_scale, acceleration_scale
                 )
+                if success:
+                    goal_handle.succeed()
+                elif action_status == GoalStatus.STATUS_CANCELED:
+                    goal_handle.canceled()
+                else:
+                    goal_handle.abort()
+                result.success = success
+                result.message = message
+                return result
+
+            move_group_goal = self.goal_builder.build_pose_goal(
+                target_pose=request.target_pose,
+                velocity_scale=velocity_scale,
+                acceleration_scale=acceleration_scale,
             )
 
             self._publish_move_to_pose_feedback(
@@ -835,6 +864,103 @@ class MotionExecutorNode(Node):
             )
 
         return success, message
+
+    async def _execute_linear_path(
+        self, target_pose, velocity_scale: float, acceleration_scale: float
+    ) -> Tuple[bool, str, int]:
+        """Plan/execute one Cartesian segment from MoveIt's current state."""
+        if not self.cartesian_path_client.wait_for_service(timeout_sec=3.0):
+            return False, "/compute_cartesian_path unavailable", GoalStatus.STATUS_ABORTED
+        request = GetCartesianPath.Request()
+        request.header = target_pose.header
+        request.start_state = RobotState(is_diff=True)
+        request.group_name = self.planning_group
+        request.link_name = self.end_effector_link
+        request.waypoints = [target_pose.pose]
+        request.max_step = 0.005
+        request.jump_threshold = 0.0
+        request.avoid_collisions = True
+        # Keep the requested TCP orientation in the world frame.  L6 must be
+        # free to counter-rotate as L1 turns toward either colour lane;
+        # constraining L6 itself makes the jaws rotate with the arm and makes
+        # the mirrored blue pose unnecessarily unreachable.
+        response = await self.cartesian_path_client.call_async(request)
+        if response.fraction < 0.999:
+            message = f"Cartesian path fraction={response.fraction:.3f}"
+            return False, message, GoalStatus.STATUS_ABORTED
+        if not self.execute_trajectory_client.wait_for_server(timeout_sec=3.0):
+            return False, "/execute_trajectory unavailable", GoalStatus.STATUS_ABORTED
+        execute_goal = ExecuteTrajectory.Goal()
+        execute_goal.trajectory = response.solution
+        # GetCartesianPath supplies a collision-checked geometric path but no
+        # timing.  Preserve its full, genuinely Cartesian sequence and give
+        # every sampled joint waypoint a monotonic timestamp for Classic's
+        # spline controller.  Collapsing this to one terminal joint point
+        # caused the physical PID arm to settle above the cube on a vertical
+        # descent even though the endpoint was valid.
+        path_points = execute_goal.trajectory.joint_trajectory.points
+        endpoint = path_points[-1]
+        self.get_logger().info(
+            "Cartesian endpoint joint target: "
+            + ", ".join(
+                f"{name}={value:.4f}"
+                for name, value in zip(
+                    execute_goal.trajectory.joint_trajectory.joint_names,
+                    endpoint.positions,
+                )
+            )
+        )
+        # Honour the task's contact/lift velocity scale *and* the actual
+        # Cartesian distance.  The previous formula timed every segment as if
+        # it were 15 cm long: the 5 mm break-away lift therefore took 15 s at
+        # scale 0.01 and looked stationary before the task switched to a
+        # fallback grasp candidate.  ``max_step`` bounds each geometric
+        # segment to 5 mm, so its point count is a conservative distance
+        # estimate.  At scale 0.03, a 15 cm segment still takes five seconds;
+        # short contact motions retain a three-second minimum for ODE.
+        geometric_distance_m = max(len(path_points) - 1, 1) * request.max_step
+        duration_sec = max(
+            3.0,
+            min(20.0, geometric_distance_m / max(velocity_scale, 0.01)),
+        )
+        duration_whole = int(duration_sec)
+        duration_nanos = int((duration_sec - duration_whole) * 1_000_000_000)
+        timed_points = []
+        point_count = len(path_points)
+        # Omit MoveIt's first geometric sample: it is an approximation of the
+        # planning-scene state, whereas JTC must start from actual feedback.
+        # The first retained point gets a positive time, so no zero-time jump
+        # is injected into the physical controller.
+        for index, point in enumerate(path_points[1:], start=1):
+            ratio = index / max(point_count - 1, 1)
+            point_duration = duration_sec * ratio
+            seconds = int(point_duration)
+            nanoseconds = int(round((point_duration - seconds) * 1_000_000_000))
+            if nanoseconds >= 1_000_000_000:
+                seconds += 1
+                nanoseconds -= 1_000_000_000
+            point.time_from_start = Duration(sec=seconds, nanosec=nanoseconds)
+            point.velocities = []
+            point.accelerations = []
+            timed_points.append(point)
+        if not timed_points:
+            endpoint.time_from_start = Duration(
+                sec=duration_whole, nanosec=duration_nanos
+            )
+            endpoint.velocities = []
+            endpoint.accelerations = []
+            timed_points = [endpoint]
+        execute_goal.trajectory.joint_trajectory.points = timed_points
+        handle = await self.execute_trajectory_client.send_goal_async(execute_goal)
+        if not handle.accepted:
+            return False, "ExecuteTrajectory rejected Cartesian path", GoalStatus.STATUS_ABORTED
+        result = await handle.get_result_async()
+        code = int(result.result.error_code.val)
+        ok = code == MoveItErrorCodes.SUCCESS
+        message = "Cartesian execution: " + str(
+            self.MOVEIT_ERROR_NAMES.get(code, code)
+        )
+        return ok, message, result.status
 
     async def _send_move_group_goal(
         self,

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>gazebo_classic_grasp_attachment</name>
+  <version>0.1.0</version>
+  <description>Explicit fixed-joint grasp attachment for the Gazebo Classic A3 workcell.</description>
+  <maintainer email="liyu@example.com">liyu</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>gazebo_dev</build_depend>
+  <depend>gazebo_ros</depend>
+  <depend>rclcpp</depend>
+  <depend>std_srvs</depend>
+
+  <export><build_type>ament_cmake</build_type></export>
+</package>
