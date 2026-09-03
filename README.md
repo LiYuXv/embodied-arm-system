@@ -1,12 +1,14 @@
 # 基于自然语言交互的机械臂具身操作系统设计与实现
 
-本科毕业设计项目，面向 EDULITE_A3 机械臂，基于 Ubuntu 22.04、ROS 2 Humble、MoveIt 2、RViz 2 与 Gazebo Classic 构建自然语言交互、视觉感知、任务调度和机械臂操作一体化系统。
+本科毕业设计项目，面向 EDULITE_A3 机械臂，基于 Ubuntu 22.04、ROS 2 Humble、MoveIt 2、RViz 2 与 Gazebo Classic 构建自然语言交互、视觉感知、任务调度和机械臂操作一体化系统，并逐步扩展到真实机械臂与 LeRobot/VLA 数据采集、训练和推理链路。
 
-当前已完成第一个核心里程碑：
+当前已完成两个核心里程碑：
 
 > 中文指令 → 红蓝目标视觉定位 → MoveIt 运动规划 → Gazebo 夹取、搬运与放置 → 回到安全位姿
 
-红色和蓝色方块均已在同一 Gazebo 场景中完成顺序抓放验收。下一阶段将在稳定的基础抓放链路上开展大语言模型交互、LeRobot/VLA 方案调研与真实机械臂迁移。
+> 真实 EDULITE_A3 → L1-L7 零力矩手动示教 → 双 USB RGB → LeRobotDataset v3.0
+
+红色和蓝色方块均已在同一 Gazebo 场景中完成顺序抓放验收；真实 EDULITE_A3 已完成基础通信、关节控制、零力矩示教与双摄 LeRobot 数据录制验证。当前阶段转入正式 VLA 任务定义、批量示教数据采集、SmolVLA 微调与真机推理。
 
 ## 1. 当前系统架构
 
@@ -40,9 +42,28 @@ red_cube / blue_cube / red_target_zone / blue_target_zone
 embodied_task
 ```
 
-正常抓放任务使用实时视觉坐标计算目标位姿。视觉结果缺失、过期或必要规划段失败时，任务会明确失败；默认不会使用固定世界坐标伪造成功。
+真机 VLA 数据采集链路：
 
-详细完成记录见 [2026-07-30 红蓝方块抓放闭环完成](docs/dev_logs/2026-07-30-pick-place-completion.md)。
+```text
+真实 EDULITE_A3
+    ↓
+L1-L7 零力矩手动示教
+    ↓
+双 USB RGB @ 20 Hz
+    ↓
+state[t] = [x, y, z, rx, ry, rz, gripper]
+    ↓
+action[t] = state[t+5]
+    ↓
+LeRobotDataset v3.0
+```
+
+正常 Gazebo 抓放任务使用实时视觉坐标计算目标位姿。视觉结果缺失、过期或必要规划段失败时，任务会明确失败；默认不会使用固定世界坐标伪造成功。
+
+详细完成记录见：
+
+- [2026-07-30 红蓝方块抓放闭环完成](docs/dev_logs/2026-07-30-pick-place-completion.md)
+- [2026-09-03 真机零力矩示教与 LeRobot 数据录制链路打通](docs/dev_logs/2026-09-03-real-robot-lerobot-recording.md)
 
 ## 2. 已实现功能
 
@@ -140,7 +161,27 @@ Gazebo Classic / MoveIt / ros2_control / RViz
 → language_node
 ```
 
+### 2.8 真实机械臂与 LeRobot 数据采集
+
+真实 EDULITE_A3 已完成以下验证：
+
+- CANable2 通过 SLCAN 建立 `can0`，上位机使用 SocketCAN；
+- L1-L7 反馈与小角度动作测试通过；
+- L1-L7 可在零力矩示教状态下手动拖动，包括夹爪 L7；
+- 两路外接 USB 摄像头使用 `/dev/v4l/by-path/` 固定物理端口，避免 `/dev/videoX` 重编号造成 cam1/cam2 混乱；
+- 测试集 `ela3_test_0903` 成功生成 LeRobotDataset v3.0；
+- 双路 RGB 为 `720×720`、`20 Hz`；
+- `observation.state` 为 7 维 `[x, y, z, rx, ry, rz, gripper]`；
+- `observation.gripper_torque` 为 1 维；
+- `action` 为 7 维；
+- 逐帧验证确认 `action[t] = state[t+5]`，对应 `20 Hz` 下 `0.25 s` lookahead；
+- 单测试 episode 共 `783` 帧、约 `39.1 s`，双路 MP4、Parquet 和 Meta 文件均正常生成。
+
+当前测试集只用于链路验证，正式 VLA 训练数据将重新按统一任务和采集规范录制。
+
 ## 3. 开发环境
+
+ROS 2 / 仿真环境：
 
 - Ubuntu 22.04
 - ROS 2 Humble
@@ -151,6 +192,14 @@ Gazebo Classic / MoveIt / ros2_control / RViz
 - ros2_control
 - EDULITE_A3
 - VS Code
+
+LeRobot / VLA 环境与 ROS 2 Python 环境隔离：
+
+- Miniforge / Conda `lerobot` 环境
+- Python 3.12
+- LeRobot 0.6.2
+- PyTorch 2.11.0 + CUDA 12.8
+- RTX 4060 Laptop GPU（8 GB，本地用于验证，不作为正式 SmolVLA 训练平台）
 
 ## 4. 仓库结构
 
@@ -336,21 +385,26 @@ PR #8 合并前完成的最终验收包括：
 ## 10. 当前限制
 
 - 语言模块仍为规则解析，尚未接入大语言模型；
-- 视觉算法主要针对当前红蓝颜色、固定尺寸与固定工作台；
+- Gazebo 视觉算法主要针对当前红蓝颜色、固定尺寸与固定工作台；
 - 单目平面求交依赖已标定的固定主相机与已知表面高度；
 - 抓取附着插件属于 Gazebo Classic 稳定化方案，不能直接代表真实夹持物理；
 - 尚未形成通用多物体、多任务规划接口；
-- LeRobot/VLA 数据采集、训练与微调尚未开始；
-- 真实 EDULITE_A3 迁移、手眼标定和安全验证尚未完成。
+- LeRobot 数据录制链路已打通，但正式 VLA 任务数据尚未批量采集；
+- SmolVLA 服务器微调、checkpoint 回传和真机推理尚未完成；
+- 当前真机零位为人工近似校准，正式 FK/IK 精度实验和手眼标定前需进一步校准；
+- 真机部分姿态下的重力补偿稳定性仍需继续验证与调参；
+- 真实机械臂的完整语言/VLA 闭环任务和安全性实验尚未完成。
 
 ## 11. 下一阶段
 
-1. 固化当前抓放基线，保留可复现实验命令、日志与视频；
-2. 调研并搭建 LeRobot 数据采集与回放流程；
-3. 设计规则解析与大语言模型任务规划的统一接口；
-4. 评估 VLA 模型接入方式与最小可行训练任务；
-5. 完成真实相机标定和真实机械臂安全迁移；
-6. 将系统实现、实验结果和局限整理为论文内容。
+1. 定义第一个最小可行 VLA 抓放任务与统一采集规范；
+2. 固定物体、目标区、双相机视角、起始姿态、成功标准与 episode 时长；
+3. 批量采集正式 `ela3_demo` 并进行数据质量检查；
+4. 上传服务器，按既有 SmolVLA 管线完成微调；
+5. 回传 checkpoint，验证 RTC/真机连续推理和任务成功率；
+6. 设计规则解析与大语言模型任务规划的统一接口；
+7. 完成真机正式零位、相机/手眼标定、安全验证和实验统计；
+8. 将系统实现、实验结果和局限整理为论文内容。
 
 ## 12. 毕设目标
 
