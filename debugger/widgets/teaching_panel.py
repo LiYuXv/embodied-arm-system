@@ -1,6 +1,7 @@
 """示教面板：零力矩模式 + 轨迹录制/回放"""
 
 import math
+import logging
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QDoubleSpinBox, QPushButton, QGroupBox,
@@ -13,6 +14,8 @@ from debugger.utils.i18n import tr
 from debugger.utils.theme_manager import ThemeManager
 from debugger.utils.style import SCENE_COLORS
 
+logger = logging.getLogger("debugger.teaching")
+
 
 class TeachingPanel(QWidget):
     """示教模式：零力矩拖动 + 轨迹录制回放"""
@@ -21,6 +24,7 @@ class TeachingPanel(QWidget):
     zero_torque_gravity_requested = pyqtSignal(bool)
     move_j_requested = pyqtSignal(list, float)  # positions, duration
     joint_ctrl_requested = pyqtSignal(list)  # positions for impedance control
+    trajectory_playback_requested = pyqtSignal(list)  # list of SDK TrajectoryPoint
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -163,7 +167,9 @@ class TeachingPanel(QWidget):
                 self.zero_torque_gravity_requested.emit(False)
             else:
                 self.zero_torque_requested.emit(False)
-                self.joint_ctrl_requested.emit(self._current_positions[:6])
+                # 发送完整7个关节位置（包含L7夹爪），避免L7回到旧目标位置
+                logger.info(f"退出零力矩: 发送joint_ctrl, positions={self._current_positions[:7]}")
+                self.joint_ctrl_requested.emit(self._current_positions[:7])
 
     def _toggle_recording(self):
         if self.recorder.is_recording:
@@ -208,9 +214,55 @@ class TeachingPanel(QWidget):
         traj = self.recorder.trajectories[idx]
         if not traj.points:
             return
-        dt = 1.0 / max(traj.sample_rate_hz, 1.0)
-        for pt in traj.points:
-            self.move_j_requested.emit(pt.positions[:6], dt)
+
+        # 用三次样条把 10Hz 录制点平滑成 200Hz 轨迹，时间严格对齐录制间隔
+        from el_a3_sdk.trajectory import (
+            TrajectoryPoint as SDKTrajectoryPoint,
+            CubicSplinePlanner,
+        )
+
+        control_dt = 0.005  # 200Hz
+        has_gripper = len(traj.points[0].positions) >= 7 if traj.points else False
+        num_joints = 7 if has_gripper else 6
+
+        n_points = len(traj.points)
+        waypoints = [pt.positions[:num_joints] for pt in traj.points]
+        durations = []
+        for i in range(n_points - 1):
+            dt = traj.points[i + 1].timestamp - traj.points[i].timestamp
+            durations.append(max(1e-6, dt))
+
+        spline_points = CubicSplinePlanner.plan_waypoints(
+            waypoints, durations, dt=control_dt,
+            start_velocity=[0.0] * num_joints,
+            end_velocity=[0.0] * num_joints,
+        )
+
+        sdk_points = [
+            SDKTrajectoryPoint(
+                time=pt.time,
+                positions=list(pt.positions),
+                velocities=list(pt.velocities),
+                accelerations=list(pt.accelerations),
+            )
+            for pt in spline_points
+        ]
+
+        # 保证最后一个点速度为 0，避免结束后继续微漂
+        if sdk_points:
+            last = sdk_points[-1]
+            last.velocities = [0.0] * num_joints
+            last.accelerations = [0.0] * num_joints
+        else:
+            last = traj.points[-1]
+            sdk_points.append(SDKTrajectoryPoint(
+                time=0.0,
+                positions=last.positions[:num_joints],
+                velocities=[0.0] * num_joints,
+                accelerations=[0.0] * num_joints,
+            ))
+
+        self.trajectory_playback_requested.emit(sdk_points)
 
     def _save_trajectory(self):
         idx = self.traj_list.currentRow()

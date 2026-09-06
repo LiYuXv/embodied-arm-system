@@ -414,8 +414,11 @@ class ELA3Kinematics:
 
     def _pose_to_se3(self, pose: ArmEndPose) -> "pin.SE3":
         """ArmEndPose -> pinocchio SE3"""
-        R = pin.rpy.rpyToMatrix(pose.rx, pose.ry, pose.rz)
-        t = np.array([pose.x, pose.y, pose.z])
+        # 强制转 Python float：调用方可能传入 np.float32（如 VLA 推理输出），
+        # 而 rpyToMatrix / SE3 的 C++ 绑定只接受 double（np.float64 继承自
+        # Python float 可隐式转换，np.float32 会被直接拒绝）
+        R = pin.rpy.rpyToMatrix(float(pose.rx), float(pose.ry), float(pose.rz))
+        t = np.array([pose.x, pose.y, pose.z], dtype=np.float64)
         return pin.SE3(R, t)
 
     def _clamp_to_limits(self, q: np.ndarray, margin: float = 0.0):

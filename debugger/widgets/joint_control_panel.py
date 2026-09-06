@@ -42,6 +42,7 @@ class JointControlPanel(QWidget):
         self._pos_labels = []
         self._vel_labels = []
         self._torque_labels = []
+        self._temp_labels = []
         self._header_labels = []
         self._name_labels = []
         self._init_ui()
@@ -56,7 +57,8 @@ class JointControlPanel(QWidget):
         grid.setContentsMargins(0, 0, 0, 0)
 
         headers = [tr("jc.header_joint"), tr("jc.header_ctrl"), tr("jc.header_target"),
-                 tr("jc.header_pos"), tr("jc.header_vel"), tr("jc.header_torque"), ""]
+                 tr("jc.header_pos"), tr("jc.header_vel"), tr("jc.header_torque"),
+                 "", tr("jc.header_temp")]
         for col, h in enumerate(headers):
             lbl = QLabel(h)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -126,6 +128,14 @@ class JointControlPanel(QWidget):
 
             grid.addWidget(QLabel("Nm"), row, 6)
 
+            temp_label = QLabel("--")
+            temp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            temp_label.setFixedWidth(60)
+            temp_label.setFixedHeight(24)
+            temp_label.setStyleSheet("color: #888;")
+            self._temp_labels.append(temp_label)
+            grid.addWidget(temp_label, row, 7)
+
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 5)
         grid.setColumnStretch(2, 0)
@@ -158,7 +168,9 @@ class JointControlPanel(QWidget):
 
     def retranslate_ui(self):
         sc = SCENE_COLORS[ThemeManager.instance().theme]
-        headers = [tr("jc.header_joint"), tr("jc.header_ctrl"), tr("jc.header_target"), tr("jc.header_actual")]
+        headers = [tr("jc.header_joint"), tr("jc.header_ctrl"), tr("jc.header_target"),
+                   tr("jc.header_pos"), tr("jc.header_vel"), tr("jc.header_torque"),
+                   "", tr("jc.header_temp")]
         for i, lbl in enumerate(self._header_labels):
             lbl.setText(headers[i])
             lbl.setStyleSheet(f"font-weight: bold; color: {sc['header_text']};")
@@ -224,6 +236,10 @@ class JointControlPanel(QWidget):
                 pass
         self._updating_from_feedback = False
 
+    def sync_to_feedback(self):
+        """公开接口：将控制滑块/输入框同步到当前反馈位置"""
+        self._sync_to_feedback()
+
     def update_feedback(self, joint_states):
         """从 ArmJointStates 更新位置显示"""
         positions = joint_states.to_list(include_gripper=True)
@@ -234,11 +250,28 @@ class JointControlPanel(QWidget):
         self._updating_from_feedback = False
 
     def update_motor_feedback(self, motor_feedback_list):
-        """从 MotorFeedback 列表更新速度和力矩显示"""
+        """从 MotorFeedback 列表更新速度、力矩和温度显示。
+
+        温度着色：正常灰色；≥70°C 淡红；≥80°C 深红。
+        """
         self._updating_from_feedback = True
         for i, fb in enumerate(motor_feedback_list[:7]):
             self._vel_labels[i].setText(f"{fb.velocity:.2f}")
             self._torque_labels[i].setText(f"{fb.torque:.2f}")
+            if hasattr(fb, 'temperature') and fb.temperature is not None:
+                t = float(fb.temperature)
+                self._temp_labels[i].setText(f"{t:.1f}")
+                if t >= 80:
+                    color = "#d32f2f"
+                elif t >= 70:
+                    color = "#ff6b6b"
+                else:
+                    color = "#888"
+                self._temp_labels[i].setStyleSheet(
+                    f"color: {color}; font-weight: bold;")
+            else:
+                self._temp_labels[i].setText("--")
+                self._temp_labels[i].setStyleSheet("color: #888;")
         self._updating_from_feedback = False
 
     def set_enabled(self, enabled: bool):

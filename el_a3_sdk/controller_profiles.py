@@ -134,8 +134,8 @@ PROFILES: Dict[str, ControllerProfile] = {
         display_name="Xbox (xpad/xinput)",
         description="Standard Xbox layout using Linux xpad-style axes.",
         sticks=StickMap(
-            lx=AxisBinding(0),
-            ly=AxisBinding(1),
+            lx=AxisBinding(0,invert=True),
+            ly=AxisBinding(1,invert=True),
             lt=TriggerBinding(index=2, scale=0.5, offset=0.5),
             rx=AxisBinding(3),
             ry=AxisBinding(4),

@@ -204,6 +204,16 @@ QComboBox::drop-down {{
     border-top-right-radius: 5px;
     border-bottom-right-radius: 5px;
 }}
+QComboBox::down-arrow {{
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #8b8fa8;
+    width: 0; height: 0;
+}}
+QComboBox::down-arrow:hover {{
+    border-top-color: #89b4fa;
+}}
 QComboBox QAbstractItemView {{
     background-color: #222338;
     color: #cdd6f4;
@@ -537,6 +547,16 @@ QComboBox::drop-down {{
     width: 22px;
     border-top-right-radius: 5px;
     border-bottom-right-radius: 5px;
+}}
+QComboBox::down-arrow {{
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #6b7084;
+    width: 0; height: 0;
+}}
+QComboBox::down-arrow:hover {{
+    border-top-color: #3478f6;
 }}
 QComboBox QAbstractItemView {{
     background-color: #ffffff;

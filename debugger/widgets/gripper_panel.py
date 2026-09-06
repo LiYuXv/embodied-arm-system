@@ -13,10 +13,11 @@ from debugger.utils.style import SCENE_COLORS
 
 
 class GripperPanel(QWidget):
-    """夹爪控制：角度滑块、全开/全关、设零"""
+    """夹爪控制：角度滑块、全开/全关、设零、力矩限制"""
 
-    gripper_command = pyqtSignal(float)  # angle in rad
+    gripper_command = pyqtSignal(float, float, float)  # (angle rad, torque_max, torque_min) Nm
     set_zero_requested = pyqtSignal()
+    torque_limit_changed = pyqtSignal(float, float)  # (max, min) in Nm
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,6 +71,34 @@ class GripperPanel(QWidget):
         fb_layout.addStretch()
         g_layout.addLayout(fb_layout)
 
+        # 力矩限制输入（默认最大 0.5 Nm / 最小 -0.5 Nm）
+        limit_layout = QHBoxLayout()
+        self._lbl_limit = QLabel()
+        limit_layout.addWidget(self._lbl_limit)
+        self.torque_max_spin = QDoubleSpinBox()
+        self.torque_max_spin.setRange(-10.0, 10.0)
+        self.torque_max_spin.setDecimals(2)
+        self.torque_max_spin.setSingleStep(0.05)
+        self.torque_max_spin.setValue(0.5)
+        self.torque_max_spin.setSuffix(" Nm")
+        self.torque_max_spin.setFixedWidth(90)
+        self.torque_max_spin.valueChanged.connect(self._emit_torque_limit)
+        limit_layout.addWidget(self.torque_max_spin)
+        limit_layout.addSpacing(8)
+        self._lbl_limit_min = QLabel()
+        limit_layout.addWidget(self._lbl_limit_min)
+        self.torque_min_spin = QDoubleSpinBox()
+        self.torque_min_spin.setRange(-10.0, 10.0)
+        self.torque_min_spin.setDecimals(2)
+        self.torque_min_spin.setSingleStep(0.05)
+        self.torque_min_spin.setValue(-0.5)
+        self.torque_min_spin.setSuffix(" Nm")
+        self.torque_min_spin.setFixedWidth(90)
+        self.torque_min_spin.valueChanged.connect(self._emit_torque_limit)
+        limit_layout.addWidget(self.torque_min_spin)
+        limit_layout.addStretch()
+        g_layout.addLayout(limit_layout)
+
         btn_layout = QHBoxLayout()
         self.send_btn = QPushButton()
         self.send_btn.setObjectName("enableBtn")
@@ -102,11 +131,18 @@ class GripperPanel(QWidget):
         self._lbl_angle.setText(tr("grip.angle"))
         self._lbl_actual.setText(tr("grip.actual"))
         self._lbl_torque.setText(tr("grip.torque"))
+        self._lbl_limit.setText(tr("grip.torque_limit"))
+        self._lbl_limit_min.setText(tr("grip.torque_min"))
         self.send_btn.setText(tr("grip.send"))
         self.open_btn.setText(tr("grip.open"))
         self.close_btn.setText(tr("grip.close"))
         self.zero_btn.setText(tr("grip.set_zero"))
         self._apply_feedback_label_styles()
+
+    def _emit_torque_limit(self):
+        self.torque_limit_changed.emit(
+            self.torque_max_spin.value(), self.torque_min_spin.value()
+        )
 
     def _on_slider_changed(self, val):
         if self._updating:
@@ -131,7 +167,9 @@ class GripperPanel(QWidget):
 
     def _send_command(self):
         angle_rad = math.radians(self.angle_spin.value())
-        self.gripper_command.emit(angle_rad)
+        self.gripper_command.emit(
+            angle_rad, self.torque_max_spin.value(), self.torque_min_spin.value()
+        )
 
     def update_feedback(self, joint_states, effort_states=None):
         positions = joint_states.to_list(include_gripper=True)

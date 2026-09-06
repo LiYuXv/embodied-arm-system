@@ -60,8 +60,19 @@ SPEED_LEVELS = [
     ("最大", 1.00),
 ]
 
-HOME_POSITIONS = [0.0, 0.785, -0.785, 0.0, 0.0, 0.0]
+HOME_POSITIONS = [0.0, 0.785, -0.785, 1, 0.0, 0.0]
 ZERO_POSITIONS = [0.0] * 6
+
+# ── 夹爪力矩限制（与 debugger VR 面板一致的安全策略）──
+# 闭合方向（角度增大）：力矩≥上限时锁定并保位；张开方向（角度减小）：力矩≤下限同理。
+GRIPPER_TORQUE_MAX = 0.5     # 夹爪力矩上限 (Nm)：闭合时力矩≥此值停止继续闭合
+GRIPPER_TORQUE_MIN = -0.5    # 夹爪力矩下限 (Nm)：张开时力矩≤此值停止继续张开
+# 软阈值比例：力矩达限值的此比例时推进量开始线性预减速（消除快速闭合的力矩超调）
+_GRIPPER_TORQUE_SOFT_RATIO = 0.6
+
+# 夹爪闭合/张开速度 (rad/s)：D-pad 按住期间目标角度按此速度连续变化
+# （每 tick 步长 = GRIPPER_SPEED / 控制频率，100Hz 时 1.0 rad/s → 0.01 rad/tick）
+GRIPPER_SPEED = 1.0
 
 
 # ================================================================
@@ -141,6 +152,13 @@ class XboxArmController:
         self._gripper_angle = 0.0
         self._gripper_step = 0.2
 
+        # 夹爪力矩限制（Nm）：可由 GUI 夹爪面板通过 set_gripper_torque_limits 写入
+        self.gripper_torque_max = GRIPPER_TORQUE_MAX
+        self.gripper_torque_min = GRIPPER_TORQUE_MIN
+        # 夹爪力矩锁定：触限后锁定该方向，D-pad 回中或反向才解锁（防止反复撞击）
+        self._gripper_close_locked = False
+        self._gripper_open_locked = False
+
         # Button edge detection
         self._prev_btn = [0] * LinuxJoystick.MAX_BUTTONS
         self._prev_dpad_up = 0
@@ -187,23 +205,36 @@ class XboxArmController:
     # ---- Initialization ----
 
     def _initialize(self):
-        logger.info("移动到零位...")
-        self._arm.MoveJ(ZERO_POSITIONS, duration=3.0, block=True)
-        time.sleep(0.3)
+        # 从当前关节位置启动，而不是回到零位。先让控制循环进入 Servo 模式，
+        # 然后读取当前关节角作为 IK seed 和滤波器初始位置。
+        logger.info("从当前位置启动控制...")
+        try:
+            q_current = self._arm.GetArmJointMsgs().to_list()[:6]
+        except Exception as e:
+            logger.warning("读取当前关节位置失败: %s, 回退到零位", e)
+            q_current = list(ZERO_POSITIONS)
 
-        self._ik_seed = list(ZERO_POSITIONS)
-        self._ik_filter_pos = list(ZERO_POSITIONS)
+        self._ik_seed = list(q_current)
+        self._ik_filter_pos = list(q_current)
         self._ik_filter_vel = [0.0] * 6
         self._ik_raw = None
         self._seed_just_init = True
         self._consecutive_rejects = 0
         self._consecutive_ik_fails = 0
 
+        # 以当前夹爪反馈角度为基准，避免启动后首次按 D-pad 时夹爪突动
+        try:
+            positions = self._arm.GetArmJointMsgs().to_list(include_gripper=True)
+            if len(positions) >= 7:
+                self._gripper_angle = float(positions[6])
+        except Exception:
+            pass
+
         if self._kin is not None:
-            self._target_pose = self._kin.forward_kinematics(ZERO_POSITIONS)
+            self._target_pose = self._kin.forward_kinematics(q_current)
             self._prev_pose = None
             p = self._target_pose
-            logger.info("初始化完成, 末端位姿: (%.3f, %.3f, %.3f) m  (%.2f, %.2f, %.2f) rad",
+            logger.info("初始化完成, 从当前位姿开始: (%.3f, %.3f, %.3f) m  (%.2f, %.2f, %.2f) rad",
                         p.x, p.y, p.z, p.rx, p.ry, p.rz)
         else:
             logger.info("初始化完成 (无运动学)")
@@ -272,6 +303,33 @@ class XboxArmController:
             return False
         return self._joy.buttons[idx] == 1 and self._prev_btn[idx] == 0
 
+    # ---- Gripper torque limit helpers ----
+
+    def set_gripper_torque_limits(self, torque_max: float, torque_min: float):
+        """设置夹爪力矩限制 (Nm)，由 GUI 夹爪面板实时写入（float 赋值原子，跨线程安全）"""
+        self.gripper_torque_max = float(torque_max)
+        self.gripper_torque_min = float(torque_min)
+
+    def _read_gripper_torque(self) -> Optional[float]:
+        """读取夹爪(L7)当前力矩 (Nm)，失败返回 None"""
+        try:
+            efforts = self._arm.GetArmJointEfforts().to_list(include_gripper=True)
+            if len(efforts) >= 7:
+                return float(efforts[6])
+        except Exception:
+            pass
+        return None
+
+    def _read_gripper_feedback(self) -> float:
+        """读取夹爪(L7)当前反馈角度 (rad)，失败返回当前目标角度"""
+        try:
+            positions = self._arm.GetArmJointMsgs().to_list(include_gripper=True)
+            if len(positions) >= 7:
+                return float(positions[6])
+        except Exception:
+            pass
+        return float(self._gripper_angle)
+
     # ---- Main tick ----
 
     def _tick(self):
@@ -291,7 +349,8 @@ class XboxArmController:
             self._async_move(HOME_POSITIONS, "Home")
 
         if self._btn_edge(buttons.west):
-            self._async_move(ZERO_POSITIONS, "零位")
+            self._async_move(ZERO_POSITIONS, "零位", duration=4.0,
+                             v_max=0.6, a_max=1.0)
 
         if self._btn_edge(buttons.north):
             self._toggle_zero_torque()
@@ -303,18 +362,67 @@ class XboxArmController:
             logger.info("收到退出请求")
             self._exit_requested = True
 
-        # D-pad gripper
+        # D-pad gripper：单击小步长，长按持续开合（带力矩限制保护，策略与 VR 面板一致）
         dpad_y = self._axis_value(sticks.dpad_y)
         dpad_up = 1 if dpad_y < -0.5 else 0
         dpad_down = 1 if dpad_y > 0.5 else 0
-        if dpad_up and not self._prev_dpad_up:
-            self._gripper_angle = min(self._gripper_angle + self._gripper_step, 1.5708)
+
+        # 长按持续变化时的每 tick 步长（由夹爪速度 GRIPPER_SPEED 换算，平滑微调）
+        gripper_hold_step = GRIPPER_SPEED * self._dt
+
+        if not dpad_up and not dpad_down:
+            # D-pad 回中：解锁力矩锁定，允许松开后重新尝试闭合/张开
+            self._gripper_close_locked = False
+            self._gripper_open_locked = False
+        else:
+            closing = bool(dpad_up)  # 角度增大方向 = 闭合（与 VR 面板约定一致）
+            increment = gripper_hold_step if closing else -gripper_hold_step
+            # 反向操作时解锁对应方向的锁定
+            if closing:
+                self._gripper_open_locked = False
+            else:
+                self._gripper_close_locked = False
+
+            # 力矩受限推进：预减速 + 触限锁定保位，消除快速闭合时的力矩超调
+            effective_inc = increment
+            locked = False
+            gripper_torque = self._read_gripper_torque()
+            if gripper_torque is not None:
+                if closing:
+                    soft = self.gripper_torque_max * _GRIPPER_TORQUE_SOFT_RATIO
+                    if gripper_torque >= self.gripper_torque_max or self._gripper_close_locked:
+                        # 触限：锁定闭合方向，保位在当前反馈位置（不再继续推进）
+                        if not self._gripper_close_locked:
+                            logger.warning(
+                                "夹爪力矩 %.2f Nm 达上限 %.2f Nm，停止闭合（D-pad 回中后解锁）",
+                                gripper_torque, self.gripper_torque_max)
+                        self._gripper_close_locked = True
+                        locked = True
+                        effective_inc = self._read_gripper_feedback() - self._gripper_angle
+                    elif gripper_torque > soft and self.gripper_torque_max > soft:
+                        # 预减速：力矩从软阈值→上限时，推进量线性衰减到 0
+                        k = (self.gripper_torque_max - gripper_torque) / (self.gripper_torque_max - soft)
+                        effective_inc = increment * max(0.0, min(1.0, k))
+                else:  # 张开方向（对称处理）
+                    soft = self.gripper_torque_min * _GRIPPER_TORQUE_SOFT_RATIO
+                    if gripper_torque <= self.gripper_torque_min or self._gripper_open_locked:
+                        if not self._gripper_open_locked:
+                            logger.warning(
+                                "夹爪力矩 %.2f Nm 达下限 %.2f Nm，停止张开（D-pad 回中后解锁）",
+                                gripper_torque, self.gripper_torque_min)
+                        self._gripper_open_locked = True
+                        locked = True
+                        effective_inc = self._read_gripper_feedback() - self._gripper_angle
+                    elif gripper_torque < soft and self.gripper_torque_min < soft:
+                        k = (self.gripper_torque_min - gripper_torque) / (self.gripper_torque_min - soft)
+                        effective_inc = increment * max(0.0, min(1.0, k))
+
+            self._gripper_angle = max(-1.5708,
+                                      min(self._gripper_angle + effective_inc, 1.5708))
             self._arm.GripperCtrl(gripper_angle=self._gripper_angle)
-            logger.info("夹爪: %.2f rad", self._gripper_angle)
-        if dpad_down and not self._prev_dpad_down:
-            self._gripper_angle = max(self._gripper_angle - self._gripper_step, -1.5708)
-            self._arm.GripperCtrl(gripper_angle=self._gripper_angle)
-            logger.info("夹爪: %.2f rad", self._gripper_angle)
+            if not locked:
+                logger.info("夹爪: %.2f rad", self._gripper_angle)
+
         self._prev_dpad_up = dpad_up
         self._prev_dpad_down = dpad_down
 
@@ -501,16 +609,19 @@ class XboxArmController:
 
     # ---- Button actions ----
 
-    def _async_move(self, positions: List[float], name: str):
+    def _async_move(self, positions: List[float], name: str, duration: float = 5.0,
+                    v_max: Optional[float] = None, a_max: Optional[float] = None):
         if self._is_moving:
             logger.warning("正在执行其他动作，请稍后再试")
             return
         logger.info("正在移动到 %s...", name)
         self._is_moving = True
         threading.Thread(
-            target=self._do_move, args=(positions, name), daemon=True).start()
+            target=self._do_move, args=(positions, name, duration, v_max, a_max),
+            daemon=True).start()
 
-    def _do_move(self, positions: List[float], name: str):
+    def _do_move(self, positions: List[float], name: str, duration: float = 5.0,
+                 v_max: Optional[float] = None, a_max: Optional[float] = None):
         try:
             if self._zero_torque:
                 self._arm.ZeroTorqueMode(False)
@@ -521,7 +632,8 @@ class XboxArmController:
                 time.sleep(0.3)
                 self._arm.start_control_loop(rate_hz=200.0)
                 self._estop = False
-            self._arm.MoveJ(positions, duration=2.0, block=True)
+            self._arm.MoveJ(positions, duration=duration,
+                            v_max=v_max, a_max=a_max, block=True)
             feedback_q = self._arm.GetArmJointMsgs().to_list()[:6]
             self._ik_seed = list(positions)
             self._ik_filter_pos = list(positions)

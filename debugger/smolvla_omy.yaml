@@ -1,0 +1,41 @@
+dataset:
+  repo_id: ela3_demo
+  root: ./lerobot_data/ela3_demo
+  eval_split: 0.1              # 留出 10% episodes 做验证 loss（监控过拟合）
+  image_transforms:
+    enable: true               # 图像增强（亮度/对比度等，见默认 tfs 配置）
+    random_order: true         # 随机顺序应用增强
+# 验证 loss 计算频率（步）：eval_split 只划分数据，eval_steps>0 才会真正计算
+eval_steps: 500
+policy:
+  type: smolvla_torque
+  torque_key: observation.gripper_torque
+  # 从 SmolVLA 官方预训练权重微调（VLM+动作专家都有机器人数据先验，不从零训练）；
+  # 权重已实测与 smolvla_torque 完全兼容（0 missing/unexpected）
+  pretrained_path: ./pretrained_models/smolvla_base
+  # 注意：不要设置 n_obs_steps——SmolVLA 的 observation_delta_indices 硬编码 [0]，
+  # 该参数对 SmolVLA 无效（lerobot 0.4/0.6 均如此）
+  chunk_size: 40
+  n_action_steps: 20
+  device: cuda
+  push_to_hub: false
+  vlm_model_name: ./pretrained_models/smolvlm2-500m-video-instruct
+
+save_checkpoint: true
+output_dir: ./ckpt/smolvla_ela3_torque_la5  # lookahead=5 数据新 run，避免与旧目录冲突
+batch_size: 16
+job_name: smolvla_ela3_torque_la5
+resume: false
+seed: 42
+num_workers: 4
+steps: 40_000           # 对齐开源项目（27.7 epoch 量级），分阶段评估可提前停
+env_eval_freq: -1
+log_freq: 50
+save_freq: 2_000
+use_policy_training_preset: true
+
+wandb:
+  enable: false
+  project: smolvla_ela3
+  entity: <your_wandb_entity>
+  disable_artifact: true

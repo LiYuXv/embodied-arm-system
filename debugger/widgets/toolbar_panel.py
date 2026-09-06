@@ -47,6 +47,7 @@ class ToolbarPanel(QWidget):
     enable_requested = pyqtSignal()
     disable_requested = pyqtSignal()
     emergency_stop_requested = pyqtSignal()
+    safe_exit_requested = pyqtSignal()
     open_monitor_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -163,6 +164,13 @@ class ToolbarPanel(QWidget):
         self.estop_btn.clicked.connect(self.emergency_stop_requested.emit)
         row.addWidget(self.estop_btn)
 
+        self.safe_exit_btn = QPushButton(tr("tb.safe_exit"))
+        self.safe_exit_btn.setObjectName("safeExitBtn")
+        self.safe_exit_btn.setFixedWidth(76)
+        self.safe_exit_btn.setToolTip(tr("tb.safe_exit_tip"))
+        self.safe_exit_btn.clicked.connect(self.safe_exit_requested.emit)
+        row.addWidget(self.safe_exit_btn)
+
         self._add_sep(row)
 
         self.monitor_btn = QPushButton(tr("tb.monitor"))
@@ -227,6 +235,8 @@ class ToolbarPanel(QWidget):
         self.can_baud_combo.setToolTip(tr("tb.can_baud_tip"))
         self.refresh_btn.setToolTip(tr("tb.refresh_tip"))
         self.estop_btn.setText(tr("tb.estop"))
+        self.safe_exit_btn.setText(tr("tb.safe_exit"))
+        self.safe_exit_btn.setToolTip(tr("tb.safe_exit_tip"))
         self.monitor_btn.setText(tr("tb.monitor"))
         self.monitor_btn.setToolTip(tr("tb.monitor_tip"))
 

@@ -78,6 +78,7 @@ class Viewer3DPanel(QWidget):
         self._hovered_link: Optional[str] = None
         self._filter_installed = False
         self._enabled = False
+        self._view_closed = True  # 默认关闭 3D 视图（点击"关闭视图"按钮可恢复）
 
         self._init_ui()
 
@@ -111,6 +112,13 @@ class Viewer3DPanel(QWidget):
         self._wireframe_btn.clicked.connect(self._toggle_wireframe)
         row1.addWidget(self._wireframe_btn)
 
+        self._view_btn = QPushButton(tr("v3d.view_off"))
+        self._view_btn.setSizePolicy(_btn_sp())
+        self._view_btn.setCheckable(True)
+        self._view_btn.setChecked(True)  # 默认关闭 3D 视图
+        self._view_btn.clicked.connect(self._toggle_view)
+        row1.addWidget(self._view_btn)
+
         row1.addStretch()
         layout.addLayout(row1)
 
@@ -130,6 +138,8 @@ class Viewer3DPanel(QWidget):
             sc = SCENE_COLORS[ThemeManager.instance().theme]
             self._plotter.set_background(sc["bg_bottom"], top=sc["bg_top"])
             layout.addWidget(self._plotter.interactor)
+            # 默认关闭 3D 视图：隐藏渲染窗口并跳过渲染更新
+            self._toggle_view(True)
         except Exception as e:
             logger.error(f"创建 3D 渲染器失败: {e}")
             self._plotter = None
@@ -161,6 +171,8 @@ class Viewer3DPanel(QWidget):
             self._reset_btn.setText(tr("v3d.reset"))
         if hasattr(self, '_wireframe_btn'):
             self._wireframe_btn.setText(tr("v3d.wireframe"))
+        if hasattr(self, '_view_btn'):
+            self._view_btn.setText(tr("v3d.view_off"))
 
     # ==================================================================
     # 模型加载
@@ -280,6 +292,8 @@ class Viewer3DPanel(QWidget):
     def update_joint_angles(self, joint_states):
         """根据关节反馈更新 3D 模型姿态（节流到 10Hz）"""
         if not self._initialized or self._model is None:
+            return
+        if self._view_closed:
             return
         if self._drag_mode:
             return
@@ -477,7 +491,7 @@ class Viewer3DPanel(QWidget):
 
     def _render_pose(self, angles: Dict[str, float]):
         """用给定角度字典更新 3D mesh 位姿并渲染。"""
-        if not self._model:
+        if not self._model or self._view_closed:
             return
 
         transforms = self._model.compute_link_transforms(angles)
@@ -570,6 +584,21 @@ class Viewer3DPanel(QWidget):
                 (0.0, 0.0, 0.15),
                 (0.0, 0.0, 1.0),
             ]
+
+    def _toggle_view(self, checked):
+        """关闭/恢复 3D 视图：关闭时隐藏渲染窗口并跳过所有渲染更新。"""
+        self._view_closed = checked
+        if self._plotter is None:
+            return
+        if checked:
+            if self._drag_mode:
+                self.set_drag_mode(False)
+            self._plotter.interactor.hide()
+            self._status_label.setText(tr("v3d.view_off"))
+        else:
+            self._plotter.interactor.show()
+            self._status_label.setText("")
+            self._render_pose(self._current_angles)
 
     def _toggle_wireframe(self, checked):
         if not self._plotter:

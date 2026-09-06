@@ -55,6 +55,29 @@ class DiagnosticsPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
+        self.op_group = QGroupBox()
+        op_layout = QHBoxLayout()
+
+        zero_layout = QHBoxLayout()
+        self._lbl_zero_motor = QLabel()
+        zero_layout.addWidget(self._lbl_zero_motor)
+        self.zero_motor_spin = QSpinBox()
+        self.zero_motor_spin.setRange(1, 7)
+        zero_layout.addWidget(self.zero_motor_spin)
+        self.zero_btn = QPushButton()
+        self.zero_btn.clicked.connect(
+            lambda: self.set_zero_requested.emit(self.zero_motor_spin.value())
+        )
+        zero_layout.addWidget(self.zero_btn)
+
+        self.zero_all_btn = QPushButton()
+        self.zero_all_btn.clicked.connect(lambda: self.set_zero_requested.emit(0xFF))
+        zero_layout.addWidget(self.zero_all_btn)
+
+        op_layout.addLayout(zero_layout)
+        self.op_group.setLayout(op_layout)
+        layout.addWidget(self.op_group)
+
         self.motor_group = QGroupBox()
         motor_layout = QVBoxLayout()
 
@@ -180,29 +203,6 @@ class DiagnosticsPanel(QWidget):
 
         self.verify_group.setLayout(verify_layout)
         layout.addWidget(self.verify_group)
-
-        self.op_group = QGroupBox()
-        op_layout = QHBoxLayout()
-
-        zero_layout = QHBoxLayout()
-        self._lbl_zero_motor = QLabel()
-        zero_layout.addWidget(self._lbl_zero_motor)
-        self.zero_motor_spin = QSpinBox()
-        self.zero_motor_spin.setRange(1, 7)
-        zero_layout.addWidget(self.zero_motor_spin)
-        self.zero_btn = QPushButton()
-        self.zero_btn.clicked.connect(
-            lambda: self.set_zero_requested.emit(self.zero_motor_spin.value())
-        )
-        zero_layout.addWidget(self.zero_btn)
-
-        self.zero_all_btn = QPushButton()
-        self.zero_all_btn.clicked.connect(lambda: self.set_zero_requested.emit(0xFF))
-        zero_layout.addWidget(self.zero_all_btn)
-
-        op_layout.addLayout(zero_layout)
-        self.op_group.setLayout(op_layout)
-        layout.addWidget(self.op_group)
 
         self.can_group = QGroupBox()
         can_layout = QHBoxLayout()

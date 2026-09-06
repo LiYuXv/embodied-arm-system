@@ -14,8 +14,8 @@ class MonitoringWindow(QMainWindow):
     def __init__(self, data_buffer: DataBuffer, parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("mon.window_title"))
-        self.setMinimumSize(900, 600)
-        self.resize(1100, 700)
+        self.setMinimumSize(1100, 800)
+        self.resize(1400, 900)
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowCloseButtonHint

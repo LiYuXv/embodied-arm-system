@@ -1,8 +1,8 @@
-"""实时监控面板：4 通道 pyqtgraph 实时曲线"""
+"""实时监控面板：单窗口 7 关节温度实时曲线。"""
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QGridLayout, QFileDialog, QLabel,
+    QFileDialog, QLabel,
 )
 from PyQt6.QtCore import QTimer
 
@@ -19,13 +19,13 @@ CHANNEL_NAMES = ["L1", "L2", "L3", "L4", "L5", "L6", "L7"]
 
 
 class MonitoringPanel(QWidget):
-    """2x2 实时曲线监控面板"""
+    """实时温度曲线监控面板（7 个关节温度绘制在同一曲线上）"""
 
     def __init__(self, data_buffer: DataBuffer, parent=None):
         super().__init__(parent)
         self.data_buffer = data_buffer
         self._paused = False
-        self._plots = []
+        self._plot = None
         self._curves = []
         self._init_ui()
         self.apply_theme()
@@ -34,19 +34,13 @@ class MonitoringPanel(QWidget):
 
     def apply_theme(self):
         sc = SCENE_COLORS[ThemeManager.instance().theme]
-        for pw in self._plots:
-            pw.setBackground(sc["pg_bg"])
+        if self._plot is not None:
+            self._plot.setBackground(sc["pg_bg"])
 
     def retranslate_ui(self):
-        titles = [
-            tr("mon.title_pos"),
-            tr("mon.title_vel"),
-            tr("mon.title_torque"),
-            tr("mon.title_temp"),
-        ]
-        for pw, title in zip(self._plots, titles):
-            pw.setTitle(title)
-            pw.setLabel("bottom", tr("mon.time"), units="s")
+        if self._plot is not None:
+            self._plot.setTitle(tr("mon.title_temp"))
+            self._plot.setLabel("bottom", tr("mon.time"), units="s")
         self.pause_btn.setText(tr("mon.resume") if self._paused else tr("mon.pause"))
         self.clear_btn.setText(tr("mon.clear"))
         self.export_btn.setText(tr("mon.export"))
@@ -55,6 +49,7 @@ class MonitoringPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
+        # ---- 顶部控制栏 ----
         top_bar = QHBoxLayout()
         self.pause_btn = QPushButton()
         self.pause_btn.setFixedWidth(60)
@@ -84,24 +79,17 @@ class MonitoringPanel(QWidget):
         top_bar.addStretch()
         layout.addLayout(top_bar)
 
-        grid = QGridLayout()
-        grid.setSpacing(4)
+        # ---- 主体：单一温度曲线（7 关节同图） ----
+        self._plot = pg.PlotWidget()
+        self._plot.showGrid(x=True, y=True, alpha=0.3)
+        self._plot.setLabel("left", tr("mon.title_temp"))
 
-        for idx in range(4):
-            pw = pg.PlotWidget()
-            pw.showGrid(x=True, y=True, alpha=0.3)
+        for ch in range(7):
+            pen = pg.mkPen(color=JOINT_COLORS[ch], width=1.5)
+            curve = self._plot.plot([], [], pen=pen)
+            self._curves.append(curve)
 
-            curves = []
-            for ch in range(7):
-                pen = pg.mkPen(color=JOINT_COLORS[ch], width=1.5)
-                curve = pw.plot([], [], pen=pen)
-                curves.append(curve)
-
-            self._plots.append(pw)
-            self._curves.append(curves)
-            grid.addWidget(pw, idx // 2, idx % 2)
-
-        layout.addLayout(grid)
+        layout.addWidget(self._plot, stretch=1)
 
         for ch, lbl in enumerate(self._channel_swatches):
             lbl.setText(f"■ {CHANNEL_NAMES[ch]}")
@@ -115,16 +103,13 @@ class MonitoringPanel(QWidget):
         if self._paused or self.data_buffer.count == 0:
             return
 
-        ts, pos, vel, torq, temp = self.data_buffer.get_data()
+        ts, _pos, _vel, _torq, temp = self.data_buffer.get_data()
         if len(ts) == 0:
             return
 
         t_rel = ts - ts[0]
-        datasets = [pos, vel, torq, temp]
-
-        for plot_idx, data_2d in enumerate(datasets):
-            for ch in range(7):
-                self._curves[plot_idx][ch].setData(t_rel, data_2d[:, ch])
+        for ch in range(7):
+            self._curves[ch].setData(t_rel, temp[:, ch])
 
     def _toggle_pause(self):
         self._paused = not self._paused
@@ -132,9 +117,8 @@ class MonitoringPanel(QWidget):
 
     def _clear_data(self):
         self.data_buffer.clear()
-        for plot_curves in self._curves:
-            for c in plot_curves:
-                c.setData([], [])
+        for c in self._curves:
+            c.setData([], [])
 
     def _export_csv(self):
         filepath, _ = QFileDialog.getSaveFileName(

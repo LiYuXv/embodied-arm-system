@@ -21,3 +21,19 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.bak
+
+
+
+__pycache__/
+*.pyc
+*.log
+
+ckpt/
+lerobot_data/
+pretrained_models/
+inference_plots/
+captures/
+
+*.safetensors
+*.pt
+*.pth

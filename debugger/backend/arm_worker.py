@@ -5,9 +5,11 @@ import time
 import math
 import logging
 import traceback
+import threading
 from pathlib import Path
 from typing import List, Optional
 from queue import Queue, Empty
+from collections import deque
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -45,6 +47,8 @@ class ArmWorker(QThread):
     can_fps_updated = pyqtSignal(float)
     zero_sta_verified = pyqtSignal(list)
     motor_scan_result = pyqtSignal(list)
+    # 使能前检查未通过（携带给用户的中文提示），由 UI 弹窗提示
+    enable_rejected = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58,6 +62,7 @@ class ArmWorker(QThread):
         self._sim_mode = False
 
         self._slow_poll_counter = 0
+        self._trajectory_playing = False
 
         # Simulation state
         self._sim_positions = [0.0] * 7
@@ -73,8 +78,26 @@ class ArmWorker(QThread):
     def is_enabled(self):
         return self._enabled
 
+    # 高频流式运动指令：同类只保留最新一条，防止队列无限积压
+    _STREAMING_CMDS = {"end_pose_ctrl", "end_pose_ctrl_quat", "joint_ctrl", "gripper_ctrl"}
+    # 安全/状态指令：入队前清除积压的流式运动指令，保证立即生效
+    _PRIORITY_CMDS = {"disable", "emergency_stop", "cancel_motion", "disconnect", "enable"}
+
     def submit_command(self, cmd: str, *args, **kwargs):
-        self._cmd_queue.put((cmd, args, kwargs))
+        with self._cmd_queue.mutex:
+            if cmd in self._PRIORITY_CMDS:
+                self._cmd_queue.queue = deque(
+                    item for item in self._cmd_queue.queue
+                    if item[0] not in self._STREAMING_CMDS
+                )
+            elif cmd in self._STREAMING_CMDS:
+                self._cmd_queue.queue = deque(
+                    item for item in self._cmd_queue.queue
+                    if item[0] != cmd
+                )
+            self._cmd_queue.queue.append((cmd, args, kwargs))
+            self._cmd_queue.unfinished_tasks += 1
+            self._cmd_queue.not_empty.notify()
 
     def run(self):
         self._running = True
@@ -85,6 +108,8 @@ class ArmWorker(QThread):
                 self._process_commands()
                 if self._connected:
                     self._poll_feedback()
+                # 检查非阻塞轨迹是否完成
+                self._check_trajectory_done()
             except Exception as e:
                 logger.error(f"Worker error: {e}\n{traceback.format_exc()}")
                 self.error_occurred.emit(str(e))
@@ -95,6 +120,7 @@ class ArmWorker(QThread):
 
     def stop(self):
         self._running = False
+        self._cancel_gripper_move()
         self.wait(3000)
 
     def _process_commands(self):
@@ -120,6 +146,7 @@ class ArmWorker(QThread):
             self._do_disable()
         elif cmd == "emergency_stop":
             self._do_emergency_stop()
+
         elif cmd == "joint_ctrl":
             self._do_joint_ctrl(*args)
         elif cmd == "move_j":
@@ -128,6 +155,10 @@ class ArmWorker(QThread):
             self._do_move_l(*args, **kwargs)
         elif cmd == "end_pose_ctrl":
             self._do_end_pose_ctrl(*args, **kwargs)
+        elif cmd == "end_pose_ctrl_quat":
+            self._do_end_pose_ctrl_quat(*args, **kwargs)
+        elif cmd == "move_waypoints":
+            self._do_move_waypoints(*args, **kwargs)
         elif cmd == "cancel_motion":
             self._do_cancel_motion()
         elif cmd == "zero_torque":
@@ -150,6 +181,8 @@ class ArmWorker(QThread):
             self._do_start_control_loop(*args)
         elif cmd == "stop_control_loop":
             self._do_stop_control_loop()
+        elif cmd == "playback_trajectory":
+            self._do_playback_trajectory(*args)
         elif cmd == "set_smoothing_alpha":
             if self.arm and not self._sim_mode:
                 self.arm.SetSmoothingAlpha(args[0])
@@ -224,6 +257,15 @@ class ArmWorker(QThread):
             self.log_message.emit("已断开连接")
         except Exception as e:
             self.error_occurred.emit(f"断开失败: {e}")
+        finally:
+            self._cancel_gripper_move()
+
+    # ---- 使能前安全检查（角度单位：度） ----
+    _ENABLE_JOINT_ABS_LIMIT_DEG = 50.0    # J1~J6 必须在 ±50° 以内
+    _ENABLE_GRIPPER_MIN_DEG = -100.0      # J7(夹爪) 必须在 -100° ~ +20° 以内
+    _ENABLE_GRIPPER_MAX_DEG = 20.0
+    _ENABLE_FEEDBACK_TIMEOUT_S = 1.0      # 等待全部电机反馈的最长时间
+    _ENABLE_FEEDBACK_FRESH_S = 1.0        # 反馈时间戳新鲜度阈值
 
     def _do_enable(self):
         if not self._connected:
@@ -234,12 +276,74 @@ class ArmWorker(QThread):
             self.log_message.emit("电机已使能（模拟模式）")
             return
         try:
+            # 1) 先成功读取全部 7 个关节的位置反馈，否则不允许使能
+            positions = self._read_joint_positions_for_enable()
+            if positions is None:
+                msg = ("使能失败：无法读取各关节位置信息。\n"
+                       "请检查电源是否打开、串口/CAN 连接是否异常。")
+                self.log_message.emit("使能失败：无法读取各关节位置（电源未开或串口/CAN 异常）")
+                self.enable_rejected.emit(msg)
+                return
+
+            # 2) 位置范围检查：J1~J6 在 ±50° 以内，J7(夹爪) 在 -100° ~ +20° 以内
+            degs = [math.degrees(p) for p in positions[:7]]
+            out_of_range = []
+            for i in range(6):
+                if abs(degs[i]) > self._ENABLE_JOINT_ABS_LIMIT_DEG:
+                    out_of_range.append(
+                        f"J{i+1} = {degs[i]:.1f}°（要求 ±{self._ENABLE_JOINT_ABS_LIMIT_DEG:.0f}°）")
+            if not (self._ENABLE_GRIPPER_MIN_DEG <= degs[6] <= self._ENABLE_GRIPPER_MAX_DEG):
+                out_of_range.append(
+                    f"J7(夹爪) = {degs[6]:.1f}°（要求 "
+                    f"{self._ENABLE_GRIPPER_MIN_DEG:.0f}° ~ {self._ENABLE_GRIPPER_MAX_DEG:.0f}°）")
+            if out_of_range:
+                msg = ("使能失败：关节位置超出允许范围：\n  " + "\n  ".join(out_of_range) +
+                       "\n\n请让机械臂回到0位置附近，或重新设置各关节0点位置。")
+                self.log_message.emit(
+                    "使能失败：关节位置超差 [" + ", ".join(out_of_range) + "]")
+                self.enable_rejected.emit(msg)
+                return
+
+            # 3) 检查通过，执行使能
             self.arm.EnableArm()
             self._enabled = True
             self.enabled_changed.emit(True)
             self.log_message.emit("电机已使能")
         except Exception as e:
             self.error_occurred.emit(f"使能失败: {e}")
+
+    def _read_joint_positions_for_enable(self) -> Optional[List[float]]:
+        """使能前读取 7 个电机的位置反馈。
+
+        主动发送运控帧触发电机回传，等待全部 7 个电机都有有效且新鲜的反馈。
+        成功返回 7 关节位置列表 (rad，含夹爪)，失败返回 None。
+        """
+        if not self.arm:
+            return None
+        deadline = time.monotonic() + self._ENABLE_FEEDBACK_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                self._trigger_feedback_poll()
+            except Exception:
+                pass
+            time.sleep(0.05)
+            try:
+                states = self.arm.GetMotorStates()
+            except Exception:
+                states = None
+            if not states:
+                continue
+            now = time.time()
+            all_ok = True
+            for mid in range(1, 8):
+                fb = states.get(mid)
+                if (fb is None or not fb.is_valid
+                        or (now - fb.timestamp) > self._ENABLE_FEEDBACK_FRESH_S):
+                    all_ok = False
+                    break
+            if all_ok:
+                return self.arm.GetArmJointMsgs().to_list(include_gripper=True)
+        return None
 
     def _do_disable(self):
         if self._sim_mode:
@@ -305,7 +409,7 @@ class ArmWorker(QThread):
             return
         if self.arm and self._enabled:
             self._ensure_control_loop()
-            self.arm.JointCtrlList(positions[:6])
+            self.arm.JointCtrlList(positions[:7])
 
     def _do_move_j(self, positions, duration=2.0, block=False):
         if self._sim_mode:
@@ -314,7 +418,12 @@ class ArmWorker(QThread):
             return
         if self.arm and self._enabled:
             self._ensure_control_loop()
-            self.arm.MoveJ(positions, duration=duration, block=block)
+            # 确保传入7个关节位置（包含夹爪L7）
+            full_positions = list(positions[:7]) + [0.0] * (7 - len(positions))
+            self.arm.MoveJ(full_positions[:6], duration=duration, block=block)
+            # 单独控制夹爪L7
+            if len(full_positions) >= 7:
+                self.arm.GripperCtrl(gripper_angle=full_positions[6])
             self.log_message.emit(f"MoveJ 执行中 duration={duration}s")
 
     def _do_move_l(self, target_pose, duration=2.0, block=False):
@@ -326,13 +435,74 @@ class ArmWorker(QThread):
             self.arm.MoveL(target_pose, duration=duration, block=block)
             self.log_message.emit(f"MoveL 执行中 duration={duration}s")
 
-    def _do_end_pose_ctrl(self, x, y, z, rx, ry, rz, duration=2.0):
+    def _do_end_pose_ctrl(self, x, y, z, rx, ry, rz, duration=2.0, block=True,
+                          servo=False, interp="linear"):
         if self._sim_mode:
             self.log_message.emit(f"EndPoseCtrl（模拟）[{x:.3f},{y:.3f},{z:.3f}]")
             return
         if self.arm and self._enabled:
             self._ensure_control_loop()
-            self.arm.EndPoseCtrl(x, y, z, rx, ry, rz, duration=duration)
+            # 强制转 Python float：调用方可能传入 np.float32（如 VLA 推理限幅结果），
+            # 而 IK 里 pin.rpy.rpyToMatrix 的 C++ 绑定只接受 double
+            self.arm.EndPoseCtrl(float(x), float(y), float(z),
+                                 float(rx), float(ry), float(rz),
+                                 duration=duration, block=block,
+                                 servo=servo, interp=interp)
+
+    def _do_end_pose_ctrl_quat(self, x, y, z, w, qx, qy, qz, duration=2.0, block=True):
+        import math, pinocchio as pin
+        if self._sim_mode:
+            self.log_message.emit(f"EndPoseCtrlQuat（模拟）[{x:.3f},{y:.3f},{z:.3f}] q=[{w:.3f},{qx:.3f},{qy:.3f},{qz:.3f}]")
+            return
+        if not (self.arm and self._enabled):
+            return
+        # 归一化四元数
+        norm = math.sqrt(w * w + qx * qx + qy * qy + qz * qz)
+        if norm < 1e-10:
+            self.error_occurred.emit("四元数模长为零，无法转换姿态")
+            return
+        w, qx, qy, qz = w / norm, qx / norm, qy / norm, qz / norm
+        # 将四元数转换为 Pinocchio 的 RPY（与实时显示面板约定一致）
+        R = pin.Quaternion(w, qx, qy, qz).matrix()
+        rpy = pin.rpy.matrixToRpy(R)
+        self._ensure_control_loop()
+        # 全部强制转 Python float：调用方可能传入 np.float32（如 VLA 推理输出），
+        # IK 里 pin.rpy.rpyToMatrix 的 C++ 绑定只接受 double
+        self.arm.EndPoseCtrl(float(x), float(y), float(z),
+                             float(rpy[0]), float(rpy[1]), float(rpy[2]),
+                             duration=duration, block=block)
+        self.log_message.emit(f"EndPoseCtrlQuaternion 执行 [{x:.3f},{y:.3f},{z:.3f}] duration={duration}s")
+
+    def _do_move_waypoints(self, waypoints, durations):
+        """批量路点运动：依次串行执行 MoveJ，每个路点独立完整运动"""
+        if self._sim_mode:
+            self.log_message.emit(f"路点运动（模拟）{len(waypoints)} 个路点")
+            return
+        if not self.arm or not self._enabled:
+            return
+        if len(waypoints) < 1:
+            return
+
+        self._ensure_control_loop()
+        n_points = len(waypoints)
+
+        for i, (positions, duration) in enumerate(zip(waypoints, durations)):
+            self.log_message.emit(f"路点 {i+1}/{n_points} 执行中...")
+            try:
+                # 确保传入7个关节位置（包含夹爪L7）
+                full_positions = list(positions[:7]) + [0.0] * (7 - len(positions))
+                # block=True 阻塞等待当前 MoveJ 完成后再执行下一个
+                self.arm.MoveJ(full_positions[:6], duration=duration, block=True)
+                # 单独控制夹爪L7
+                if len(full_positions) >= 7:
+                    self.arm.GripperCtrl(gripper_angle=full_positions[6])
+                self.log_message.emit(f"路点 {i+1}/{n_points} 完成")
+            except Exception as e:
+                self.log_message.emit(f"路点 {i+1}/{n_points} 失败: {e}")
+                self.error_occurred.emit(f"路点 {i+1} 运动失败: {e}")
+                return
+
+        self.log_message.emit(f"路点运动全部完成: {n_points} 个路点")
 
     def _do_cancel_motion(self):
         if self._sim_mode:
@@ -365,12 +535,85 @@ class ArmWorker(QThread):
             state = "开启" if enable else "关闭"
             self.log_message.emit(f"重力补偿零力矩{state}")
 
-    def _do_gripper_ctrl(self, angle):
+    def _do_gripper_ctrl(self, angle, torque_max=None, torque_min=None):
         if self._sim_mode:
             self._sim_target[6] = angle
             return
         if self.arm and self._enabled:
-            self.arm.GripperCtrl(angle)
+            if torque_max is None or torque_min is None:
+                self.arm.GripperCtrl(angle)
+                return
+            # 力矩受限移动：后台线程逐步逼近目标角度，
+            # 力矩达到上限/下限时停止推进（位置控制保位），防止夹爪继续夹闭/张开。
+            self._cancel_gripper_move()
+            self._gripper_move_stop = threading.Event()
+            self._gripper_move_thread = threading.Thread(
+                target=self._gripper_torque_limited_move,
+                args=(angle, torque_max, torque_min),
+                daemon=True, name="gripper_torque_move")
+            self._gripper_move_thread.start()
+
+    # ---- 夹爪力矩受限移动（后台线程） ----
+
+    _GRIPPER_MOVE_STEP_RAD = 0.02   # 单步推进量 (rad)
+    _GRIPPER_MOVE_INTERVAL_S = 0.05  # 步进间隔 (s) → 约 0.4 rad/s
+    _GRIPPER_MOVE_TIMEOUT_S = 30.0   # 总超时保护
+
+    def _cancel_gripper_move(self):
+        if getattr(self, "_gripper_move_stop", None) is not None:
+            self._gripper_move_stop.set()
+        thread = getattr(self, "_gripper_move_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._gripper_move_thread = None
+
+    def _gripper_torque_limited_move(self, target, torque_max, torque_min):
+        """逐步推进夹爪目标角度；闭合力矩≥上限 / 张开口力矩≤下限 时停止并保位。"""
+        if self.arm is None:
+            return
+        stop = getattr(self, "_gripper_move_stop", None) or threading.Event()
+        t0 = time.monotonic()
+        try:
+            while not stop.is_set():
+                if time.monotonic() - t0 > self._GRIPPER_MOVE_TIMEOUT_S:
+                    self.log_message.emit("夹爪力矩受限移动超时")
+                    break
+                try:
+                    positions = self.arm.GetArmJointMsgs().to_list(include_gripper=True)
+                    efforts = self.arm.GetArmJointEfforts().to_list(include_gripper=True)
+                except Exception as e:
+                    logger.warning("读取夹爪反馈失败: %s", e)
+                    break
+                if len(positions) < 7 or len(efforts) < 7:
+                    break
+                cur = float(positions[6])
+                torque = float(efforts[6])
+                diff = target - cur
+
+                if abs(diff) <= self._GRIPPER_MOVE_STEP_RAD:
+                    self.arm.GripperCtrl(target)
+                    break
+
+                # 闭合方向（diff>0，角度向0增大）：力矩≥上限 → 保位停止
+                if diff > 0.0 and torque >= torque_max:
+                    self.arm.GripperCtrl(cur)
+                    self.log_message.emit(
+                        f"夹爪力矩达上限 {torque_max:.2f} Nm，停止闭合，保位 {math.degrees(cur):.1f}°")
+                    break
+                # 张开方向（diff<0，角度向全开减小）：力矩≤下限 → 保位停止
+                if diff < 0.0 and torque <= torque_min:
+                    self.arm.GripperCtrl(cur)
+                    self.log_message.emit(
+                        f"夹爪力矩达下限 {torque_min:.2f} Nm，停止张开，保位 {math.degrees(cur):.1f}°")
+                    break
+
+                next_target = cur + self._GRIPPER_MOVE_STEP_RAD * (1.0 if diff > 0 else -1.0)
+                self.arm.GripperCtrl(next_target)
+                time.sleep(self._GRIPPER_MOVE_INTERVAL_S)
+        except Exception as e:
+            logger.error("夹爪力矩受限移动异常: %s", e)
+        finally:
+            self._gripper_move_thread = None
 
     def _do_set_zero(self, motor_num=0xFF):
         if self._sim_mode:
@@ -479,6 +722,48 @@ class ArmWorker(QThread):
             self.control_loop_changed.emit(False)
             self.log_message.emit("控制循环已停止")
 
+    def _do_playback_trajectory(self, traj_points):
+        """示教轨迹回放：推入控制循环队列，200Hz Kp跟踪。
+
+        使用 block=False 防止阻塞 worker 线程，确保反馈轮询继续运行，
+        这样摄像头录制和界面显示才能实时更新末端位姿。
+        """
+        if self._sim_mode:
+            self.log_message.emit(f"轨迹回放（模拟）{len(traj_points)} 个点")
+            return
+        if not self.arm or not self._enabled:
+            self.log_message.emit("轨迹回放失败：未连接或未使能")
+            return
+        if not traj_points:
+            return
+
+        self._ensure_control_loop()
+        n_points = len(traj_points)
+        self.log_message.emit(f"轨迹回放开始：{n_points} 个点，推入控制循环队列")
+
+        try:
+            # 非阻塞推入轨迹；worker 主循环继续轮询反馈
+            self.arm._execute_trajectory_async(traj_points, block=False)
+            self._trajectory_playing = True
+        except Exception as e:
+            self.log_message.emit(f"轨迹回放失败: {e}")
+            self.error_occurred.emit(f"轨迹回放失败: {e}")
+
+    def _check_trajectory_done(self):
+        """检查非阻塞轨迹是否执行完成。"""
+        if not self._trajectory_playing:
+            return
+        if self.arm is None:
+            self._trajectory_playing = False
+            return
+        try:
+            if not self.arm.is_moving():
+                self._trajectory_playing = False
+                self.log_message.emit("轨迹回放完成")
+        except Exception as e:
+            logger.debug(f"检查轨迹状态失败: {e}")
+            self._trajectory_playing = False
+
     def _trigger_feedback_poll(self):
         """发送运控帧触发电机反馈（连接后使能前使用）"""
         driver = self.arm._driver
@@ -514,16 +799,17 @@ class ArmWorker(QThread):
                 self.velocities_updated.emit(vel_msg)
                 self.efforts_updated.emit(eff_msg)
 
+                # 关键：末端位姿每次轮询都更新（与视频/录制同步）
+                try:
+                    end_pose = self.arm.GetArmEndPoseMsgs()
+                    self.end_pose_updated.emit(end_pose)
+                except Exception:
+                    pass
+
                 if do_slow_poll:
                     try:
                         status = self.arm.GetArmStatus()
                         self.status_updated.emit(status)
-                    except Exception:
-                        pass
-
-                    try:
-                        end_pose = self.arm.GetArmEndPoseMsgs()
-                        self.end_pose_updated.emit(end_pose)
                     except Exception:
                         pass
 

@@ -76,7 +76,7 @@ class ELA3Interface:
         joint_offsets: Optional[Dict[int, float]] = None,
         joint_limits: Optional[Dict[int, tuple]] = None,
         start_sdk_joint_limit: bool = True,
-        default_kp: float = 80.0,
+        default_kp: float = 100,
         default_kd: float = 4.0,
         urdf_path: Optional[str] = None,
         inertia_config_path: Optional[str] = None,
@@ -248,6 +248,10 @@ class ELA3Interface:
         self._motion_done = threading.Event()
         self._motion_done.set()
 
+        # 伺服流插值状态（VLA/RTC 流式控制）
+        self._servo_last_time = 0.0    # 上一次 servo 调用时间
+        self._servo_hist: List[List[float]] = []       # 最近目标历史
+
     # ================================================================
     # 连接管理
     # ================================================================
@@ -386,10 +390,17 @@ class ELA3Interface:
 
                 pt = self._trajectory[self._traj_index]
                 with self._cmd_lock:
-                    for i in range(min(len(pt.positions), self.NUM_ARM_JOINTS)):
+                    # L1-L6 从轨迹获取
+                    n_arm = min(len(pt.positions), self.NUM_ARM_JOINTS)
+                    for i in range(n_arm):
                         self._target_positions[i] = pt.positions[i]
+                    # L7 (夹爪) 从轨迹获取（如果轨迹包含7个关节）
+                    if len(pt.positions) > self.NUM_ARM_JOINTS:
+                        self._target_gripper = pt.positions[self.NUM_ARM_JOINTS]
+                        self._gripper_dirty = True
                     if pt.velocities:
-                        for i in range(min(len(pt.velocities), self.NUM_ARM_JOINTS)):
+                        n_vel = min(len(pt.velocities), self.NUM_ARM_JOINTS)
+                        for i in range(n_vel):
                             self._target_velocities[i] = pt.velocities[i]
 
                 if self._traj_index >= len(self._trajectory) - 1:
@@ -414,8 +425,23 @@ class ELA3Interface:
         if first_cmd:
             with self._state_lock:
                 self._first_command = False
-            self._last_cmd_positions = list(target_positions)
-            self._gravity_input_positions = list(target_positions)
+            # 使用反馈位置初始化_last_cmd_positions，避免使用旧目标位置
+            # 这确保电机不会向旧目标（如0）运动
+            fb_positions = self._read_feedback_positions()
+            gripper_fb = self._driver.get_feedback(self.NUM_JOINTS)
+            if gripper_fb and gripper_fb.is_valid:
+                direction = self._joint_directions.get(self.NUM_JOINTS, 1.0)
+                offset = self._joint_offsets.get(self.NUM_JOINTS, 0.0)
+                gripper_pos = (gripper_fb.position - offset) * direction
+            else:
+                gripper_pos = gripper_target
+                logger.warning("L7反馈无效，使用gripper_target=%.3f", gripper_target)
+            full_target = list(fb_positions)
+            full_target.append(gripper_pos)
+            self._last_cmd_positions = full_target
+            self._gravity_input_positions = list(fb_positions)
+            logger.info("first_cmd: _last_cmd_positions=%s, gripper_target=%.3f",
+                       [f"{v:.3f}" for v in full_target], gripper_target)
 
         # --- Gravity computation (EMA-smoothed, every tick) ---
         if zero_torque:
@@ -434,13 +460,18 @@ class ELA3Interface:
         with self._cmd_lock:
             target_velocities = list(self._target_velocities)
 
-        # --- Per-joint processing ---
-        for i in range(self.NUM_ARM_JOINTS):
+        # --- Per-joint processing (L1-L6 + L7) ---
+        for i in range(self.NUM_JOINTS):
             mid = i + 1
             direction = self._joint_directions.get(mid, 1.0)
             offset = self._joint_offsets.get(mid, 0.0)
 
-            pos = target_positions[i]
+            # L7 (夹爪) 的目标位置处理
+            if i < self.NUM_ARM_JOINTS:
+                pos = target_positions[i]
+            else:
+                pos = gripper_target
+
             if self._joint_limit_enabled:
                 limits = self._joint_limits.get(mid)
                 if limits:
@@ -449,6 +480,11 @@ class ELA3Interface:
                     pos = clamp(pos, lo_stop, hi_stop)
 
             motor_pos = pos * direction + offset
+
+            # 正常控制下 L7 固定使用 POSITION_PP，不能再给它发送 Type-1 运控帧。
+            # 只有进入零力矩示教时，L7 才和 L1-L6 一样使用 MOTION_CONTROL。
+            if i == self.NUM_ARM_JOINTS and not zero_torque:
+                continue
 
             if zero_torque:
                 fb = self._driver.get_feedback(mid)
@@ -462,11 +498,18 @@ class ELA3Interface:
                 else:
                     motor_kd = clamp(self._zero_torque_kd, 0.0, 5.0)
 
-                grav_torque = gravity_torques[i] * direction if gravity_torques else 0.0
+                # Pinocchio 重力模型只有 L1-L6 六维；L7 不参与重力补偿。
+                grav_torque = (
+                    gravity_torques[i] * direction
+                    if gravity_torques is not None and i < len(gravity_torques)
+                    else 0.0
+                )
                 self._driver.send_motion_control(
                     mid, current_motor_pos, 0.0, motor_kp, motor_kd, grav_torque)
             else:
+                # 此分支只会处理 L1-L6（L7 已在上面 continue）。
                 vel_from_caller = target_velocities[i]
+
                 if abs(vel_from_caller) > 1e-6:
                     vel_ff = vel_from_caller
                 else:
@@ -482,17 +525,25 @@ class ELA3Interface:
                 if abs(vel_ff) < 0.01:
                     motor_kd = min(motor_kd * 1.25, 5.0)
 
-                grav_torque = gravity_torques[i] * direction * self._gravity_feedforward_ratio if gravity_torques else 0.0
+                grav_torque = (
+                    gravity_torques[i] * direction * self._gravity_feedforward_ratio
+                    if gravity_torques is not None and i < len(gravity_torques)
+                    else 0.0
+                )
                 self._driver.send_motion_control(
                     mid, motor_pos, motor_vel, motor_kp, motor_kd, grav_torque)
 
             _busy_wait_us(150)
 
-        self._last_cmd_positions = list(target_positions)
+        # 更新 last_cmd_positions 包含 L7
+        full_target = list(target_positions[:self.NUM_ARM_JOINTS])
+        full_target.append(gripper_target)
+        self._last_cmd_positions = full_target
 
         # --- Gripper ---
+        # 正常模式：L7 走 PP 位置控制；零力矩模式：L7 已在上面的 Type-1 分支中处理。
         if gripper_dirty and not zero_torque:
-            gripper_motor_id = 7
+            gripper_motor_id = self.NUM_JOINTS
             self._driver.set_position_pp(gripper_motor_id, gripper_target)
 
     def _read_feedback_positions(self) -> List[float]:
@@ -831,6 +882,16 @@ class ELA3Interface:
                 self._gripper_dirty = True
             return True
 
+        # 如果零力矩模式已启用（L7处于运控模式），发送运控帧而非PP帧
+        if self._zero_torque_mode:
+            fb = self._driver.get_feedback(gripper_motor_id)
+            current_pos = fb.position if (fb and fb.is_valid) else 0.0
+            direction = self._joint_directions.get(gripper_motor_id, 1.0)
+            motor_torque = gripper_effort * direction
+            return self._driver.send_motion_control(
+                gripper_motor_id, current_pos, 0.0, 0.0,
+                self._zero_torque_kd, motor_torque)
+
         return self._driver.set_position_pp(gripper_motor_id, gripper_angle)
 
     # ================================================================
@@ -840,120 +901,195 @@ class ELA3Interface:
     def ZeroTorqueMode(self, enable: bool, kd: float = 1.0,
                        gravity_torques: Optional[List[float]] = None) -> bool:
         """
-        零力矩模式（Kp=0，可手动拖动机械臂）
+        零力矩模式（Kp=0，可手动拖动机械臂，包括 L7 夹爪关节）。
 
-        进入零力矩时切换到运控模式（Type 1 帧），退出时切回 PP 模式。
-        如果控制循环正在运行，由控制循环以自适应 Kd 持续发送。
-        否则发送单次指令。
+        进入零力矩：
+        - L1-L7 全部处于 MOTION_CONTROL；
+        - L1-L6 使用 Kp=0 + 自适应 Kd + 重力补偿；
+        - L7 使用 Kp=0 + 自适应 Kd，重力前馈固定为 0，可手动开合。
+
+        退出零力矩：
+        - L1-L6 保持 MOTION_CONTROL，并锁定当前位置恢复阻抗控制；
+        - L7 恢复 POSITION_PP，并以当前位置作为目标，避免跳动。
+
+        模式切换期间把状态临时置为 ENABLED，暂停 200Hz 控制循环发指令，
+        避免控制线程与 disable/set_run_mode/enable 同时访问电机造成竞态。
         """
         if not self._connected:
             return False
+
         with self._state_lock:
-            if enable and self._state not in (ArmState.ENABLED, ArmState.RUNNING, ArmState.ZERO_TORQUE):
-                logger.error("当前状态 %s 不允许零力矩，请先 EnableArm()", self._state.name)
+            current_state = self._state
+            if enable and current_state not in (
+                ArmState.ENABLED, ArmState.RUNNING, ArmState.ZERO_TORQUE
+            ):
+                logger.error("当前状态 %s 不允许零力矩，请先 EnableArm()", current_state.name)
                 return False
 
-            self._zero_torque_mode = enable
             self._zero_torque_kd = kd
+            # ENABLED 状态不会进入 _control_loop_tick，用它作为模式切换过渡态。
+            self._state = ArmState.ENABLED
+            if not enable:
+                self._zero_torque_mode = False
 
-            if enable:
-                self._state = ArmState.ZERO_TORQUE
-
-        if enable:
-            for mid in range(1, self.NUM_JOINTS + 1):
-                is_gripper = (mid == self.NUM_JOINTS)
-                target_mode = RunMode.POSITION_PP if is_gripper else RunMode.MOTION_CONTROL
-                current_mode = self._driver.get_run_mode(mid)
+        def ensure_run_mode(mid: int, target_mode: RunMode, retries: int = 3) -> bool:
+            """可靠切换运行模式，并读回 RUN_MODE 确认。"""
+            for attempt in range(1, retries + 1):
                 fb = self._driver.get_feedback(mid)
-                is_enabled = fb and fb.is_valid and fb.mode_state == 2
+                current_mode = self._driver.get_run_mode(mid)
+                is_enabled = bool(fb and fb.is_valid and fb.mode_state == ModeState.MOTOR)
 
-                if is_enabled and current_mode is not None and current_mode == int(target_mode):
+                if is_enabled and current_mode == int(target_mode):
+                    if target_mode == RunMode.MOTION_CONTROL:
+                        self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
+                    elif target_mode == RunMode.POSITION_PP:
+                        self._driver.set_pp_velocity(mid, self._pp_velocity)
+                        time.sleep(0.005)
+                        self._driver.set_pp_acceleration(mid, self._pp_acceleration)
+                    return True
+
+                # 清故障后再切模式。原版 10ms 且不校验，L7 实测可能仍停在 PP。
+                if not self._driver.disable_motor(mid, clear_fault=True):
+                    logger.warning("电机 %d 失能失败（模式切换，第 %d 次）", mid, attempt)
+                    time.sleep(0.03)
+                    continue
+                time.sleep(0.03)
+
+                if not self._driver.set_run_mode(mid, target_mode):
+                    logger.warning("电机 %d 设置 %s 失败（第 %d 次）",
+                                   mid, target_mode.name, attempt)
+                    time.sleep(0.03)
+                    continue
+                time.sleep(0.03)
+
+                actual_mode = self._driver.get_run_mode(mid)
+                if actual_mode != int(target_mode):
+                    logger.warning(
+                        "电机 %d 模式读回不一致：期望=%s(%d)，实际=%s（第 %d 次）",
+                        mid, target_mode.name, int(target_mode), actual_mode, attempt,
+                    )
                     continue
 
-                self._driver.disable_motor(mid, clear_fault=False)
-                time.sleep(0.01)
-                self._driver.set_run_mode(mid, target_mode)
-                time.sleep(0.01)
-                self._driver.enable_motor(mid)
-                time.sleep(0.01)
-                if is_gripper:
+                if not self._driver.enable_motor(mid):
+                    logger.warning("电机 %d 使能失败（第 %d 次）", mid, attempt)
+                    time.sleep(0.03)
+                    continue
+                time.sleep(0.03)
+
+                if target_mode == RunMode.MOTION_CONTROL:
+                    self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
+                    time.sleep(0.005)
+                    # 新切入运控模式的电机先下发一帧 Kp=0 的安全指令。
+                    fb_now = self._driver.get_feedback(mid)
+                    current_motor_pos = (
+                        fb_now.position if (fb_now and fb_now.is_valid) else 0.0
+                    )
+                    self._driver.send_motion_control(
+                        mid, current_motor_pos, 0.0, 0.0,
+                        self._zero_torque_kd_max, 0.0,
+                    )
+                elif target_mode == RunMode.POSITION_PP:
                     self._driver.set_pp_velocity(mid, self._pp_velocity)
                     time.sleep(0.005)
                     self._driver.set_pp_acceleration(mid, self._pp_acceleration)
                     time.sleep(0.005)
+
+                return True
+
+            logger.error("电机 %d 无法切换到 %s", mid, target_mode.name)
+            return False
+
+        if enable:
+            # L1-L7 全部必须真正进入 MOTION_CONTROL，尤其检查 L7。
+            for mid in range(1, self.NUM_JOINTS + 1):
+                if not ensure_run_mode(mid, RunMode.MOTION_CONTROL):
+                    with self._state_lock:
+                        self._zero_torque_mode = False
+                        self._state = ArmState.ENABLED
+                    return False
 
             for i in range(self.NUM_JOINTS):
                 self._adaptive_kd_values[i] = self._zero_torque_kd_max
 
             if not self._control_running:
-                grav = list(gravity_torques or [0.0] * self.NUM_JOINTS)
-                for i, mid in enumerate(range(1, self.NUM_ARM_JOINTS + 1)):
+                # 无 200Hz 控制循环时，至少下发一次零力矩指令。
+                grav = list(gravity_torques or [0.0] * self.NUM_ARM_JOINTS)
+                for i, mid in enumerate(range(1, self.NUM_JOINTS + 1)):
                     fb = self._driver.get_feedback(mid)
                     current_pos = fb.position if (fb and fb.is_valid) else 0.0
                     direction = self._joint_directions.get(mid, 1.0)
+                    # 只有 L1-L6 有重力模型；L7 前馈恒为 0。
                     motor_torque = grav[i] * direction if i < len(grav) else 0.0
-                    self._driver.send_motion_control(mid, current_pos, 0.0, 0.0, kd, motor_torque)
-                    _busy_wait_us(150)
-            logger.warning("零力矩模式已启用 (Kd=%.3f, adaptive=%s)",
-                           kd, "ON" if self._adaptive_kd_enabled else "OFF")
-        else:
-            # 获取当前反馈位置，用于同步目标位置
-            current_positions = self._read_feedback_positions()
-            
-            # 同步目标位置到当前位置，避免回到旧目标（如0位置）
-            with self._cmd_lock:
-                for i in range(min(len(current_positions), self.NUM_ARM_JOINTS)):
-                    self._target_positions[i] = current_positions[i]
-                    self._last_cmd_positions[i] = current_positions[i]
-                    self._target_velocities[i] = 0.0
-
-            for mid in range(1, self.NUM_JOINTS + 1):
-                fb = self._driver.get_feedback(mid)
-                motor_pos = fb.position if (fb and fb.is_valid) else 0.0
-
-                is_gripper = (mid == self.NUM_JOINTS)
-                target_mode = RunMode.POSITION_PP if is_gripper else RunMode.MOTION_CONTROL
-                current_mode = self._driver.get_run_mode(mid)
-                is_enabled = fb and fb.is_valid and fb.mode_state == 2
-
-                if is_enabled and current_mode is not None and current_mode == int(target_mode):
-                    if is_gripper:
-                        self._driver.set_pp_velocity(mid, self._pp_velocity)
-                        time.sleep(0.005)
-                        self._driver.set_pp_acceleration(mid, self._pp_acceleration)
-                    else:
-                        # 保持运控模式，使用当前位置作为目标，开启关节空间阻抗控制
-                        # 力矩 = Kp*(当前位置-目标位置) + Kd*(速度-0) + 重力补偿
-                        self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
-                        time.sleep(0.005)
-                        self._driver.send_motion_control(
-                            mid, motor_pos, 0.0, self._position_kp, self._position_kd, 0.0)
-                    time.sleep(0.01)
-                    continue
-
-                # 如果模式不对，才需要重新配置电机
-                self._driver.disable_motor(mid, clear_fault=False)
-                time.sleep(0.01)
-                self._driver.set_run_mode(mid, target_mode)
-                time.sleep(0.01)
-                self._driver.enable_motor(mid)
-                time.sleep(0.005)
-                if is_gripper:
-                    self._driver.set_pp_velocity(mid, self._pp_velocity)
-                    time.sleep(0.005)
-                    self._driver.set_pp_acceleration(mid, self._pp_acceleration)
-                else:
-                    self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
-                    time.sleep(0.005)
                     self._driver.send_motion_control(
-                        mid, motor_pos, 0.0, self._position_kp, self._position_kd, 0.0)
-                time.sleep(0.01)
+                        mid, current_pos, 0.0, 0.0, kd, motor_torque
+                    )
+                    _busy_wait_us(150)
 
             with self._state_lock:
-                self._state = ArmState.ENABLED
-                self._first_command = True
-            logger.info("零力矩模式已关闭，切换到关节空间阻抗模式（目标位置锁定当前位置）")
+                self._zero_torque_mode = True
+                self._state = ArmState.ZERO_TORQUE
 
+            logger.warning(
+                "零力矩模式已启用：L1-L7=MOTION_CONTROL (Kd=%.3f, adaptive=%s)",
+                kd, "ON" if self._adaptive_kd_enabled else "OFF",
+            )
+            return True
+
+        # ---------------- 退出零力矩 ----------------
+        current_positions = self._read_feedback_positions()
+        gripper_fb = self._driver.get_feedback(self.NUM_JOINTS)
+        if gripper_fb and gripper_fb.is_valid:
+            direction = self._joint_directions.get(self.NUM_JOINTS, 1.0)
+            offset = self._joint_offsets.get(self.NUM_JOINTS, 0.0)
+            current_gripper_pos = (gripper_fb.position - offset) * direction
+        else:
+            current_gripper_pos = self._target_gripper
+
+        # 同步目标到当前位置，避免退出零力矩后回到旧目标。
+        with self._cmd_lock:
+            for i in range(self.NUM_ARM_JOINTS):
+                self._target_positions[i] = current_positions[i]
+                self._target_velocities[i] = 0.0
+            self._target_gripper = current_gripper_pos
+            self._gripper_dirty = False
+
+        # L1-L6 保持/恢复 MOTION_CONTROL，并锁定当前位置。
+        for mid in range(1, self.NUM_ARM_JOINTS + 1):
+            if not ensure_run_mode(mid, RunMode.MOTION_CONTROL):
+                with self._state_lock:
+                    self._state = ArmState.ENABLED
+                return False
+
+            fb = self._driver.get_feedback(mid)
+            motor_pos = fb.position if (fb and fb.is_valid) else 0.0
+            self._driver.send_motion_control(
+                mid, motor_pos, 0.0, self._position_kp, self._position_kd, 0.0
+            )
+            time.sleep(0.005)
+
+        # L7 恢复 PP，并以当前夹爪角度作为目标，避免恢复瞬间跳动。
+        gripper_id = self.NUM_JOINTS
+        if not ensure_run_mode(gripper_id, RunMode.POSITION_PP):
+            with self._state_lock:
+                self._state = ArmState.ENABLED
+            return False
+        self._driver.set_position_pp(gripper_id, current_gripper_pos)
+
+        # 控制缓存与当前反馈保持一致。
+        full_target = list(current_positions[:self.NUM_ARM_JOINTS])
+        full_target.append(current_gripper_pos)
+        self._last_cmd_positions = full_target
+        self._gravity_input_positions = list(current_positions[:self.NUM_ARM_JOINTS])
+
+        with self._state_lock:
+            self._zero_torque_mode = False
+            self._state = ArmState.ENABLED
+            self._first_command = True
+
+        logger.info(
+            "零力矩模式已关闭：L1-L6=MOTION_CONTROL，L7=POSITION_PP，"
+            "L7目标=%.3f rad", current_gripper_pos,
+        )
         return True
 
     def ZeroTorqueModeWithGravity(
@@ -1274,6 +1410,18 @@ class ELA3Interface:
             _kp, _kd = self._position_kp, self._position_kd
         logger.info("全局 PD 增益已设置: Kp=%.1f, Kd=%.2f", _kp, _kd)
 
+    def GetPositionPD(self) -> Tuple[float, float]:
+        """获取全局默认 PD 增益，返回 (kp, kd)"""
+        with self._state_lock:
+            return self._position_kp, self._position_kd
+
+    def GetJointPD(self, motor_id: int) -> Tuple[float, float]:
+        """获取指定关节实际生效的 PD 增益（逐关节覆盖优先，否则用全局默认）"""
+        with self._state_lock:
+            kp = self._joint_kp.get(motor_id, self._position_kp)
+            kd = self._joint_kd.get(motor_id, self._position_kd)
+        return kp, kd
+
     def SetJointPD(self, motor_id: int, kp: float, kd: float):
         """设置单个关节的 PD 增益（覆盖全局默认值）"""
         with self._state_lock:
@@ -1322,8 +1470,16 @@ class ELA3Interface:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         block: bool = True,
+        servo: bool = False,
+        interp: str = "linear",
     ) -> bool:
-        """笛卡尔位姿控制（Pinocchio IK -> MoveJ）"""
+        """笛卡尔位姿控制（Pinocchio IK -> MoveJ）
+
+        servo=True：伺服流模式，供 ≥20Hz 高频连续下发（VLA/RTC 流式控制），
+        IK 后按 interp 方式把离散关节目标上采样为控制频率平滑设定点：
+        - "none"：不插值，直接写关节目标
+        - "linear"：关节空间线性插值，段内匀速、段间位置连续
+        """
         if not self._connected:
             logger.error("未连接")
             return False
@@ -1339,7 +1495,39 @@ class ELA3Interface:
             logger.error("IK 求解失败，目标位姿可能不可达")
             return False
 
+        if servo and self._control_running:
+            return self._servo_stream(q_target, duration, interp)
+
         return self.MoveJ(q_target, duration=duration, kp=kp, kd=kd, block=block)
+
+    def _servo_stream(self, q_target, duration: float, interp: str = "linear") -> bool:
+        """伺服流式微轨迹：把离散关节目标上采样为控制频率（200Hz）平滑设定点。
+
+        每次调用生成一段跨越 duration 的微轨迹并推入控制循环；下一段从
+        当前指令设定点接续，段间位置连续，轨迹被高频替换时运动不中断。
+        模型只输出离散位置（无速度/加速度），速度前馈由插值解析导数给出。
+        """
+        if interp == "none":
+            return self.JointCtrl(*q_target[:self.NUM_ARM_JOINTS])
+
+        from el_a3_sdk.trajectory import TrajectoryPoint
+        with self._cmd_lock:
+            q0 = list(self._target_positions[:self.NUM_ARM_JOINTS])
+        dt = self._control_period
+        dur = max(float(duration), dt)
+        n = max(2, int(round(dur / dt)) + 1)
+        nj = self.NUM_ARM_JOINTS
+        q1 = list(q_target[:nj])
+        dq = [q1[i] - q0[i] for i in range(nj)]
+
+        traj = []
+        for k in range(n):
+            s = k / (n - 1)
+            pos = [q0[i] + s * dq[i] for i in range(nj)]
+            vel = [dq[i] / dur for i in range(nj)]
+            traj.append(TrajectoryPoint(time=k * dt, positions=pos, velocities=vel))
+
+        return self._execute_trajectory_async(traj, block=False)
 
     def CartesianVelocityCtrl(
         self, vx: float, vy: float, vz: float,

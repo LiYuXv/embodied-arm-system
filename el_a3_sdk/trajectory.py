@@ -109,6 +109,7 @@ class SCurvePlanner:
         v_peak = min(v_natural, vm)
 
         # --- Step 2: accel/decel segment timing ---
+        # d_accel 统一表示 加速段+减速段 的总距离
         if v_peak >= am * t_j - self.EPSILON:
             t1 = t_j
             t2 = max(0.0, v_peak / am - t_j)
@@ -118,10 +119,10 @@ class SCurvePlanner:
             t1 = math.sqrt(v_peak / jm)
             t2 = 0.0
             t3 = t1
-            d_accel = jm * t1 * t1 * t1
+            d_accel = 2.0 * jm * t1 * t1 * t1
 
         # --- Step 3: cruise phase ---
-        d_cruise = d - 2.0 * d_accel
+        d_cruise = d - d_accel
         t4 = max(0.0, d_cruise / v_peak) if v_peak > self.EPSILON else 0.0
 
         prof = SCurveProfile()
@@ -413,6 +414,8 @@ class CubicSplinePlanner:
         waypoints: List[List[float]],
         durations: List[float],
         dt: float = 0.005,
+        start_velocity: Optional[List[float]] = None,
+        end_velocity: Optional[List[float]] = None,
     ) -> List[TrajectoryPoint]:
         """
         三次样条多路点轨迹规划
@@ -421,6 +424,8 @@ class CubicSplinePlanner:
             waypoints: 路点列表，每个路点为关节角度列表
             durations: 各段持续时间（长度 = len(waypoints) - 1）
             dt: 采样间隔
+            start_velocity: 起点各关节速度 (rad/s)，None 则用有限差分
+            end_velocity: 终点各关节速度 (rad/s)，None 则用有限差分
 
         Returns:
             TrajectoryPoint 列表
@@ -468,14 +473,26 @@ class CubicSplinePlanner:
                 p0 = waypoints[seg][j]
                 p1 = waypoints[seg + 1][j] if seg + 1 < n_wp else p0
 
+                # 计算 Hermite 样条在 s=0 和 s=1 处的切线 dp/ds。
+                # 由于 dp/dt = dp/ds / seg_dur，边界速度 v0 (rad/s) 对应的 dp/ds = v0 * seg_dur。
+                v_curr = (p1 - p0) / seg_dur if seg_dur > 1e-9 else 0.0
+
                 if seg == 0:
-                    m0 = (p1 - p0) if seg_dur < 1e-9 else (p1 - p0)
+                    v_start = start_velocity[j] if start_velocity is not None else v_curr
+                    m0 = v_start * seg_dur
                 else:
-                    m0 = 0.5 * (p1 - waypoints[seg - 1][j])
+                    prev_dur = durations[seg - 1]
+                    v_prev = (p0 - waypoints[seg - 1][j]) / prev_dur if prev_dur > 1e-9 else 0.0
+                    m0 = 0.5 * (v_prev + v_curr) * seg_dur
+
                 if seg + 1 >= n_wp - 1:
-                    m1 = (p1 - p0) if seg_dur < 1e-9 else (p1 - p0)
+                    v_end = end_velocity[j] if end_velocity is not None else v_curr
+                    m1 = v_end * seg_dur
                 else:
-                    m1 = 0.5 * (waypoints[seg + 2][j] - p0)
+                    next_dur = durations[seg + 1]
+                    p_next = waypoints[seg + 2][j]
+                    v_next = (p_next - p1) / next_dur if next_dur > 1e-9 else 0.0
+                    m1 = 0.5 * (v_curr + v_next) * seg_dur
 
                 p = h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
                 pos.append(p)

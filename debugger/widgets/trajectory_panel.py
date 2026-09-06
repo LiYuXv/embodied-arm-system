@@ -24,18 +24,22 @@ class TrajectoryPanel(QWidget):
     move_j_requested = pyqtSignal(list, float)
     move_l_requested = pyqtSignal(list, float)
     end_pose_requested = pyqtSignal(float, float, float, float, float, float, float)
+    end_pose_quat_requested = pyqtSignal(float, float, float, float, float, float, float, float)
     cancel_requested = pyqtSignal()
+    waypoints_batch_requested = pyqtSignal(list, list)  # waypoints, durations
 
     drag_mode_toggled = pyqtSignal(bool)
     sync_feedback_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._current_positions = [0.0] * 6
+        self._current_positions = [0.0] * 7
         self._waypoints = []
         self._status_mode = "ready"
         self._drag_active = False
         self._updating_from_drag = False
+        self._pd_kp = None
+        self._pd_kd = None
         self._init_ui()
 
     def _init_ui(self):
@@ -93,10 +97,13 @@ class TrajectoryPanel(QWidget):
         self.movej_group = QGroupBox(tr("traj.joint_target"))
         grid = QGridLayout()
         self._movej_spins = []
-        joint_names = ["L1", "L2", "L3", "L4", "L5", "L6"]
-        limits = [(-160, 160), (0, 210), (-230, 0), (-90, 90), (-90, 90), (-90, 90)]
-        for i in range(6):
-            grid.addWidget(QLabel(joint_names[i]), i // 3, (i % 3) * 2)
+        joint_names = ["L1", "L2", "L3", "L4", "L5", "L6", "L7"]
+        limits = [(-160, 160), (0, 210), (-230, 0), (-90, 90), (-90, 90), (-90, 90), (-90, 90)]
+        for i in range(7):
+            row = i // 4
+            col_label = (i % 4) * 2
+            col_spin = col_label + 1
+            grid.addWidget(QLabel(joint_names[i]), row, col_label)
             spin = QDoubleSpinBox()
             lo, hi = limits[i]
             spin.setRange(lo, hi)
@@ -104,7 +111,7 @@ class TrajectoryPanel(QWidget):
             spin.setSuffix("°")
             spin.setValue(0.0 if lo <= 0 <= hi else lo)
             self._movej_spins.append(spin)
-            grid.addWidget(spin, i // 3, (i % 3) * 2 + 1)
+            grid.addWidget(spin, row, col_spin)
         self.movej_group.setLayout(grid)
         layout.addWidget(self.movej_group)
 
@@ -125,6 +132,17 @@ class TrajectoryPanel(QWidget):
         dur_layout.addWidget(self.movej_exec_btn)
         layout.addLayout(dur_layout)
 
+        # --- PD 增益信息框（MoveJ 实际使用的 Kp/Kd） ---
+        self.movej_pd_group = QGroupBox(tr("traj.pd_gains"))
+        pd_layout = QHBoxLayout()
+        self.movej_pd_label = QLabel()
+        self.movej_pd_label.setTextFormat(Qt.TextFormat.RichText)
+        pd_layout.addWidget(self.movej_pd_label)
+        pd_layout.addStretch()
+        self.movej_pd_group.setLayout(pd_layout)
+        layout.addWidget(self.movej_pd_group)
+        self.update_pd_info(None, None)
+
         layout.addStretch()
         return w
 
@@ -132,6 +150,7 @@ class TrajectoryPanel(QWidget):
         w = QWidget()
         layout = QVBoxLayout(w)
 
+        # --- Euler 笛卡尔目标 ---
         self.movel_group = QGroupBox(tr("traj.cart_target"))
         grid = QGridLayout()
         labels = ["X (m)", "Y (m)", "Z (m)", "Rx (°)", "Ry (°)", "Rz (°)"]
@@ -166,6 +185,43 @@ class TrajectoryPanel(QWidget):
         dur_layout.addWidget(self.movel_exec_btn)
         layout.addLayout(dur_layout)
 
+        # --- Quaternion 笛卡尔目标 (WXYZ) ---
+        self.movel_quat_group = QGroupBox(tr("traj.cart_target_quat"))
+        quat_grid = QGridLayout()
+        quat_labels = ["X (m)", "Y (m)", "Z (m)", "W", "X", "Y", "Z"]
+        quat_defaults = [0.3, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0]
+        quat_ranges = [(-1, 1), (-1, 1), (0, 1), (-1, 1), (-1, 1), (-1, 1), (-1, 1)]
+        self._movel_quat_spins = []
+        for i, (label, default, (lo, hi)) in enumerate(zip(quat_labels, quat_defaults, quat_ranges)):
+            col = i % 4
+            row = i // 4
+            quat_grid.addWidget(QLabel(label), row, col * 2)
+            spin = QDoubleSpinBox()
+            spin.setRange(lo, hi)
+            spin.setDecimals(4)
+            spin.setSingleStep(0.01)
+            spin.setValue(default)
+            self._movel_quat_spins.append(spin)
+            quat_grid.addWidget(spin, row, col * 2 + 1)
+        self.movel_quat_group.setLayout(quat_grid)
+        layout.addWidget(self.movel_quat_group)
+
+        quat_dur_layout = QHBoxLayout()
+        self.movel_quat_dur_label = QLabel(tr("traj.duration"))
+        quat_dur_layout.addWidget(self.movel_quat_dur_label)
+        self.movel_quat_duration = QDoubleSpinBox()
+        self.movel_quat_duration.setRange(0.5, 30.0)
+        self.movel_quat_duration.setValue(2.0)
+        self.movel_quat_duration.setSuffix(" s")
+        quat_dur_layout.addWidget(self.movel_quat_duration)
+        quat_dur_layout.addStretch()
+
+        self.movel_quat_exec_btn = QPushButton(tr("traj.exec_movel_quat"))
+        self.movel_quat_exec_btn.setObjectName("enableBtn")
+        self.movel_quat_exec_btn.clicked.connect(self._on_exec_movel_quat)
+        quat_dur_layout.addWidget(self.movel_quat_exec_btn)
+        layout.addLayout(quat_dur_layout)
+
         layout.addStretch()
         return w
 
@@ -173,9 +229,9 @@ class TrajectoryPanel(QWidget):
         w = QWidget()
         layout = QVBoxLayout(w)
 
-        self.waypoint_table = QTableWidget(0, 7)
+        self.waypoint_table = QTableWidget(0, 8)
         self.waypoint_table.setHorizontalHeaderLabels(
-            ["L1°", "L2°", "L3°", "L4°", "L5°", "L6°", tr("traj.time_header")]
+            ["L1°", "L2°", "L3°", "L4°", "L5°", "L6°", "L7°", tr("traj.time_header")]
         )
         self.waypoint_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
@@ -219,7 +275,7 @@ class TrajectoryPanel(QWidget):
     def update_drag_angles(self, angles: dict):
         """Receive drag angle dict from 3D viewer and update MoveJ spinboxes."""
         self._updating_from_drag = True
-        for i, jname in enumerate(JOINT_NAMES_ORDERED[:6]):
+        for i, jname in enumerate(JOINT_NAMES_ORDERED[:7]):
             if jname in angles:
                 self._movej_spins[i].setValue(math.degrees(angles[jname]))
         self._updating_from_drag = False
@@ -230,6 +286,33 @@ class TrajectoryPanel(QWidget):
             self.drag_btn.setChecked(False)
             self._drag_active = False
             self.drag_mode_toggled.emit(False)
+
+    @staticmethod
+    def _sdk_default_pd():
+        """从 SDK ELA3Interface.__init__ 签名动态读取 default_kp/default_kd，
+        保证与 interface.py 单一数据源；SDK 不可用时兜底 80.0/4.0。"""
+        try:
+            import inspect
+            from el_a3_sdk import ELA3Interface
+            params = inspect.signature(ELA3Interface.__init__).parameters
+            return (float(params["default_kp"].default),
+                    float(params["default_kd"].default))
+        except Exception:
+            return 80.0, 4.0
+
+    def update_pd_info(self, kp, kd):
+        """更新 MoveJ 信息框中的 PD 增益显示。
+
+        kp/kd 为 None 时（未连接真实机械臂）显示 SDK 默认值。
+        """
+        self._pd_kp, self._pd_kd = kp, kd
+        if kp is None or kd is None:
+            kp, kd = self._sdk_default_pd()
+            self.movej_pd_label.setText(
+                tr("traj.pd_gains_value_default", kp=kp, kd=kd))
+        else:
+            self.movej_pd_label.setText(
+                tr("traj.pd_gains_value", kp=kp, kd=kd))
 
     # ==================================================================
     # retranslate
@@ -248,11 +331,16 @@ class TrajectoryPanel(QWidget):
         self.movej_group.setTitle(tr("traj.joint_target"))
         self.movej_dur_label.setText(tr("traj.duration"))
         self.movej_exec_btn.setText(tr("traj.exec_movej"))
+        self.movej_pd_group.setTitle(tr("traj.pd_gains"))
+        self.update_pd_info(self._pd_kp, self._pd_kd)
         self.movel_group.setTitle(tr("traj.cart_target"))
         self.movel_dur_label.setText(tr("traj.duration"))
         self.movel_exec_btn.setText(tr("traj.exec_movel"))
+        self.movel_quat_group.setTitle(tr("traj.cart_target_quat"))
+        self.movel_quat_dur_label.setText(tr("traj.duration"))
+        self.movel_quat_exec_btn.setText(tr("traj.exec_movel_quat"))
         self.waypoint_table.setHorizontalHeaderLabels(
-            ["L1°", "L2°", "L3°", "L4°", "L5°", "L6°", tr("traj.time_header")]
+            ["L1°", "L2°", "L3°", "L4°", "L5°", "L6°", "L7°", tr("traj.time_header")]
         )
         self.add_btn.setText(tr("traj.add_cur"))
         self.del_btn.setText(tr("traj.del_sel"))
@@ -290,21 +378,34 @@ class TrajectoryPanel(QWidget):
         self._status_mode = "movel"
         self.status_label.setText(tr("traj.movel_running"))
 
+    def _on_exec_movel_quat(self):
+        x = self._movel_quat_spins[0].value()
+        y = self._movel_quat_spins[1].value()
+        z = self._movel_quat_spins[2].value()
+        w = self._movel_quat_spins[3].value()
+        qx = self._movel_quat_spins[4].value()
+        qy = self._movel_quat_spins[5].value()
+        qz = self._movel_quat_spins[6].value()
+        duration = self.movel_quat_duration.value()
+        self.end_pose_quat_requested.emit(x, y, z, w, qx, qy, qz, duration)
+        self._status_mode = "movel"
+        self.status_label.setText(tr("traj.movel_running"))
+
     def _fill_current_positions(self):
-        for i in range(min(6, len(self._current_positions))):
+        for i in range(min(7, len(self._current_positions))):
             self._movej_spins[i].setValue(math.degrees(self._current_positions[i]))
 
     def update_current_positions(self, joint_states):
-        positions = joint_states.to_list(include_gripper=False)
-        self._current_positions = positions[:6]
+        positions = joint_states.to_list(include_gripper=True)
+        self._current_positions = positions[:7]
 
     def _add_current_waypoint(self):
         row = self.waypoint_table.rowCount()
         self.waypoint_table.insertRow(row)
-        for i in range(6):
+        for i in range(7):
             deg = math.degrees(self._current_positions[i]) if i < len(self._current_positions) else 0.0
             self.waypoint_table.setItem(row, i, QTableWidgetItem(f"{deg:.2f}"))
-        self.waypoint_table.setItem(row, 6, QTableWidgetItem("2.0"))
+        self.waypoint_table.setItem(row, 7, QTableWidgetItem("2.0"))
 
     def _delete_selected_waypoint(self):
         rows = set(idx.row() for idx in self.waypoint_table.selectedIndexes())
@@ -312,14 +413,26 @@ class TrajectoryPanel(QWidget):
             self.waypoint_table.removeRow(row)
 
     def _exec_waypoints(self):
-        for row in range(self.waypoint_table.rowCount()):
+        """收集所有路点，一次性批量执行（三次样条插值）"""
+        n_rows = self.waypoint_table.rowCount()
+        if n_rows == 0:
+            return
+
+        waypoints = []
+        durations = []
+
+        for row in range(n_rows):
             positions = []
-            for col in range(6):
+            for col in range(7):
                 item = self.waypoint_table.item(row, col)
                 val = float(item.text()) if item else 0.0
                 positions.append(math.radians(val))
-            dur_item = self.waypoint_table.item(row, 6)
+            waypoints.append(positions)
+
+            dur_item = self.waypoint_table.item(row, 7)
             duration = float(dur_item.text()) if dur_item else 2.0
-            self.move_j_requested.emit(positions, duration)
+            durations.append(duration)
+
+        self.waypoints_batch_requested.emit(waypoints, durations)
         self._status_mode = "waypoints"
-        self.status_label.setText(tr("traj.exec_waypoints", n=self.waypoint_table.rowCount()))
+        self.status_label.setText(tr("traj.exec_waypoints", n=n_rows))
