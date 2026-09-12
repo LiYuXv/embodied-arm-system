@@ -1,0 +1,39 @@
+dataset:
+  repo_id: ela3_dual_demo
+  root: ./lerobot_data/ela3_dual_demo
+  eval_split: 0.1
+  image_transforms:
+    enable: true
+    random_order: true
+
+eval_steps: 500
+policy:
+  type: smolvla_torque
+  robot_mode: dual
+  torque_key: observation.gripper_torque
+  pretrained_path: ./pretrained_models/smolvla_base
+  chunk_size: 40
+  n_action_steps: 20
+  max_state_dim: 32       # 14D state + 2D torque are padded from 16D
+  max_action_dim: 32      # 14D action is unpadded on output
+  device: cuda
+  push_to_hub: false
+  vlm_model_name: ./pretrained_models/smolvlm2-500m-video-instruct
+
+save_checkpoint: true
+output_dir: ./ckpt/smolvla_ela3_dual
+batch_size: 8
+job_name: smolvla_ela3_dual
+resume: false
+seed: 42
+num_workers: 4
+steps: 40000
+env_eval_freq: -1
+log_freq: 50
+save_freq: 2000
+use_policy_training_preset: true
+
+wandb:
+  enable: false
+  project: smolvla_ela3_dual
+  entity: <your_wandb_entity>

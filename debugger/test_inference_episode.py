@@ -12,14 +12,14 @@ Differences vs the ACT notebook:
     - SmolVLA does NOT normalize inside the policy, so we explicitly apply the
       checkpoint's `preprocessor` (tokenizer + state normalizer) before
       `select_action` and the `postprocessor` (action unnormalizer) afterwards.
-    - action_dim = 7 (x, y, z, rx, ry, rz, gripper_rad).
+    - action_dim 由 checkpoint/dataset 决定：单臂 7D，双臂 14D。
 
 Usage:
     conda run -n yolo --no-capture-output python test_inference_episode.py \
         --checkpoint ./ckpt/smolvla_ela3/checkpoints/last --episode 0
 
     # 摄像头消融（测试哪路摄像头对模型准确率影响最大）：
-    #   默认双路输入；--cam1 只喂 cam1 画面（cam2 置黑）；--cam2 反之
+    #   默认输入 checkpoint 声明的所有相机；--camN 只保留指定视角
     # 随机种子：默认 --seed 1000（每个 episode 推理前重置，保证各 cam 模式可对比）
 """
 import argparse
@@ -37,6 +37,19 @@ from lerobot.policies.factory import get_policy_class
 from lerobot.processor import DataProcessorPipeline
 
 import configuration_smolvla_torque  # noqa: F401 注册 "smolvla_torque" 策略（含夹爪力矩输入）
+import configuration_pi05_torque  # noqa: F401 注册 "pi05_torque"
+import processor_pi05_torque  # noqa: F401 注册自定义 processor step
+
+from vla_features import (
+    ACTION_KEY,
+    CAMERA_PREFIX,
+    TORQUE_KEY,
+    as_action_chunk,
+    get_mode_spec,
+    split_dual_action,
+    validate_policy_checkpoint,
+    validate_vla_features,
+)
 
 
 def load_policy(checkpoint_path: str, device: str = "cuda"):
@@ -73,13 +86,45 @@ class EpisodeSampler(torch.utils.data.Sampler):
         return len(self.frame_ids)
 
 
-def run_episode(policy, preprocessor, postprocessor, dataset, episode_index, device,
-                torque_key=None, cam_mode="both"):
-    """Roll out the policy over one episode; return (pred_actions, gt_actions).
+def camera_keys_for_inference(config, dataset):
+    configured = getattr(config, "input_features", None) or {}
+    available = dataset.meta.features
+    return [
+        key for key in configured
+        if key.startswith(CAMERA_PREFIX) and key in available
+    ]
 
-    cam_mode: "both" 双路输入；"cam1" 只喂 cam1（cam2 置黑）；"cam2" 反之；
-    "cam0" 双路置黑（盲测，验证模型对视觉的依赖程度）。
-    """
+
+def build_episode_observation(
+    batch, device, camera_keys, *, torque_key=None, torque_dim=1, cam_mode="all"
+):
+    """Build a dynamic two/three-camera single-frame observation."""
+    observation = {key: batch[key].to(device) for key in camera_keys}
+    observation["observation.state"] = batch["observation.state"].to(device)
+    observation["task"] = batch["task"]
+
+    mode = "blind" if cam_mode == "cam0" else cam_mode
+    if mode not in {"all", "both"}:
+        keep_key = f"{CAMERA_PREFIX}{mode}" if mode.startswith("cam") else None
+        for key in camera_keys:
+            if mode == "blind" or key != keep_key:
+                observation[key] = torch.zeros_like(observation[key])
+    if torque_key is not None:
+        if torque_key in batch:
+            observation[torque_key] = batch[torque_key].reshape(
+                batch[torque_key].shape[0], -1
+            ).to(device)
+        else:
+            observation[torque_key] = torch.zeros(
+                observation["observation.state"].shape[0], torque_dim, device=device
+            )
+    return observation
+
+
+def run_episode(policy, preprocessor, postprocessor, dataset, episode_index, device,
+                torque_key=None, cam_mode="all", camera_keys=None, torque_dim=1,
+                mode="single"):
+    """Roll out one episode with dynamic cameras and 7D/14D action validation."""
     episode_sampler = EpisodeSampler(dataset, episode_index)
     test_dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -98,38 +143,25 @@ def run_episode(policy, preprocessor, postprocessor, dataset, episode_index, dev
             "yellow", attrs=["bold"]))
     warned_missing = False
 
+    camera_keys = camera_keys or [
+        key for key in dataset.meta.features if key.startswith(CAMERA_PREFIX)
+    ]
     actions, gt_actions = [], []
     policy.reset()  # clear the action-chunk queue once per episode
     for batch in test_dataloader:
         # ground-truth single-step action at this frame: (1, action_dim)
         gt = batch["action"]
 
-        observation = {
-            "observation.images.cam1": batch["observation.images.cam1"].to(device),
-            "observation.images.cam2": batch["observation.images.cam2"].to(device),
-            "observation.state": batch["observation.state"].to(device),
-            "task": batch["task"],
-        }
-        # 摄像头消融：cam1 只保留 cam1（cam2 置黑）；cam2 反之；cam0 双路置黑
-        if cam_mode == "cam1":
-            observation["observation.images.cam2"] = torch.zeros_like(
-                observation["observation.images.cam2"])
-        elif cam_mode == "cam2":
-            observation["observation.images.cam1"] = torch.zeros_like(
-                observation["observation.images.cam1"])
-        elif cam_mode == "cam0":
-            observation["observation.images.cam1"] = torch.zeros_like(
-                observation["observation.images.cam1"])
-            observation["observation.images.cam2"] = torch.zeros_like(
-                observation["observation.images.cam2"])
-        if need_torque:
-            if torque_key in batch:
-                # (1, 1)，已带 batch 维（add_batch_dim 步骤不处理该自定义键）
-                observation[torque_key] = batch[torque_key].reshape(1, -1).to(device)
-            else:
-                if not warned_missing:
-                    warned_missing = True
-                observation[torque_key] = torch.zeros(1, 1, device=device)
+        observation = build_episode_observation(
+            batch,
+            device,
+            camera_keys,
+            torque_key=torque_key if need_torque else None,
+            torque_dim=torque_dim,
+            cam_mode=cam_mode,
+        )
+        if need_torque and torque_key not in batch and not warned_missing:
+            warned_missing = True
         observation = preprocessor(observation)
 
         with torch.no_grad():
@@ -145,6 +177,7 @@ def run_episode(policy, preprocessor, postprocessor, dataset, episode_index, dev
             pred = action[:, 0, :]
         else:
             pred = action
+        as_action_chunk(pred, mode=mode)
 
         actions.append(pred)
         gt_actions.append(gt)
@@ -158,7 +191,12 @@ def plot_actions(actions, gt_actions, action_dim, title, save_path):
     fig, axs = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim))
     if action_dim == 1:
         axs = [axs]
-    labels = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+    labels = (
+        [f"left_J{i}" for i in range(1, 7)] + ["left_gripper"]
+        + [f"right_J{i}" for i in range(1, 7)] + ["right_gripper"]
+        if action_dim == 14 else
+        ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+    )
     for i in range(action_dim):
         axs[i].plot(actions[:, i].cpu().detach().numpy(), label="pred")
         axs[i].plot(gt_actions[:, i].cpu().detach().numpy(), label="gt")
@@ -185,17 +223,20 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./inference_plots")
     cam_group = parser.add_mutually_exclusive_group()
     cam_group.add_argument("--cam1", action="store_true",
-                           help="只输入 cam1 画面（cam2 置黑），用于摄像头消融")
+                           help="只输入 cam1，其余摄像头置黑")
     cam_group.add_argument("--cam2", action="store_true",
-                           help="只输入 cam2 画面（cam1 置黑），用于摄像头消融")
+                           help="只输入 cam2，其余摄像头置黑")
     cam_group.add_argument("--cam0", action="store_true",
-                           help="双路均置黑（盲测），验证模型对视觉的依赖程度")
+                           help="所有摄像头均置黑（盲测）")
+    cam_group.add_argument("--cam3", action="store_true",
+                           help="只输入 cam3，其余摄像头置黑")
     parser.add_argument("--seed", type=int, default=1000,
                         help="flow-matching 采样随机种子（默认 1000），每个 episode 推理前重置")
     args = parser.parse_args()
 
-    cam_mode = "cam1" if args.cam1 else ("cam2" if args.cam2 else ("cam0" if args.cam0 else "both"))
-    cam_suffix = "" if cam_mode == "both" else f"_{cam_mode}"
+    cam_mode = "cam1" if args.cam1 else ("cam2" if args.cam2 else (
+        "cam3" if args.cam3 else ("blind" if args.cam0 else "all")))
+    cam_suffix = "" if cam_mode == "all" else f"_{cam_mode}"
 
     device = torch.device(args.device)
     policy, preprocessor, postprocessor, config = load_policy(args.checkpoint, args.device)
@@ -223,7 +264,21 @@ def main():
     else:
         episodes = [int(e) for e in args.episode.split(",")]
 
-    action_dim = dataset.meta.features["action"]["shape"][0]
+    action_dim = dataset.meta.features[ACTION_KEY]["shape"][0]
+    mode = "dual" if action_dim == 14 else "single" if action_dim == 7 else None
+    if mode is None:
+        raise ValueError(f"unsupported dataset action dimension: {action_dim}")
+    validate_vla_features(dataset.meta.features, mode)
+    validate_policy_checkpoint(config, mode)
+    camera_keys = camera_keys_for_inference(config, dataset)
+    torque_dim = dataset.meta.features.get(
+        TORQUE_KEY, {"shape": [get_mode_spec(mode).torque_dim]}
+    )["shape"][0]
+    print(colored(
+        f"VLA schema: mode={mode}, cameras={camera_keys}, "
+        f"state/action={action_dim}D, torque={torque_dim}D",
+        "green",
+    ))
 
     total_err, total_frames = 0.0, 0
     for ep in episodes:
@@ -232,7 +287,11 @@ def main():
         torch.manual_seed(args.seed)
         actions, gt_actions = run_episode(
             policy, preprocessor, postprocessor, dataset, ep, device,
-            torque_key=torque_key, cam_mode=cam_mode)
+            torque_key=torque_key, cam_mode=cam_mode,
+            camera_keys=camera_keys, torque_dim=torque_dim, mode=mode)
+        if mode == "dual":
+            left, right = split_dual_action(actions)
+            print(f"  dual split: left={tuple(left.shape)}, right={tuple(right.shape)}")
         mean_err = torch.mean(torch.abs(actions - gt_actions.to(actions.device))).item()
         n = actions.shape[0]
         total_err += mean_err * n

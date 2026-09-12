@@ -92,6 +92,64 @@ class ControllerDetection:
     source: str
 
 
+@dataclass(frozen=True)
+class JoyConProfile:
+    """Linux hid-nintendo 为单只 Joy-Con 暴露的 evdev 语义映射。"""
+
+    side: str
+    product_id: int
+    stick_x: str
+    stick_y: str
+    clutch: str
+    z_positive: str
+    z_negative: str
+    gripper_close: str
+    gripper_open: str
+    zero: str
+    home: str
+    exit: str
+
+
+JOYCON_VENDOR_ID = 0x057E
+JOYCON_PROFILES: Dict[str, JoyConProfile] = {
+    "left": JoyConProfile(
+        side="left",
+        product_id=0x2006,
+        stick_x="ABS_X",
+        stick_y="ABS_Y",
+        clutch="BTN_TL2",       # ZL，按住启用 IMU 姿态旋转
+        z_positive="BTN_DPAD_UP",
+        z_negative="BTN_DPAD_DOWN",
+        gripper_close="BTN_DPAD_LEFT",
+        gripper_open="BTN_DPAD_RIGHT",
+        zero="BTN_THUMBL",      # 摇杆按下
+        home="BTN_TL",          # L
+        exit="BTN_SELECT",      # Minus
+    ),
+    "right": JoyConProfile(
+        side="right",
+        product_id=0x2007,
+        stick_x="ABS_RX",
+        stick_y="ABS_RY",
+        clutch="BTN_TR2",       # ZR，按住启用 IMU 姿态旋转
+        z_positive="BTN_NORTH", # X
+        z_negative="BTN_SOUTH", # B
+        gripper_close="BTN_WEST",   # Y
+        gripper_open="BTN_EAST",    # A
+        zero="BTN_THUMBR",      # 摇杆按下
+        home="BTN_TR",          # R
+        exit="BTN_START",       # Plus
+    ),
+}
+
+
+def get_joycon_profile(side: str) -> JoyConProfile:
+    try:
+        return JOYCON_PROFILES[side]
+    except KeyError as exc:
+        raise KeyError(f"Unknown Joy-Con side: {side}") from exc
+
+
 def _read_text(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as handle:

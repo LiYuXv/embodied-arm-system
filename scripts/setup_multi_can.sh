@@ -4,6 +4,8 @@
 
 # Configuration parameters
 BITRATE=1000000  # 1Mbps
+RESTART_MS=100
+TX_QUEUE_LEN=1000
 CAN_INTERFACES=(can0 can1 can2 can3)
 
 # Color output
@@ -31,20 +33,21 @@ echo ""
 # Configure specified number of CAN interfaces
 for i in $(seq 0 $((NUM_INTERFACES - 1))); do
     CAN_IF="${CAN_INTERFACES[$i]}"
-    
+
     echo -n "Configuring $CAN_IF... "
-    
+
     # Check if interface exists
     if ! ip link show "$CAN_IF" &> /dev/null; then
         echo -e "${RED}Interface does not exist${NC}"
         continue
     fi
-    
+
     # Bring down interface
     ip link set "$CAN_IF" down 2>/dev/null
-    
-    # Configure bitrate
-    if ip link set "$CAN_IF" type can bitrate $BITRATE; then
+
+    # Configure the verified bus parameters
+    if ip link set "$CAN_IF" type can bitrate "$BITRATE" restart-ms "$RESTART_MS" && \
+       ip link set "$CAN_IF" txqueuelen "$TX_QUEUE_LEN"; then
         # Bring up interface
         if ip link set "$CAN_IF" up; then
             echo -e "${GREEN}Success${NC}"
@@ -64,7 +67,7 @@ echo "=================================="
 # Display all CAN interface status
 for i in $(seq 0 $((NUM_INTERFACES - 1))); do
     CAN_IF="${CAN_INTERFACES[$i]}"
-    
+
     if ip link show "$CAN_IF" &> /dev/null; then
         STATE=$(ip link show "$CAN_IF" | grep -oP '(?<=state )\w+')
         if [ "$STATE" == "UP" ]; then

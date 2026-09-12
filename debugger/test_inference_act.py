@@ -38,9 +38,16 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 
 from act_data_utils import (
     TORQUE_KEY,
+    camera_keys_for_features,
     get_cam_hw,
     get_image_transforms,
     make_collate_fn,
+)
+from vla_features import (
+    as_action_chunk,
+    split_dual_action,
+    validate_policy_checkpoint,
+    validate_vla_features,
 )
 
 
@@ -89,8 +96,7 @@ def build_dataset(
     # Resolve delta_timestamps using the policy's config (same as training).
     delta_timestamps = resolve_delta_timestamps(policy.config, dataset_metadata)
 
-    cam_keys = [k for k in ("observation.images.cam1", "observation.images.cam2")
-                if k in policy.config.input_features]
+    cam_keys = camera_keys_for_features(policy.config.input_features)
     cam_hw = get_cam_hw(dataset_metadata, cam_keys[0]) if cam_keys else None
 
     print("[INFO] Building dataset...")
@@ -147,7 +153,7 @@ def build_observation(batch: dict, policy: ACTPolicy, device: torch.device):
     return observation
 
 
-def run_episode(policy, dataset, episode_index, device, collate_fn=None):
+def run_episode(policy, dataset, episode_index, device, collate_fn=None, mode="single"):
     """Roll out the policy over one episode; return (pred_actions, gt_actions)."""
     episode_sampler = EpisodeSampler(dataset, episode_index)
     test_dataloader = torch.utils.data.DataLoader(
@@ -182,6 +188,7 @@ def run_episode(policy, dataset, episode_index, device, collate_fn=None):
             pred = action[:, 0, :]
         else:
             pred = action
+        as_action_chunk(pred, mode=mode)
 
         actions.append(pred)
         gt_actions.append(gt)
@@ -195,7 +202,12 @@ def plot_actions(actions, gt_actions, action_dim, title, save_path):
     fig, axs = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim))
     if action_dim == 1:
         axs = [axs]
-    labels = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+    labels = (
+        [f"left_J{i}" for i in range(1, 7)] + ["left_gripper"]
+        + [f"right_J{i}" for i in range(1, 7)] + ["right_gripper"]
+        if action_dim == 14 else
+        ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+    )
     for i in range(action_dim):
         axs[i].plot(actions[:, i].cpu().detach().numpy(), label="pred")
         axs[i].plot(gt_actions[:, i].cpu().detach().numpy(), label="gt")
@@ -295,10 +307,20 @@ def main():
         episodes = [int(e) for e in args.episode.split(",")]
 
     action_dim = dataset.meta.features["action"]["shape"][0]
+    mode = "dual" if action_dim == 14 else "single" if action_dim == 7 else None
+    if mode is None:
+        raise ValueError(f"unsupported dataset action dimension: {action_dim}")
+    validate_vla_features(dataset.meta.features, mode)
+    validate_policy_checkpoint(policy.config, mode)
 
     total_err, total_frames = 0.0, 0
     for ep in episodes:
-        actions, gt_actions = run_episode(policy, dataset, ep, device, collate_fn)
+        actions, gt_actions = run_episode(
+            policy, dataset, ep, device, collate_fn, mode=mode
+        )
+        if mode == "dual":
+            left, right = split_dual_action(actions)
+            print(f"  dual split: left={tuple(left.shape)}, right={tuple(right.shape)}")
         mean_err = torch.mean(torch.abs(actions - gt_actions.to(actions.device))).item()
         n = actions.shape[0]
         total_err += mean_err * n

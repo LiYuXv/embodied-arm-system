@@ -1,0 +1,10 @@
+arms:
+  left_arm:
+    enabled: true
+    can_interface: can0
+    host_can_id: 253
+
+  right_arm:
+    enabled: true
+    can_interface: can1
+    host_can_id: 253

@@ -1,5 +1,11 @@
 from el_a3_sdk.interface import ELA3Interface
-from el_a3_sdk.arm_manager import ArmManager
+from el_a3_sdk.arm_manager import ArmManager, initialize_dual_arms
+from el_a3_sdk.joycon import (
+    JoyConInput,
+    JoyConPoseAdapter,
+    discover_joycon,
+    discover_joycons,
+)
 from el_a3_sdk.data_types import (
     MotorFeedback,
     ArmStatus,
@@ -38,6 +44,11 @@ def get_slcan_driver():
 __all__ = [
     "ELA3Interface",
     "ArmManager",
+    "initialize_dual_arms",
+    "JoyConInput",
+    "JoyConPoseAdapter",
+    "discover_joycon",
+    "discover_joycons",
     "get_kinematics",
     "get_slcan_driver",
     "MotorFeedback",

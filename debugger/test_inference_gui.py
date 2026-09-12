@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""训练日志分析 + 离线推理一体化 GUI（PyQt6）。
+"""VLA 训练日志分析 + 离线推理一体化 GUI（PyQt6）。
 
 左栏：解析 train.log，同图绘制 train loss / eval loss 曲线，自动标注 eval
 最低点并映射到实际存在的最近 checkpoint（最佳模型），可一键应用到右栏。
@@ -29,7 +29,18 @@ from PyQt6.QtWidgets import (
     QFileDialog, QSplitter, QGroupBox,
 )
 
-from test_inference_episode import load_policy, run_episode  # 复用现有推理逻辑
+from test_inference_episode import (  # 复用现有推理逻辑
+    camera_keys_for_inference,
+    load_policy,
+    run_episode,
+)
+from vla_features import (
+    ACTION_KEY,
+    TORQUE_KEY,
+    get_mode_spec,
+    validate_policy_checkpoint,
+    validate_vla_features,
+)
 
 
 # ==================== train.log 解析 ====================
@@ -124,9 +135,20 @@ class InferenceWorker(QThread):
 
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
             dataset = LeRobotDataset(self.repo_id, root=self.dataset_root)
+            action_dim = dataset.meta.features[ACTION_KEY]["shape"][0]
+            mode = "dual" if action_dim == 14 else "single" if action_dim == 7 else None
+            if mode is None:
+                raise ValueError(f"unsupported dataset action dimension: {action_dim}")
+            validate_vla_features(dataset.meta.features, mode)
+            validate_policy_checkpoint(config, mode)
+            camera_keys = camera_keys_for_inference(config, dataset)
+            torque_dim = dataset.meta.features.get(
+                TORQUE_KEY, {"shape": [get_mode_spec(mode).torque_dim]}
+            )["shape"][0]
             self.status.emit(
                 f"数据集 {dataset.num_episodes} episodes / {dataset.num_frames} 帧 | "
-                f"力矩: {'启用' if torque_key else '无'} | cam={self.cam_mode} seed={self.seed}")
+                f"mode={mode} action={action_dim}D torque={torque_dim}D | "
+                f"cameras={camera_keys} cam={self.cam_mode} seed={self.seed}")
 
             total_err, total_frames = 0.0, 0
             for ep in self.episodes:
@@ -137,7 +159,8 @@ class InferenceWorker(QThread):
                 torch.manual_seed(self.seed)
                 actions, gt = run_episode(
                     policy, preprocessor, postprocessor, dataset, ep, device,
-                    torque_key=torque_key, cam_mode=self.cam_mode)
+                    torque_key=torque_key, cam_mode=self.cam_mode,
+                    camera_keys=camera_keys, torque_dim=torque_dim, mode=mode)
                 err = torch.mean(torch.abs(actions - gt.to(actions.device))).item()
                 n = actions.shape[0]
                 total_err += err * n
@@ -158,7 +181,7 @@ class InferenceWorker(QThread):
 class InferenceGui(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SmolVLA 训练分析 + 离线推理")
+        self.setWindowTitle("VLA 训练分析 + 离线推理（单臂/双臂）")
         self.resize(1500, 900)
         self.worker = None
         self._best_ckpt = None
@@ -231,7 +254,7 @@ class InferenceGui(QMainWindow):
         row.addWidget(self.ep_edit, stretch=1)
         row.addWidget(QLabel("cam:"))
         self.cam_combo = QComboBox()
-        self.cam_combo.addItems(["both", "cam1", "cam2", "cam0"])
+        self.cam_combo.addItems(["all", "cam1", "cam2", "cam3", "blind", "both", "cam0"])
         row.addWidget(self.cam_combo)
         row.addWidget(QLabel("seed:"))
         self.seed_spin = QSpinBox()
@@ -360,7 +383,7 @@ class InferenceGui(QMainWindow):
         from test_inference_episode import plot_actions
         save_dir = Path("./inference_plots")
         save_dir.mkdir(exist_ok=True)
-        suffix = "" if self.cam_combo.currentText() == "both" else f"_{self.cam_combo.currentText()}"
+        suffix = "" if self.cam_combo.currentText() in {"all", "both"} else f"_{self.cam_combo.currentText()}"
         plot_actions(pred, gt, pred.shape[1],
                      f"episode {ep}  (mean abs err={err:.4f})",
                      save_dir / f"episode_{ep:03d}{suffix}.png")
@@ -368,8 +391,13 @@ class InferenceGui(QMainWindow):
     def _plot_pred_gt(self, pred, gt, title):
         fig = self.infer_canvas.figure
         fig.clear()
-        labels = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
         dim = pred.shape[1]
+        labels = (
+            [f"left_J{i}" for i in range(1, 7)] + ["left_gripper"]
+            + [f"right_J{i}" for i in range(1, 7)] + ["right_gripper"]
+            if dim == 14 else
+            ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+        )
         axs = fig.subplots(dim, 1, sharex=True)
         if dim == 1:
             axs = [axs]

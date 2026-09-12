@@ -14,6 +14,7 @@ setup(
     extras_require={
         "dynamics": ["pin"],
         "slcan": ["pyserial>=3.5"],
+        "joycon": ["evdev>=1.6"],
         "windows": ["pyserial>=3.5"],
         "debugger": [
             "pyqt6",

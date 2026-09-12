@@ -38,6 +38,7 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 
 from act_data_utils import (
     TORQUE_KEY,
+    camera_keys_for_features,
     get_cam_hw,
     get_image_transforms,
     make_collate_fn,
@@ -57,6 +58,7 @@ DEFAULT_CKPT_DIR = os.path.join(DEFAULT_PROJECT_ROOT, "ckpt", "act_ela3_real")
 def build_policy_and_dataset(
     dataset_root: str,
     device: torch.device,
+    repo_id: str = "ela3_demo",
     chunk_size: int = 10,
     n_action_steps: int = 10,
     kl_weight: float = 1.0,
@@ -71,6 +73,7 @@ def build_policy_and_dataset(
     optimizer_lr_backbone: float = 1e-5,
     use_cam1: bool = True,
     use_cam2: bool = True,
+    use_cam3: bool = True,
     use_torque: bool = True,
     image_size: int = 256,
     val_split: float = 0.1,
@@ -80,7 +83,7 @@ def build_policy_and_dataset(
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
 
     print(f"[INFO] Loading dataset metadata from: {dataset_root}")
-    dataset_metadata = LeRobotDatasetMetadata("ela3_demo", root=dataset_root)
+    dataset_metadata = LeRobotDatasetMetadata(repo_id, root=dataset_root)
     print(f"[INFO] Dataset: {dataset_metadata.total_episodes} episodes, "
           f"{dataset_metadata.total_frames} frames")
     n_tasks = getattr(dataset_metadata, "total_tasks", None)
@@ -102,6 +105,11 @@ def build_policy_and_dataset(
     if "observation.images.cam2" in input_features and not use_cam2:
         input_features.pop("observation.images.cam2")
         print("[INFO] Dropped observation.images.cam2")
+    if "observation.images.cam3" in input_features and not use_cam3:
+        input_features.pop("observation.images.cam3")
+        print("[INFO] Dropped observation.images.cam3")
+    if not camera_keys_for_features(input_features):
+        raise ValueError("至少需要保留一路 cam1/cam2/cam3 图像输入")
 
     print("[INFO] Input features:", list(input_features.keys()))
     print("[INFO] Output features:", list(output_features.keys()))
@@ -128,7 +136,7 @@ def build_policy_and_dataset(
           f"kl_weight={kl_weight}")
     print(f"[INFO] action delta_timestamps: {delta_timestamps.get('action')}")
 
-    # 力矩适配：原生 ACT 只用 observation.state，把 torque 并入 state（7->8 维），
+    # 力矩适配：单臂为 7+1->8，双臂为 14+2->16。
     # 特征形状与归一化统计量同步合并；数据集仍返回独立的 torque 键，由 collate 拼接
     stats = dataset_metadata.stats
     torque_merged = False
@@ -150,8 +158,7 @@ def build_policy_and_dataset(
     policy.train()
     policy.to(device)
 
-    cam_keys = [k for k in ("observation.images.cam1", "observation.images.cam2")
-                if k in input_features]
+    cam_keys = camera_keys_for_features(input_features)
     cam_hw = get_cam_hw(dataset_metadata, cam_keys[0]) if cam_keys else None
 
     print("[INFO] Loading dataset...")
@@ -168,7 +175,7 @@ def build_policy_and_dataset(
               f"episodes（验证: {val_episodes}）")
 
     dataset = LeRobotDataset(
-        "ela3_demo",
+        repo_id,
         delta_timestamps=delta_timestamps,
         root=dataset_root,
         image_transforms=get_image_transforms(image_size, cam_hw),
@@ -179,7 +186,7 @@ def build_policy_and_dataset(
     val_dataset = None
     if val_episodes:
         val_dataset = LeRobotDataset(
-            "ela3_demo",
+            repo_id,
             delta_timestamps=delta_timestamps,
             root=dataset_root,
             image_transforms=get_image_transforms(image_size, cam_hw),
@@ -384,6 +391,12 @@ def main():
         help="Directory to save checkpoints",
     )
     parser.add_argument(
+        "--repo_id",
+        type=str,
+        default="ela3_demo",
+        help="LeRobot dataset repo_id (folder name)",
+    )
+    parser.add_argument(
         "--training_steps",
         type=int,
         default=20000,
@@ -428,7 +441,7 @@ def main():
     parser.add_argument(
         "--no_torque",
         action="store_true",
-        help="禁用夹爪力矩输入（默认并入 observation.state 第8维）",
+        help="禁用夹爪力矩输入（单臂合并为8D，双臂合并为16D）",
     )
     parser.add_argument(
         "--use_cam1",
@@ -451,6 +464,17 @@ def main():
         "--no_cam2",
         action="store_true",
         help="Disable observation.images.cam2",
+    )
+    parser.add_argument(
+        "--use_cam3",
+        action="store_true",
+        default=True,
+        help="Use observation.images.cam3 when present",
+    )
+    parser.add_argument(
+        "--no_cam3",
+        action="store_true",
+        help="Disable observation.images.cam3",
     )
     parser.add_argument(
         "--optimizer_lr",
@@ -516,19 +540,22 @@ def main():
 
     use_cam1 = args.use_cam1 and not args.no_cam1
     use_cam2 = args.use_cam2 and not args.no_cam2
-    if not use_cam1 and not use_cam2:
+    use_cam3 = args.use_cam3 and not args.no_cam3
+    if not use_cam1 and not use_cam2 and not use_cam3:
         print("[ERROR] At least one camera must be enabled")
         sys.exit(1)
 
     policy, dataset, val_dataset, cfg, collate_fn = build_policy_and_dataset(
         dataset_root=args.dataset_root,
         device=device,
+        repo_id=args.repo_id,
         chunk_size=args.chunk_size,
         n_action_steps=args.n_action_steps,
         kl_weight=args.kl_weight,
         optimizer_lr=args.optimizer_lr,
         use_cam1=use_cam1,
         use_cam2=use_cam2,
+        use_cam3=use_cam3,
         use_torque=not args.no_torque,
         image_size=args.image_size,
         val_split=args.val_split,

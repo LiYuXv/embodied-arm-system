@@ -2,7 +2,7 @@
 
 力矩适配原理：原生 ACT 只读取 observation.state 作为机器人状态输入，
 observation.gripper_torque 会被忽略。因此把 torque 拼接到 state 末尾
-(7 -> 8 维)，特征形状与归一化统计量同步合并，模型侧零改动。
+(单臂 7+1 -> 8，双臂 14+2 -> 16)，特征形状与归一化统计量同步合并。
 """
 import numpy as np
 import torch
@@ -13,6 +13,9 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 
 TORQUE_KEY = "observation.gripper_torque"
 STATE_KEY = "observation.state"
+
+
+CAMERA_KEYS = tuple(f"observation.images.cam{i}" for i in range(1, 4))
 
 
 def get_cam_hw(metadata, cam_key="observation.images.cam1"):
@@ -66,6 +69,11 @@ def merge_torque_into_state_features(input_features):
         shape=(state_ft.shape[0] + torque_ft.shape[0],),
     )
     return input_features
+
+
+def camera_keys_for_features(features):
+    """Return canonical camera keys present in a dataset/policy feature map."""
+    return [key for key in CAMERA_KEYS if key in features]
 
 
 def merge_torque_stats(stats):

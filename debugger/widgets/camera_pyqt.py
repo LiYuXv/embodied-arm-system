@@ -89,6 +89,8 @@ class CameraDetectThread(QThread):
     def run(self):
         indices = []
         for idx in range(8):
+            if self.isInterruptionRequested():
+                break
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
                 ret, frame = cap.read()

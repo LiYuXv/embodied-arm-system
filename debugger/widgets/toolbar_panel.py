@@ -50,8 +50,9 @@ class ToolbarPanel(QWidget):
     safe_exit_requested = pyqtSignal()
     open_monitor_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, preferred_can_name="can0"):
         super().__init__(parent)
+        self._preferred_can_name = preferred_can_name or "can0"
         self._connected = False
         self._enabled = False
         self._interfaces = []
@@ -287,7 +288,10 @@ class ToolbarPanel(QWidget):
             self._refresh_can_interfaces()
 
     def _refresh_can_interfaces(self):
-        prev_text = self.can_combo.currentText().split(" ")[0].strip()
+        prev_text = (
+            self.can_combo.currentText().split(" ")[0].strip()
+            or self._preferred_can_name
+        )
         self.can_combo.clear()
 
         self._interfaces = detect_can_interfaces()
@@ -306,8 +310,10 @@ class ToolbarPanel(QWidget):
                 self._sync_bitrate_combo(bitrate)
 
         if not self._interfaces:
-            self.can_combo.addItem(f"can0 {tr('tb.no_can')}")
-            self.can_combo.setItemData(0, "can0")
+            self.can_combo.addItem(
+                f"{self._preferred_can_name} {tr('tb.no_can')}",
+                self._preferred_can_name,
+            )
 
         if restore_idx >= 0:
             self.can_combo.setCurrentIndex(restore_idx)

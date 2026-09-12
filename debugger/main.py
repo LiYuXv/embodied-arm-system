@@ -19,17 +19,24 @@ os.environ.setdefault("QT_API", "pyqt6")
 
 def main():
     parser = argparse.ArgumentParser(description="EL-A3 Robot Arm Debugger")
-    parser.add_argument("--can", default="can0", help="CAN interface name (default: can0)")
+    parser.add_argument(
+        "--can", default="can0",
+        help="Initial CAN interface in single-arm mode (default: can0)",
+    )
     parser.add_argument("--sim", action="store_true", help="Simulation mode (no hardware)")
+    parser.add_argument(
+        "--config",
+        default=str(SDK_ROOT / "resources" / "config" / "multi_arm_config.yaml"),
+        help="Dual-arm configuration file",
+    )
+    parser.add_argument(
+        "--mode", choices=("single", "dual"), default="dual",
+        help="Initial GUI mode (default: dual)",
+    )
     parser.add_argument(
         "--urdf",
         default=str(SDK_ROOT / "resources" / "urdf" / "el_a3.urdf"),
-        help="URDF file path",
-    )
-    parser.add_argument(
-        "--meshes",
-        default=str(SDK_ROOT / "resources" / "meshes"),
-        help="STL mesh directory",
+        help="URDF file used by single-arm forward kinematics",
     )
     parser.add_argument(
         "--log-level", default="INFO",
@@ -56,12 +63,17 @@ def main():
     app.setStyleSheet(THEMES[tm.theme])
     tm.theme_changed.connect(lambda t: app.setStyleSheet(THEMES[t]))
 
-    from debugger.main_window import MainWindow
-    window = MainWindow(
+    from el_a3_sdk import initialize_dual_arms
+    from debugger.window_coordinator import WindowCoordinator
+
+    manager = initialize_dual_arms(args.config, auto_connect=False)
+    coordinator = WindowCoordinator(
+        manager,
         urdf_path=args.urdf,
-        mesh_dir=args.meshes,
+        single_can_name=args.can,
+        sim_mode=args.sim,
     )
-    window.show()
+    coordinator.show(args.mode)
 
     sys.exit(app.exec())
 

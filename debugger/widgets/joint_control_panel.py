@@ -181,6 +181,14 @@ class JointControlPanel(QWidget):
         for i, lbl in enumerate(self._name_labels):
             lbl.setToolTip(tooltips[i])
 
+    def set_joint_names(self, names):
+        """Override row labels, e.g. expose L7 explicitly as the gripper."""
+        if len(names) != 7:
+            raise ValueError("joint names must contain 6 arm joints and 1 gripper")
+        for label, name in zip(self._name_labels, names):
+            label.setText(str(name))
+            label.setFixedWidth(44 if len(str(name)) > 2 else 28)
+
     def _slider_to_deg(self, joint_idx, slider_val):
         lo, hi = JOINT_LIMITS_DEG[joint_idx + 1]
         return lo + (hi - lo) * slider_val / SLIDER_RESOLUTION

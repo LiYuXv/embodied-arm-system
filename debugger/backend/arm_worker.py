@@ -50,9 +50,19 @@ class ArmWorker(QThread):
     # 使能前检查未通过（携带给用户的中文提示），由 UI 弹窗提示
     enable_rejected = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, arm=None, arm_name="arm", can_name=None):
+        """Create one worker for one mechanical-arm instance.
+
+        ``arm`` is optional for backwards compatibility.  The dual-arm GUI
+        passes the instances returned by :func:`initialize_dual_arms`, so the
+        worker never creates a second SDK object for the same CAN bus.
+        """
         super().__init__(parent)
-        self.arm: Optional[object] = None
+        self.arm: Optional[object] = arm
+        self.arm_name = arm_name
+        self.can_name = can_name or getattr(arm, "can_name", None) \
+            or getattr(arm, "_can_name", None)
+        self._arm_is_bound = arm is not None
         self.data_buffer = DataBuffer(max_samples=500, num_channels=7)
         self._running = False
         self._connected = False
@@ -183,6 +193,8 @@ class ArmWorker(QThread):
             self._do_stop_control_loop()
         elif cmd == "playback_trajectory":
             self._do_playback_trajectory(*args)
+        elif cmd == "refresh_feedback":
+            self._do_refresh_feedback()
         elif cmd == "set_smoothing_alpha":
             if self.arm and not self._sim_mode:
                 self.arm.SetSmoothingAlpha(args[0])
@@ -193,12 +205,13 @@ class ArmWorker(QThread):
         if self._connected:
             return
         self._sim_mode = sim_mode
+        self.can_name = can_name or self.can_name or "can0"
         if sim_mode:
             self._connected = True
             self.connected_changed.emit(True)
             self.log_message.emit("已连接（模拟模式）")
             return
-        if ELA3Interface is None:
+        if ELA3Interface is None and self.arm is None:
             self.error_occurred.emit("el_a3_sdk 未安装")
             return
 
@@ -214,22 +227,28 @@ class ArmWorker(QThread):
         try:
             sdk_root = Path(__file__).parent.parent.parent
             inertia_path = sdk_root / "resources" / "config" / "inertia_params.yaml"
-            kwargs = dict(can_name=can_name)
-            if inertia_path.exists():
-                kwargs["inertia_config_path"] = str(inertia_path)
-            kwargs["per_joint_kd_min"] = {4: 0.005, 5: 0.005, 6: 0.005, 7: 0.02}
-            kwargs["per_joint_kd_max"] = {4: 0.10, 5: 0.05, 6: 0.05, 7: 0.10}
-            if backend == "slcan":
-                kwargs["backend"] = "slcan"
-                kwargs["serial_port"] = serial_port or can_name
-                kwargs["serial_baudrate"] = serial_baudrate
-                kwargs["can_bitrate"] = can_bitrate
-            self.arm = ELA3Interface(**kwargs)
-            self.arm.ConnectPort()
+            if self.arm is None:
+                kwargs = dict(can_name=can_name)
+                if inertia_path.exists():
+                    kwargs["inertia_config_path"] = str(inertia_path)
+                kwargs["per_joint_kd_min"] = {4: 0.005, 5: 0.005, 6: 0.005, 7: 0.02}
+                kwargs["per_joint_kd_max"] = {4: 0.10, 5: 0.05, 6: 0.05, 7: 0.10}
+                if backend == "slcan":
+                    kwargs["backend"] = "slcan"
+                    kwargs["serial_port"] = serial_port or can_name
+                    kwargs["serial_baudrate"] = serial_baudrate
+                    kwargs["can_bitrate"] = can_bitrate
+                self.arm = ELA3Interface(**kwargs)
+            elif backend == "slcan":
+                raise ValueError("预绑定机械臂的通信后端由多臂配置决定，不能在 GUI 中切换")
+
+            connected = self.arm.ConnectPort()
+            if connected is False:
+                raise RuntimeError(f"{self.arm_name} 连接失败")
             self._connected = True
             self.connected_changed.emit(True)
             display_name = f"{serial_port or can_name} (SLCAN)" if backend == "slcan" else can_name
-            self.log_message.emit(f"已连接到 {display_name}")
+            self.log_message.emit(f"{self.arm_name} 已连接到 {display_name}")
             self._request_initial_feedback()
         except Exception as e:
             self.error_occurred.emit(f"连接失败: {e}")
@@ -249,7 +268,8 @@ class ArmWorker(QThread):
                 if self._enabled:
                     self.arm.DisableArm()
                 self.arm.DisconnectPort()
-                self.arm = None
+                if not self._arm_is_bound:
+                    self.arm = None
             self._connected = False
             self._enabled = False
             self.connected_changed.emit(False)
@@ -259,6 +279,16 @@ class ArmWorker(QThread):
             self.error_occurred.emit(f"断开失败: {e}")
         finally:
             self._cancel_gripper_move()
+
+    def _do_refresh_feedback(self):
+        """Immediately request and publish one feedback snapshot."""
+        if not self._connected:
+            self.log_message.emit(f"{self.arm_name} 未连接，无法刷新状态")
+            return
+        # Force the normally throttled status/motor/FPS branch as well.
+        self._slow_poll_counter = 9
+        self._poll_feedback()
+        self.log_message.emit(f"{self.arm_name} 状态已刷新")
 
     # ---- 使能前安全检查（角度单位：度） ----
     _ENABLE_JOINT_ABS_LIMIT_DEG = 50.0    # J1~J6 必须在 ±50° 以内

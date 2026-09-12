@@ -35,7 +35,7 @@ import threading
 import signal
 import argparse
 import logging
-from typing import Optional, List
+from typing import Callable, Optional, List
 
 import numpy as np
 
@@ -102,6 +102,11 @@ class VRArmController:
         scale: float = 1.0,
         filter_omega: float = 14.0,
         max_ik_jump: float = 0.5,
+        state_getter: Optional[Callable[[], object]] = None,
+        position_fix: Optional[np.ndarray] = None,
+        rotation_fix: Optional[np.ndarray] = None,
+        remap_rotation_rpy: bool = True,
+        input_name: str = "VR",
     ):
         self._arm = arm
         self._receiver = receiver
@@ -109,6 +114,15 @@ class VRArmController:
         self._dt = 1.0 / update_rate
         self._filter_omega = filter_omega
         self._max_ik_jump = max_ik_jump
+        self._state_getter = state_getter or receiver.get_right_state
+        self._position_fix = np.asarray(
+            _POS_FIX if position_fix is None else position_fix, dtype=float
+        )
+        self._rotation_fix = np.asarray(
+            _ROT_FIX if rotation_fix is None else rotation_fix, dtype=float
+        )
+        self._remap_rotation_rpy = remap_rotation_rpy
+        self._input_name = input_name
 
         self._kin = arm._get_kinematics()
         if self._kin is None:
@@ -126,6 +140,10 @@ class VRArmController:
         self._vr_anchor_rot = np.eye(3)
         self._ee_anchor_pos = np.zeros(3)
         self._ee_anchor_rot = np.eye(3)
+        # Joy-Con 摇杆平移使用独立锚点，不受 IMU 姿态离合影响。
+        self._translation_free_anchored = False
+        self._translation_input_anchor = np.zeros(3)
+        self._translation_ee_anchor = np.zeros(3)
 
         # 目标位姿（世界系）
         self._target_pos = np.zeros(3)
@@ -218,6 +236,7 @@ class VRArmController:
         self._target_pos = np.asarray(se3.translation, dtype=float).copy()
         self._target_rot = np.asarray(se3.rotation, dtype=float).copy()
         self._clutched = False
+        self._translation_free_anchored = False
         logger.info(
             "初始化完成, 当前末端: (%.3f, %.3f, %.3f) m",
             self._target_pos[0], self._target_pos[1], self._target_pos[2],
@@ -245,9 +264,13 @@ class VRArmController:
 
     def _print_banner(self):
         print("\n" + "=" * 52)
-        print("     EL-A3 VR 控制（Quest 3，纯 SDK 模式）")
+        print(f"     EL-A3 {self._input_name} 相对姿态控制（纯 SDK 模式）")
         print("=" * 52)
-        print("  Grip (侧键)  →  离合：按住跟随 / 松开冻结")
+        if "Joy-Con" in self._input_name:
+            print("  ZL/ZR        →  按住启用 IMU 姿态旋转 / 松开冻结旋转")
+            print("  摇杆 / 按键  →  XYZ 平移（无需离合）")
+        else:
+            print("  Grip (侧键)  →  离合：按住跟随 / 松开冻结")
         print("  摇杆 Y        →  夹爪（上推=闭合, 下拉=张开, 无需按住 Grip）")
         print("  A            →  回零位")
         print("  B            →  回工作位 (Home)")
@@ -256,12 +279,12 @@ class VRArmController:
         print(f"  运动缩放:    {self.scale:.1f}x")
         print(f"  末端目标:    ({self._target_pos[0]:.3f}, "
               f"{self._target_pos[1]:.3f}, {self._target_pos[2]:.3f}) m")
-        print("  等待 VR 数据... (确认 APK 中 IP 为本机地址)")
+        print(f"  等待 {self._input_name} 数据...")
 
     # ---- 主循环 ----
 
     def _tick(self):
-        ctrl = self._receiver.get_right_state()
+        ctrl = self._state_getter()
 
         # A/B 按键（边沿触发）
         if ctrl.button_a and not self._prev_btn_a:
@@ -327,39 +350,63 @@ class VRArmController:
                 logger.warning("夹爪控制失败: %s", e)
 
         gripped = ctrl.valid and ctrl.grip > GRIP_CLUTCH_THRESHOLD
+        translation_free = bool(
+            getattr(ctrl, "translation_without_clutch", False)
+        )
 
-        if not gripped:
-            # 离合释放：冻结机械臂（保持当前滤波位置）
+        if not ctrl.valid:
             self._clutched = False
             self._send_filtered()
             self._periodic_status(ctrl)
             return
 
-        if not self._clutched:
-            # Grip 刚按下：以当前手柄位姿和末端目标位姿重新锚定
-            self._vr_anchor_pos = ctrl.position * _POS_FIX
-            self._vr_anchor_rot = ctrl.rotation @ _ROT_FIX
-            self._ee_anchor_pos = self._target_pos.copy()
-            self._ee_anchor_rot = self._target_rot.copy()
-            self._clutched = True
-            logger.info("离合接合，已锚定")
-
         scale = float(self.scale)
+        input_pos = ctrl.position * self._position_fix
+        if translation_free:
+            if not self._translation_free_anchored:
+                self._translation_input_anchor = input_pos.copy()
+                self._translation_ee_anchor = self._target_pos.copy()
+                self._translation_free_anchored = True
+            target_pos = self._translation_ee_anchor + (
+                input_pos - self._translation_input_anchor
+            ) * scale
+        else:
+            target_pos = self._target_pos.copy()
 
-        vr_pos = ctrl.position * _POS_FIX
-        vr_rot = ctrl.rotation @ _ROT_FIX
+        if not gripped:
+            # 普通 VR 输入保持原有全位姿离合语义；Joy-Con 仅冻结旋转。
+            self._clutched = False
+            if not translation_free:
+                self._send_filtered()
+                self._periodic_status(ctrl)
+                return
+            target_rot = self._target_rot.copy()
 
-        # 相对平移：ee_anchor + (vr_current - vr_anchor) * scale（世界系增量）
-        target_pos = self._ee_anchor_pos + (vr_pos - self._vr_anchor_pos) * scale
+        else:
+            if not self._clutched:
+                # 离合刚按下：旋转从当前 IMU/末端姿态重新锚定。
+                self._vr_anchor_rot = ctrl.rotation @ self._rotation_fix
+                self._ee_anchor_rot = self._target_rot.copy()
+                if not translation_free:
+                    self._vr_anchor_pos = input_pos.copy()
+                    self._ee_anchor_pos = self._target_pos.copy()
+                self._clutched = True
+                logger.info("离合接合，已锚定")
 
-        # 相对旋转 1:1 跟随末端姿态；修正偏航/俯仰接反：
-        # 接收端处理后 dR 的 RPY 中 c[0]=手柄偏航、c[1]=手柄俯仰、c[2]=手柄横滚，
-        # 交换 c[0]与c[1] 使 手柄偏航→末端偏航、手柄俯仰→末端俯仰、横滚→横滚；
-        # c[1] 取负以纠正俯仰方向。
-        dR = self._vr_anchor_rot.T @ vr_rot
-        c = self._pin.rpy.matrixToRpy(dR)
-        target_rot = self._ee_anchor_rot @ self._pin.rpy.rpyToMatrix(
-            float(-c[1]), float(c[0]), float(c[2]))
+            if not translation_free:
+                target_pos = self._ee_anchor_pos + (
+                    input_pos - self._vr_anchor_pos
+                ) * scale
+
+            vr_rot = ctrl.rotation @ self._rotation_fix
+            # 相对旋转 1:1 跟随末端姿态。
+            dR = self._vr_anchor_rot.T @ vr_rot
+            if self._remap_rotation_rpy:
+                c = self._pin.rpy.matrixToRpy(dR)
+                target_rot = self._ee_anchor_rot @ self._pin.rpy.rpyToMatrix(
+                    float(-c[1]), float(c[0]), float(c[2]))
+            else:
+                target_rot = self._ee_anchor_rot @ dR
 
         self._target_pos = target_pos
         self._target_rot = target_rot
@@ -423,6 +470,7 @@ class VRArmController:
         self._target_pos = np.asarray(se3.translation, dtype=float).copy()
         self._target_rot = np.asarray(se3.rotation, dtype=float).copy()
         self._clutched = False
+        self._translation_free_anchored = False
 
     # ---- A/B 按键：异步移动到指定位形 ----
 
@@ -452,6 +500,7 @@ class VRArmController:
             self._target_pos = np.asarray(se3.translation, dtype=float).copy()
             self._target_rot = np.asarray(se3.rotation, dtype=float).copy()
             self._clutched = False
+            self._translation_free_anchored = False
             logger.info("已到达 %s", name)
         except Exception as e:
             logger.error("移动异常: %s", e)
@@ -498,7 +547,7 @@ class VRArmController:
         conn = "已连接" if connected else "等待数据"
         p = self._target_pos
         rpy = self._pin.rpy.matrixToRpy(self._target_rot)
-        print(f"  [VR:{conn}/{vr} 离合:{clutch}] "
+        print(f"  [{self._input_name}:{conn}/{vr} 离合:{clutch}] "
               f"目标: ({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f}) m  "
               f"({rpy[0]:+.2f},{rpy[1]:+.2f},{rpy[2]:+.2f}) rad  "
               f"ik_err={self.last_ik_err:.4f}")
