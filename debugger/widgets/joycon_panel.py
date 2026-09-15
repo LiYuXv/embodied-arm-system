@@ -17,6 +17,10 @@ from PyQt6.QtWidgets import (
 )
 
 from el_a3_sdk.joycon import (
+    JOYCON_MODE_IMU_MOTION,
+    JOYCON_MODE_STANDARD,
+    JOYCON_ROTATION_FIX,
+    JOYCON_ROTATION_VECTOR_SIGN,
     JoyConInput,
     JoyConPoseAdapter,
     discover_joycon,
@@ -74,6 +78,16 @@ class JoyConPanel(QWidget):
 
         control = QGroupBox("单臂遥操")
         control_layout = QVBoxLayout(control)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Joy-Con 控制模式："))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("标准模式", JOYCON_MODE_STANDARD)
+        self.mode_combo.addItem("IMU 动作模式（实验）", JOYCON_MODE_IMU_MOTION)
+        self.mode_combo.currentIndexChanged.connect(self._set_control_mode)
+        mode_row.addWidget(self.mode_combo)
+        mode_row.addStretch()
+        control_layout.addLayout(mode_row)
+
         control_row = QHBoxLayout()
         self.control_btn = QPushButton("开始遥操")
         self.control_btn.setObjectName("enableBtn")
@@ -98,8 +112,9 @@ class JoyConPanel(QWidget):
         layout.addWidget(control)
 
         help_label = QLabel(
-            "ZL/ZR：按住启用 IMU 姿态旋转  |  摇杆：末端 X/Y（无需离合）  |  "
-            "方向键或面键：Z/夹爪  |  "
+            "标准模式：摇杆/按键控制 XYZ（无需离合），ZL/ZR 只门控姿态。  |  "
+            "IMU 动作模式：按住 ZL/ZR，以手柄平移动作和姿态控制末端；松开立即冻结。  |  "
+            "方向键或面键：夹爪  |  "
             "摇杆按下：回零  |  L/R：回工作位"
         )
         help_label.setWordWrap(True)
@@ -138,6 +153,8 @@ class JoyConPanel(QWidget):
             binding = self._discovery_func(side)
             self._source = self._source_factory(binding)
             self._adapter = self._adapter_factory(self._source)
+            if hasattr(self._adapter, "set_mode"):
+                self._adapter.set_mode(self.mode_combo.currentData())
             self._adapter.start()
         except Exception as exc:
             self._source = None
@@ -204,8 +221,9 @@ class JoyConPanel(QWidget):
                 update_rate=100.0,
                 scale=self.scale_spin.value(),
                 position_fix=np.ones(3),
-                rotation_fix=np.eye(3),
+                rotation_fix=JOYCON_ROTATION_FIX,
                 remap_rotation_rpy=False,
+                rotation_vector_sign=JOYCON_ROTATION_VECTOR_SIGN,
                 input_name=f"Joy-Con ({'L' if self.side_combo.currentData() == 'left' else 'R'})",
             )
         except Exception as exc:
@@ -222,6 +240,14 @@ class JoyConPanel(QWidget):
         self._controller_thread.start()
         self.status_label.setText("Joy-Con 遥操中")
         self._update_buttons()
+        direction = ", ".join(
+            f"{axis} {'+' if sign > 0.0 else '-'}"
+            for axis, sign in zip(
+                ("RotVec-X", "RotVec-Y", "RotVec-Z"),
+                JOYCON_ROTATION_VECTOR_SIGN,
+            )
+        )
+        self.joycon_log.emit(f"Joy-Con 旋转向量符号已加载：{direction}")
         self.joycon_log.emit("Joy-Con 单臂遥操已启动")
 
     def _run_controller(self):
@@ -256,6 +282,15 @@ class JoyConPanel(QWidget):
         if self._controller is not None:
             self._controller.scale = float(value)
 
+    def _set_control_mode(self, _index):
+        if self._control_running:
+            return
+        mode = self.mode_combo.currentData()
+        if self._adapter is not None and hasattr(self._adapter, "set_mode"):
+            self._adapter.set_mode(mode)
+        label = self.mode_combo.currentText()
+        self.joycon_log.emit(f"Joy-Con 控制模式已切换为：{label}")
+
     def _refresh_state(self):
         if self._source is None:
             return
@@ -277,6 +312,7 @@ class JoyConPanel(QWidget):
         self.control_btn.setObjectName(
             "disconnectBtn" if self._control_running else "enableBtn"
         )
+        self.mode_combo.setEnabled(not self._control_running)
 
     def cleanup(self):
         if self._adapter is not None:

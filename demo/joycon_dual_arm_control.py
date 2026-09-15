@@ -22,6 +22,10 @@ except ImportError:  # 直接执行 demo/joycon_dual_arm_control.py
     from vr_control import VRArmController
 from el_a3_sdk import initialize_dual_arms
 from el_a3_sdk.joycon import (
+    JOYCON_CONTROL_MODES,
+    JOYCON_ROTATION_VECTOR_SIGN,
+    JOYCON_MODE_IMU_MOTION,
+    JOYCON_ROTATION_FIX,
     JoyConInput,
     JoyConPoseAdapter,
     JoyConUnavailableError,
@@ -54,21 +58,28 @@ def build_dual_joycon_controllers(
             update_rate=update_rate,
             scale=scale,
             position_fix=np.ones(3),
-            rotation_fix=np.eye(3),
+            rotation_fix=JOYCON_ROTATION_FIX,
             remap_rotation_rpy=False,
+            rotation_vector_sign=JOYCON_ROTATION_VECTOR_SIGN,
             input_name=f"Joy-Con ({'L' if side == 'left' else 'R'})",
         )
     return controllers
 
 
-def _print_mapping():
+def _print_mapping(mode: str):
     print("\nJoy-Con 双臂控制映射")
     print("  Joy-Con (L) -> left_arm  -> can0")
     print("  Joy-Con (R) -> right_arm -> can1")
-    print("  ZL / ZR      -> 按住启用 IMU 姿态旋转，松开冻结旋转")
-    print("  摇杆          -> 末端 X/Y 平移（无需离合）")
-    print("  L: ↑/↓       -> 末端 Z+/Z- 平移（无需离合）")
-    print("  R: X/B       -> 末端 Z+/Z- 平移（无需离合）")
+    if mode == JOYCON_MODE_IMU_MOTION:
+        print("  模式           -> IMU 动作模式（实验）")
+        print("  ZL / ZR      -> 总离合；按住控制 XYZ + 姿态，松开立即冻结")
+        print("  平移动作       -> 姿态补偿后的加速度生成末端 XYZ 速度")
+    else:
+        print("  模式           -> 标准模式")
+        print("  ZL / ZR      -> 按住启用 IMU 姿态旋转，松开冻结旋转")
+        print("  摇杆          -> 末端 X/Y 平移（无需离合）")
+        print("  L: ↑/↓       -> 末端 Z+/Z- 平移（无需离合）")
+        print("  R: X/B       -> 末端 Z+/Z- 平移（无需离合）")
     print("  L: →/←       -> 夹爪张开/闭合")
     print("  R: A/Y       -> 夹爪张开/闭合")
     print("  摇杆按下      -> 回零位")
@@ -82,8 +93,12 @@ def main() -> int:
     parser.add_argument("--rate", type=float, default=100.0, help="控制频率 Hz")
     parser.add_argument("--scale", type=float, default=1.0, help="相对运动缩放")
     parser.add_argument(
+        "--mode", choices=JOYCON_CONTROL_MODES, default="standard",
+        help="Joy-Con 控制模式：standard 或 imu_motion（实验）",
+    )
+    parser.add_argument(
         "--translation-speed", type=float, default=0.12,
-        help="摇杆最大平移速度 m/s",
+        help="标准模式摇杆速度或 IMU 动作模式 XYZ 速度上限，单位 m/s",
     )
     parser.add_argument("--deadzone", type=float, default=0.15, help="摇杆死区")
     parser.add_argument("--debug", action="store_true")
@@ -120,6 +135,7 @@ def main() -> int:
     adapters = {
         side: JoyConPoseAdapter(
             source,
+            mode=args.mode,
             translation_speed=args.translation_speed,
             deadzone=args.deadzone,
         )
@@ -154,7 +170,7 @@ def main() -> int:
             update_rate=args.rate,
             scale=args.scale,
         )
-        _print_mapping()
+        _print_mapping(args.mode)
         for side, controller in controllers.items():
             thread = threading.Thread(
                 target=controller.start,

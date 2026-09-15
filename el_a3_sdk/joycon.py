@@ -3,7 +3,7 @@
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -17,6 +17,25 @@ from el_a3_sdk.controller_profiles import (
 
 class JoyConUnavailableError(RuntimeError):
     """evdev 不可用或左右 Joy-Con 节点不完整。"""
+
+
+JOYCON_MODE_STANDARD = "standard"
+JOYCON_MODE_IMU_MOTION = "imu_motion"
+JOYCON_CONTROL_MODES = (JOYCON_MODE_STANDARD, JOYCON_MODE_IMU_MOTION)
+STANDARD_GRAVITY = 9.80665
+
+# Joy-Con IMU 到机械臂末端姿态轴的纯轴置换。
+# 这里不编码方向正负，只负责把原始轴循环关系校正为 Roll/Pitch/Yaw 一一对应。
+JOYCON_ROTATION_FIX = np.array([
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+])
+# 姿态方向在 SO(3) rotation vector 上逐轴修正，避免欧拉角分解/重构耦合。
+# 2026-09-15 Joy-Con R 单臂逐轴标定：X=-1 时俯仰正确，
+# Y=+1 时偏航正确，两者已锁定不再改动。本轮只将 Z 从 +1
+# 改为 -1，单独标定剩余的滚转方向。
+JOYCON_ROTATION_VECTOR_SIGN = np.array([-1.0, 1.0, -1.0])
 
 
 class LinuxEventCodes:
@@ -94,6 +113,10 @@ class JoyConSnapshot:
     zero: bool
     home: bool
     exit: bool
+    # 已经姿态补偿到固定世界系并去除重力，单位 m/s^2。
+    linear_acceleration: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # Joy-Con 本体系角速度，单位 rad/s；供静止检测使用。
+    angular_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 
 @dataclass(frozen=True)
@@ -218,12 +241,12 @@ def discover_joycons(
 
     pair = JoyConPair(left=bindings["left"], right=bindings["right"])
     if owns_devices:
-        selected = {
+        selected = (
             pair.left.control_device,
             pair.left.imu_device,
             pair.right.control_device,
             pair.right.imu_device,
-        }
+        )
         for device in devices:
             if device not in selected:
                 try:
@@ -294,7 +317,7 @@ def discover_joycon(
 
     binding = JoyConDeviceBinding(side, *matches[0])
     if owns_devices:
-        selected = {binding.control_device, binding.imu_device}
+        selected = (binding.control_device, binding.imu_device)
         for device in all_devices:
             if device not in selected:
                 try:
@@ -362,6 +385,11 @@ class ImuOrientationFilter:
     @property
     def rotation(self) -> np.ndarray:
         return self._reference.T @ self._rotation
+
+    @property
+    def world_rotation(self) -> np.ndarray:
+        """从 Joy-Con 传感器系旋转到重力对齐固定系。"""
+        return self._rotation.copy()
 
     @property
     def gyro_bias(self) -> np.ndarray:
@@ -442,6 +470,8 @@ class JoyConInput:
         self._stick = np.zeros(2)
         self._buttons = set()
         self._axis_values = np.zeros(6)
+        self._linear_acceleration = np.zeros(3)
+        self._angular_velocity = np.zeros(3)
         self._last_imu_time: Optional[float] = None
         self._orientation = ImuOrientationFilter()
         self._stick_calibration = self._read_stick_calibration()
@@ -574,6 +604,11 @@ class JoyConInput:
             gyro_rad_s = np.deg2rad(gyro_dps)
             self._orientation.update(accel_g, gyro_rad_s, sample_time)
             if self._orientation.initialized:
+                accel_world_g = self._orientation.world_rotation @ accel_g
+                self._linear_acceleration = (
+                    accel_world_g - np.array([0.0, 0.0, 1.0])
+                ) * STANDARD_GRAVITY
+                self._angular_velocity = gyro_rad_s.copy()
                 self._last_imu_time = self._clock()
 
     def recenter_orientation(self):
@@ -606,6 +641,8 @@ class JoyConInput:
                 zero=pressed(self._code(self.profile.zero)),
                 home=pressed(self._code(self.profile.home)),
                 exit=pressed(self._code(self.profile.exit)),
+                linear_acceleration=self._linear_acceleration.copy(),
+                angular_velocity=self._angular_velocity.copy(),
             )
 
 
@@ -615,20 +652,75 @@ class JoyConPoseAdapter:
     def __init__(
         self,
         source: JoyConInput,
+        mode: str = JOYCON_MODE_STANDARD,
         translation_speed: float = 0.12,
         deadzone: float = 0.15,
+        accel_lowpass_tau: float = 0.08,
+        accel_deadzone: float = 0.35,
+        velocity_damping: float = 4.0,
+        stationary_accel_threshold: float = 0.20,
+        stationary_gyro_threshold: float = 0.08,
+        stationary_time: float = 0.20,
+        max_dt: float = 0.05,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.source = source
+        self._mode = self._validate_mode(mode)
         self.translation_speed = float(translation_speed)
         self.deadzone = float(deadzone)
+        self.accel_lowpass_tau = max(float(accel_lowpass_tau), 0.0)
+        self.accel_deadzone = max(float(accel_deadzone), 0.0)
+        self.velocity_damping = max(float(velocity_damping), 0.0)
+        self.stationary_accel_threshold = max(
+            float(stationary_accel_threshold), 0.0
+        )
+        self.stationary_gyro_threshold = max(
+            float(stationary_gyro_threshold), 0.0
+        )
+        self.stationary_time = max(float(stationary_time), 0.0)
+        self.max_dt = max(float(max_dt), 1e-4)
         self._clock = clock
         self._position = np.zeros(3)
+        self._virtual_velocity = np.zeros(3)
+        self._filtered_acceleration = np.zeros(3)
+        self._stationary_elapsed = 0.0
+        self._clutch_held = False
         self._last_time = self._clock()
         self.exit_requested = False
 
+    @staticmethod
+    def _validate_mode(mode: str) -> str:
+        if mode not in JOYCON_CONTROL_MODES:
+            raise ValueError(
+                f"unknown Joy-Con control mode {mode!r}; "
+                f"expected one of {JOYCON_CONTROL_MODES}"
+            )
+        return mode
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def virtual_velocity(self) -> np.ndarray:
+        return self._virtual_velocity.copy()
+
+    def set_mode(self, mode: str):
+        """切换控制语义；调用方应保证遥操处于停止状态。"""
+        self._mode = self._validate_mode(mode)
+        self._reset_imu_motion()
+        self._clutch_held = False
+        self._last_time = self._clock()
+
+    def _reset_imu_motion(self):
+        self._virtual_velocity.fill(0.0)
+        self._filtered_acceleration.fill(0.0)
+        self._stationary_elapsed = 0.0
+
     def start(self):
         self._last_time = self._clock()
+        self._reset_imu_motion()
+        self._clutch_held = False
         self.source.start()
 
     def stop(self):
@@ -643,24 +735,96 @@ class JoyConPoseAdapter:
         sign = 1.0 if value > 0.0 else -1.0
         return sign * (abs(value) - self.deadzone) / (1.0 - self.deadzone)
 
+    def _update_imu_motion(self, state: JoyConSnapshot, dt: float, dt_valid: bool):
+        clutch = bool(state.valid and state.clutch)
+        just_engaged = clutch and not self._clutch_held
+        self._clutch_held = clutch
+
+        if not clutch or just_engaged or not dt_valid:
+            # 松开后立即冻结；重新按下时从零速度、当前姿态重新锚定。
+            self._reset_imu_motion()
+            return
+
+        acceleration = np.asarray(
+            getattr(state, "linear_acceleration", np.zeros(3)), dtype=float
+        )
+        angular_velocity = np.asarray(
+            getattr(state, "angular_velocity", np.zeros(3)), dtype=float
+        )
+        if acceleration.shape != (3,) or not np.all(np.isfinite(acceleration)):
+            self._reset_imu_motion()
+            return
+
+        if self.accel_lowpass_tau <= 0.0:
+            alpha = 1.0
+        else:
+            alpha = 1.0 - math.exp(-dt / self.accel_lowpass_tau)
+        self._filtered_acceleration += alpha * (
+            acceleration - self._filtered_acceleration
+        )
+
+        accel_norm = float(np.linalg.norm(self._filtered_acceleration))
+        if accel_norm <= self.accel_deadzone:
+            effective_acceleration = np.zeros(3)
+        else:
+            effective_acceleration = self._filtered_acceleration * (
+                (accel_norm - self.accel_deadzone) / accel_norm
+            )
+
+        gyro_norm = (
+            float(np.linalg.norm(angular_velocity))
+            if angular_velocity.shape == (3,) and np.all(np.isfinite(angular_velocity))
+            else math.inf
+        )
+        if (
+            accel_norm <= self.stationary_accel_threshold
+            and gyro_norm <= self.stationary_gyro_threshold
+        ):
+            self._stationary_elapsed += dt
+        else:
+            self._stationary_elapsed = 0.0
+
+        damping = math.exp(-self.velocity_damping * dt)
+        self._virtual_velocity = (
+            self._virtual_velocity * damping + effective_acceleration * dt
+        )
+        speed = float(np.linalg.norm(self._virtual_velocity))
+        if speed > self.translation_speed > 0.0:
+            self._virtual_velocity *= self.translation_speed / speed
+        if self._stationary_elapsed >= self.stationary_time:
+            self._virtual_velocity.fill(0.0)
+
+        # 这里只把虚拟速度转换成机械臂每周期 XYZ 增量；它不是手柄位置估计。
+        self._position += self._virtual_velocity * dt
+
     def get_state(self) -> RelativePoseInput:
         now = self._clock()
-        dt = min(max(now - self._last_time, 0.0), 0.05)
+        raw_dt = now - self._last_time
         self._last_time = now
+        dt_valid = 0.0 < raw_dt <= self.max_dt
         state = self.source.snapshot()
 
         connected = self.source.is_connected()
-        if connected:
+        if self._mode == JOYCON_MODE_STANDARD and connected:
+            # 保留标准模式原有的 dt 截断行为。
+            dt = min(max(raw_dt, 0.0), 0.05)
             velocity = np.array([
-                -self._deadzone(state.stick_y),
-                -self._deadzone(state.stick_x),
+                self._deadzone(state.stick_y),
+                self._deadzone(state.stick_x),
                 float(state.z_positive) - float(state.z_negative),
             ]) * self.translation_speed
             self._position += velocity * dt
+            self._clutch_held = bool(state.valid and state.clutch)
+        elif self._mode == JOYCON_MODE_IMU_MOTION and connected:
+            dt = raw_dt if dt_valid else 0.0
+            self._update_imu_motion(state, dt, dt_valid)
+        else:
+            self._reset_imu_motion()
+            self._clutch_held = False
 
         self.exit_requested = self.exit_requested or state.exit
         return RelativePoseInput(
-            # 平移只依赖按键/摇杆连接，不依赖 IMU 或离合。
+            # 标准模式平移不依赖 IMU；动作模式的全位姿由有效离合门控。
             valid=connected,
             position=self._position.copy(),
             rotation=state.rotation.copy(),
@@ -668,6 +832,7 @@ class JoyConPoseAdapter:
             joystick_y=float(state.gripper_close) - float(state.gripper_open),
             button_a=state.zero,
             button_b=state.home,
+            # 动作模式虽使用独立的累计输出锚点，但松开离合时适配器立即停止累计。
             translation_without_clutch=True,
         )
 

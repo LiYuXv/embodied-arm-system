@@ -16,6 +16,10 @@ from demo.joycon_dual_arm_control import build_dual_joycon_controllers
 from demo.vr_control import VRArmController
 from el_a3_sdk.controller_profiles import JOYCON_PROFILES
 from el_a3_sdk.joycon import (
+    JOYCON_ROTATION_VECTOR_SIGN,
+    JOYCON_MODE_IMU_MOTION,
+    JOYCON_MODE_STANDARD,
+    JOYCON_ROTATION_FIX,
     ImuOrientationFilter,
     JoyConDeviceBinding,
     JoyConInput,
@@ -165,6 +169,7 @@ class TestJoyConInput(unittest.TestCase):
         self.assertAlmostEqual(state.stick_x, 0.5, places=2)
         self.assertAlmostEqual(state.stick_y, -0.5, places=2)
         np.testing.assert_allclose(state.rotation, np.eye(3), atol=1e-8)
+        np.testing.assert_allclose(state.linear_acceleration, np.zeros(3), atol=1e-8)
 
         # ZL/ZR 是按住式姿态离合，松开立即释放。
         self.source.handle_control_event(
@@ -193,6 +198,28 @@ class TestJoyConInput(unittest.TestCase):
         state = self.source.snapshot()
         self.assertFalse(state.valid)
         self.assertFalse(state.clutch)
+
+    def test_acceleration_is_rotated_to_fixed_frame_and_gravity_removed(self):
+        # 即使传感器的重力轴不是本体系 Z，初始化姿态补偿后静止线加速度也应为零。
+        for code, value in (
+            (LinuxEventCodes.ABS_X, 4096),
+            (LinuxEventCodes.ABS_Y, 0),
+            (LinuxEventCodes.ABS_Z, 0),
+            (LinuxEventCodes.ABS_RX, 0),
+            (LinuxEventCodes.ABS_RY, 0),
+            (LinuxEventCodes.ABS_RZ, 0),
+        ):
+            self.source.handle_imu_event(LinuxEventCodes.EV_ABS, code, value)
+        self.source.handle_imu_event(
+            LinuxEventCodes.EV_SYN,
+            LinuxEventCodes.SYN_REPORT,
+            0,
+            self.clock(),
+        )
+
+        np.testing.assert_allclose(
+            self.source.snapshot().linear_acceleration, np.zeros(3), atol=1e-8
+        )
 
     def test_right_profile_uses_right_stick_and_zr_clutch(self):
         source = JoyConInput(
@@ -296,13 +323,22 @@ class FakeSource:
         return True
 
 
-def snapshot(clutch=False, stick_y=0.0):
+def snapshot(
+    clutch=False,
+    stick_y=0.0,
+    stick_x=0.0,
+    *,
+    valid=True,
+    acceleration=None,
+    angular_velocity=None,
+    rotation=None,
+):
     return JoyConSnapshot(
         side="left",
-        valid=True,
-        stick_x=0.0,
+        valid=valid,
+        stick_x=stick_x,
         stick_y=stick_y,
-        rotation=np.eye(3),
+        rotation=np.eye(3) if rotation is None else np.asarray(rotation, dtype=float),
         clutch=clutch,
         z_positive=False,
         z_negative=False,
@@ -311,18 +347,61 @@ def snapshot(clutch=False, stick_y=0.0):
         zero=False,
         home=False,
         exit=False,
+        linear_acceleration=np.zeros(3) if acceleration is None else np.asarray(acceleration, dtype=float),
+        angular_velocity=np.zeros(3) if angular_velocity is None else np.asarray(angular_velocity, dtype=float),
     )
+
+
+def axis_rotation(axis, angle):
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    skew = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    return np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
+
+
+class TestJoyConRotationCalibration(unittest.TestCase):
+    def test_rotation_vector_sign_keeps_pitch_yaw_and_only_flips_z(self):
+        np.testing.assert_allclose(JOYCON_ROTATION_VECTOR_SIGN, [-1.0, 1.0, -1.0])
+
+    def test_mixed_rotation_vector_components_apply_signs_independently(self):
+        import pinocchio as pin
+
+        rotvec = np.array([0.20, -0.13, 0.17], dtype=float)
+        dR = pin.exp3(rotvec)
+        measured = np.asarray(pin.log3(dR), dtype=float)
+        corrected = pin.exp3(measured * JOYCON_ROTATION_VECTOR_SIGN)
+        corrected_rotvec = np.asarray(pin.log3(corrected), dtype=float)
+        np.testing.assert_allclose(
+            corrected_rotvec,
+            rotvec * JOYCON_ROTATION_VECTOR_SIGN,
+            atol=1e-10,
+        )
+
+    def test_rotation_fix_only_permutates_axes_without_direction_signs(self):
+        # 第一次真机校正已经确认轴对应：raw Y→Roll/X, raw Z→Pitch/Y, raw X→Yaw/Z。
+        observed_to_target = (
+            ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
+            ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+            ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        )
+        for raw_axis, target_axis in observed_to_target:
+            raw_rotation = axis_rotation(raw_axis, 0.2)
+            corrected = JOYCON_ROTATION_FIX.T @ raw_rotation @ JOYCON_ROTATION_FIX
+            expected = axis_rotation(target_axis, 0.2)
+            np.testing.assert_allclose(corrected, expected, atol=1e-10)
+        self.assertAlmostEqual(np.linalg.det(JOYCON_ROTATION_FIX), 1.0)
 
 
 class TestJoyConPoseAdapter(unittest.TestCase):
     def test_translation_does_not_require_rotation_clutch(self):
         clock = FakeClock()
-        source = FakeSource(snapshot(clutch=False, stick_y=-1.0))
+        source = FakeSource(snapshot(clutch=False, stick_y=1.0))
         adapter = JoyConPoseAdapter(source, translation_speed=1.0, clock=clock)
 
         clock.advance(0.05)
         released = adapter.get_state()
-        source.state = snapshot(clutch=True, stick_y=-1.0)
+        source.state = snapshot(clutch=True, stick_y=1.0)
         clock.advance(0.05)
         engaged = adapter.get_state()
 
@@ -331,6 +410,154 @@ class TestJoyConPoseAdapter(unittest.TestCase):
         self.assertEqual(released.grip, 0.0)
         self.assertEqual(engaged.grip, 1.0)
         self.assertTrue(released.translation_without_clutch)
+
+    def test_standard_mode_positive_stick_x_moves_positive_y(self):
+        clock = FakeClock()
+        source = FakeSource(snapshot(stick_x=1.0))
+        adapter = JoyConPoseAdapter(source, translation_speed=1.0, clock=clock)
+        clock.advance(0.05)
+        state = adapter.get_state()
+        np.testing.assert_allclose(state.position, [0.0, 0.05, 0.0])
+
+    def test_rejects_unknown_control_mode(self):
+        with self.assertRaises(ValueError):
+            JoyConPoseAdapter(FakeSource(snapshot()), mode="space_position")
+
+    def test_imu_motion_total_clutch_freezes_and_restarts_from_zero_velocity(self):
+        clock = FakeClock()
+        source = FakeSource(snapshot(clutch=False, acceleration=[1.0, 0.0, 0.0]))
+        adapter = JoyConPoseAdapter(
+            source,
+            mode=JOYCON_MODE_IMU_MOTION,
+            translation_speed=10.0,
+            accel_lowpass_tau=0.0,
+            accel_deadzone=0.0,
+            velocity_damping=0.0,
+            stationary_time=1.0,
+            clock=clock,
+        )
+
+        clock.advance(0.04)
+        released = adapter.get_state()
+        source.state = snapshot(clutch=True, acceleration=[1.0, 0.0, 0.0])
+        clock.advance(0.04)
+        engaged = adapter.get_state()  # 按下边沿只清零并重新锚定。
+        clock.advance(0.04)
+        moving = adapter.get_state()
+
+        np.testing.assert_allclose(released.position, np.zeros(3))
+        np.testing.assert_allclose(engaged.position, np.zeros(3))
+        np.testing.assert_allclose(adapter.virtual_velocity, [0.04, 0.0, 0.0])
+        np.testing.assert_allclose(moving.position, [0.0016, 0.0, 0.0])
+
+        source.state = snapshot(clutch=False, acceleration=[5.0, 0.0, 0.0])
+        clock.advance(0.04)
+        frozen = adapter.get_state()
+        np.testing.assert_allclose(frozen.position, moving.position)
+        np.testing.assert_allclose(adapter.virtual_velocity, np.zeros(3))
+        self.assertEqual(frozen.grip, 0.0)
+
+        source.state = snapshot(clutch=True, acceleration=[5.0, 0.0, 0.0])
+        clock.advance(0.04)
+        adapter.get_state()
+        np.testing.assert_allclose(adapter.virtual_velocity, np.zeros(3))
+
+    def test_imu_motion_lowpass_deadzone_damping_and_speed_limit(self):
+        clock = FakeClock()
+        source = FakeSource(snapshot(clutch=True, acceleration=[1.0, 0.0, 0.0]))
+        adapter = JoyConPoseAdapter(
+            source,
+            mode=JOYCON_MODE_IMU_MOTION,
+            translation_speed=0.2,
+            accel_lowpass_tau=0.04,
+            accel_deadzone=0.5,
+            velocity_damping=4.0,
+            stationary_time=1.0,
+            clock=clock,
+        )
+
+        clock.advance(0.04)
+        adapter.get_state()  # 离合按下边沿。
+        clock.advance(0.02)
+        adapter.get_state()  # 低通后仍在死区内。
+        np.testing.assert_allclose(adapter.virtual_velocity, np.zeros(3))
+        clock.advance(0.04)
+        adapter.get_state()
+        speed_before_damping = float(np.linalg.norm(adapter.virtual_velocity))
+        self.assertGreater(speed_before_damping, 0.0)
+
+        source.state = snapshot(
+            clutch=True,
+            acceleration=[0.0, 0.0, 0.0],
+            angular_velocity=[1.0, 0.0, 0.0],
+        )
+        adapter.accel_lowpass_tau = 0.0
+        adapter.accel_deadzone = 0.0
+        clock.advance(0.04)
+        adapter.get_state()
+        self.assertLess(np.linalg.norm(adapter.virtual_velocity), speed_before_damping)
+
+        source.state = snapshot(clutch=True, acceleration=[100.0, 0.0, 0.0])
+        clock.advance(0.04)
+        adapter.get_state()
+        self.assertLessEqual(np.linalg.norm(adapter.virtual_velocity), 0.2 + 1e-12)
+
+    def test_imu_motion_stationary_update_and_abnormal_dt_zero_velocity(self):
+        clock = FakeClock()
+        source = FakeSource(snapshot(clutch=True, acceleration=[2.0, 0.0, 0.0]))
+        adapter = JoyConPoseAdapter(
+            source,
+            mode=JOYCON_MODE_IMU_MOTION,
+            translation_speed=1.0,
+            accel_lowpass_tau=0.0,
+            accel_deadzone=0.0,
+            velocity_damping=0.0,
+            stationary_time=0.08,
+            max_dt=0.05,
+            clock=clock,
+        )
+
+        clock.advance(0.04)
+        adapter.get_state()
+        clock.advance(0.04)
+        moving = adapter.get_state()
+        self.assertGreater(np.linalg.norm(adapter.virtual_velocity), 0.0)
+
+        source.state = snapshot(clutch=True)
+        clock.advance(0.04)
+        adapter.get_state()
+        clock.advance(0.04)
+        stopped = adapter.get_state()
+        np.testing.assert_allclose(adapter.virtual_velocity, np.zeros(3))
+
+        source.state = snapshot(clutch=True, acceleration=[10.0, 0.0, 0.0])
+        clock.advance(1.0)
+        protected = adapter.get_state()
+        np.testing.assert_allclose(protected.position, stopped.position)
+        np.testing.assert_allclose(adapter.virtual_velocity, np.zeros(3))
+
+    def test_switching_modes_resets_imu_motion_state(self):
+        clock = FakeClock()
+        source = FakeSource(snapshot(clutch=True, acceleration=[1.0, 0.0, 0.0]))
+        adapter = JoyConPoseAdapter(
+            source,
+            mode=JOYCON_MODE_IMU_MOTION,
+            translation_speed=1.0,
+            accel_lowpass_tau=0.0,
+            accel_deadzone=0.0,
+            velocity_damping=0.0,
+            stationary_time=1.0,
+            clock=clock,
+        )
+        clock.advance(0.04)
+        adapter.get_state()
+        clock.advance(0.04)
+        adapter.get_state()
+        self.assertGreater(np.linalg.norm(adapter.virtual_velocity), 0.0)
+
+        adapter.set_mode(JOYCON_MODE_STANDARD)
+        self.assertEqual(adapter.mode, JOYCON_MODE_STANDARD)
+        np.testing.assert_allclose(adapter.virtual_velocity, np.zeros(3))
 
     def test_controller_gates_rotation_but_not_xyz_translation(self):
         class FakeRpy:
@@ -399,7 +626,15 @@ class TestJoyConPoseAdapter(unittest.TestCase):
             )
 
         receiver = FakeReceiver()
-        fake_pinocchio = SimpleNamespace(rpy=FakeRpy())
+        fake_pinocchio = SimpleNamespace(
+            rpy=FakeRpy(),
+            log3=lambda rotation: np.array([
+                0.0,
+                0.0,
+                np.arctan2(rotation[1, 0], rotation[0, 0]),
+            ]),
+            exp3=lambda vector: rotation_z(float(np.asarray(vector)[2])),
+        )
         with patch.dict(sys.modules, {"pinocchio": fake_pinocchio}):
             controller = VRArmController(
                 FakeArm(),
@@ -408,6 +643,7 @@ class TestJoyConPoseAdapter(unittest.TestCase):
                 position_fix=np.ones(3),
                 rotation_fix=np.eye(3),
                 remap_rotation_rpy=False,
+                rotation_vector_sign=JOYCON_ROTATION_VECTOR_SIGN,
                 input_name="Joy-Con (L)",
             )
         controller._initialize()
@@ -424,7 +660,11 @@ class TestJoyConPoseAdapter(unittest.TestCase):
         receiver.state = relative_state([0.1, 0, 0], rotation_z(np.pi), grip=1.0)
         controller._tick()
         held_rotation = controller._target_rot.copy()
-        np.testing.assert_allclose(held_rotation, rotation_z(np.pi / 2), atol=1e-8)
+        np.testing.assert_allclose(
+            held_rotation,
+            rotation_z(np.pi / 2 * JOYCON_ROTATION_VECTOR_SIGN[2]),
+            atol=1e-8,
+        )
 
         receiver.state = relative_state([0.2, 0, 0], np.eye(3), grip=0.0)
         controller._tick()
@@ -456,6 +696,18 @@ class TestDualArmBinding(unittest.TestCase):
         self.assertIs(controllers["right"].kwargs["arm"], right_arm)
         self.assertIs(controllers["left"].kwargs["receiver"], left_adapter)
         self.assertIs(controllers["right"].kwargs["receiver"], right_adapter)
+        np.testing.assert_allclose(
+            controllers["left"].kwargs["rotation_fix"], JOYCON_ROTATION_FIX
+        )
+        np.testing.assert_allclose(
+            controllers["right"].kwargs["rotation_fix"], JOYCON_ROTATION_FIX
+        )
+        np.testing.assert_allclose(
+            controllers["left"].kwargs["rotation_vector_sign"], JOYCON_ROTATION_VECTOR_SIGN
+        )
+        np.testing.assert_allclose(
+            controllers["right"].kwargs["rotation_vector_sign"], JOYCON_ROTATION_VECTOR_SIGN
+        )
         self.assertFalse(controllers["left"].kwargs["remap_rotation_rpy"])
 
 

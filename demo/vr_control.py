@@ -106,6 +106,7 @@ class VRArmController:
         position_fix: Optional[np.ndarray] = None,
         rotation_fix: Optional[np.ndarray] = None,
         remap_rotation_rpy: bool = True,
+        rotation_vector_sign: Optional[np.ndarray] = None,
         input_name: str = "VR",
     ):
         self._arm = arm
@@ -122,6 +123,13 @@ class VRArmController:
             _ROT_FIX if rotation_fix is None else rotation_fix, dtype=float
         )
         self._remap_rotation_rpy = remap_rotation_rpy
+        self._use_rotation_vector_sign = rotation_vector_sign is not None
+        self._rotation_vector_sign = np.asarray(
+            np.ones(3) if rotation_vector_sign is None else rotation_vector_sign,
+            dtype=float,
+        )
+        if self._rotation_vector_sign.shape != (3,):
+            raise ValueError("rotation_vector_sign must have shape (3,)")
         self._input_name = input_name
 
         self._kin = arm._get_kinematics()
@@ -402,9 +410,19 @@ class VRArmController:
             # 相对旋转 1:1 跟随末端姿态。
             dR = self._vr_anchor_rot.T @ vr_rot
             if self._remap_rotation_rpy:
-                c = self._pin.rpy.matrixToRpy(dR)
+                # 保留 Quest VR 原有的 RPY 轴重映射行为。
+                c = np.asarray(self._pin.rpy.matrixToRpy(dR), dtype=float)
+                c = np.array([-c[1], c[0], c[2]], dtype=float)
                 target_rot = self._ee_anchor_rot @ self._pin.rpy.rpyToMatrix(
-                    float(-c[1]), float(c[0]), float(c[2]))
+                    float(c[0]), float(c[1]), float(c[2])
+                )
+            elif self._use_rotation_vector_sign:
+                # Joy-Con：在 SO(3) 对数映射得到的 rotation vector 上逐轴修正方向，
+                # 再用 exp3 回到旋转矩阵。即使三轴符号全为 +1 也保持该路径，
+                # 避免逐轴标定时因切换算法分支干扰真机判断。
+                rotvec = np.asarray(self._pin.log3(dR), dtype=float)
+                corrected_rotvec = rotvec * self._rotation_vector_sign
+                target_rot = self._ee_anchor_rot @ self._pin.exp3(corrected_rotvec)
             else:
                 target_rot = self._ee_anchor_rot @ dR
 

@@ -45,6 +45,7 @@ from debugger.main_window import MainWindow
 from debugger.window_coordinator import WindowCoordinator
 from debugger.widgets.joycon_panel import JoyConPanel
 from debugger.widgets.triple_camera_panel import CameraStreamWidget, TripleCameraPanel
+from el_a3_sdk.joycon import JOYCON_ROTATION_FIX, JOYCON_ROTATION_VECTOR_SIGN
 
 
 class FakeArm:
@@ -439,6 +440,10 @@ class FakeJoyConAdapter:
     def __init__(self, source):
         self.source = source
         self.exit_requested = False
+        self.mode = "standard"
+
+    def set_mode(self, mode):
+        self.mode = mode
 
     def start(self):
         self.source.running = True
@@ -497,16 +502,28 @@ class TestSingleArmJoyConPanel(QtTestCase):
         arm = FakeTeleopArm()
         panel.set_arm(arm)
         panel.set_arm_enabled(True)
+        panel.mode_combo.setCurrentIndex(1)
         panel._connect_input()
+        self.assertEqual(panel._adapter.mode, "imu_motion")
         panel._start_control()
         controller = FakeJoyConController.instances[-1]
         self.assertTrue(controller.started.wait(1.0))
+        self.assertFalse(panel.mode_combo.isEnabled())
 
         self.assertEqual(discovered, ["left"])
         self.assertIs(controller.kwargs["arm"], arm)
         self.assertIs(controller.kwargs["receiver"], panel._adapter)
         self.assertFalse(controller.kwargs["remap_rotation_rpy"])
+        np.testing.assert_allclose(
+            controller.kwargs["rotation_fix"], JOYCON_ROTATION_FIX
+        )
+        np.testing.assert_allclose(
+            controller.kwargs["rotation_vector_sign"],
+            JOYCON_ROTATION_VECTOR_SIGN,
+        )
         self.assertEqual(arm.control_loop_rates, [200.0])
+        panel._stop_control()
+        self.assertTrue(panel.mode_combo.isEnabled())
         panel.cleanup()
         self.assertTrue(controller.stopped.is_set())
 
