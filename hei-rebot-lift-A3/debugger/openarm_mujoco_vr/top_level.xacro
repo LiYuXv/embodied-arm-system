@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="hand"                default="true"/>
+  <xacro:arg name="ee_type"             default="openarm_hand"/>
+  <xacro:arg name="rpy_ee"              default="0 0 0"/>
+  <xacro:arg name="xyz_ee"              default="0 0 0"/>
+  <xacro:arg name="tcp_xyz"             default="0 0 0"/>
+  <xacro:arg name="tcp_rpy"             default="0 0 0"/>
+  <xacro:arg name="description_pkg"     default="openarm_description"/>
+  <xacro:arg name="special_connection"  default=""/>
+
+  <xacro:include filename="$(find openarm_description)/urdf/robot/openarm_robot.xacro"/>
+
+  <xacro:openarm_robot
+    arm_type="v10"
+    bimanual="true"
+    ee_type="$(arg ee_type)"
+    hand="$(arg hand)"
+    ros2_control="false"
+
+    joint_limits="${xacro.load_yaml('$(find openarm_description)/config/arm/v10/joint_limits.yaml')}"
+    kinematics="${xacro.load_yaml('$(find openarm_description)/config/arm/v10/kinematics.yaml')}"
+    kinematics_link="${xacro.load_yaml('$(find openarm_description)/config/arm/v10/kinematics_link.yaml')}"
+    kinematics_offset="${xacro.load_yaml('$(find openarm_description)/config/arm/v10/kinematics_offset.yaml')}"
+    inertials="${xacro.load_yaml('$(find openarm_description)/config/arm/v10/inertials.yaml')}"
+
+    body_type="v10"
+    body_inertials="${xacro.load_yaml('$(find openarm_description)/config/body/v10/inertials.yaml')}"
+    body_kinematics="${xacro.load_yaml('$(find openarm_description)/config/body/v10/kinematics.yaml')}"
+    body_kinematics_link="${xacro.load_yaml('$(find openarm_description)/config/body/v10/kinematics_link.yaml')}"
+
+    ee_kinematics_link="${xacro.load_yaml('$(find openarm_description)/config/hand/openarm_hand/kinematics_link.yaml')}"/>
+</robot>

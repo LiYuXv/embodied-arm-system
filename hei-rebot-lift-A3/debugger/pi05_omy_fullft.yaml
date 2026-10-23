@@ -1,0 +1,57 @@
+# pi0.5 全量微调配置（VLM + 视觉塔 + 动作专家全训）
+# 目标硬件：RTX 6000 Pro 96GB 服务器（autodl/seetacloud），系统内存 ~100GB
+# ⚠️ 请勿在 RTX 4080S 16GB 上启动（全量微调需 40GB+，会立即 OOM）；
+#    16GB 卡请继续使用 pi05_omy.yaml（train_expert_only）。
+#
+# 启动前必查（服务器新环境，详见 pi0.5模型微调使用手册.md）：
+#   1. §4 两个 site-packages 补丁已重打（modeling_pi05.py / pi_gemma.py，
+#      check_env.py 不覆盖 pi05，靠启动日志 "Remapped 812 ... All keys loaded" 确认）
+#   2. §2.2 paligemma tokenizer 离线缓存已重建，并加 HF_HUB_OFFLINE=1 启动
+#   3. pretrained_path 指向服务器上 pi05_base 实际位置（rsync 到 /root/autodl-tmp 的
+#      话注意移到 debugger/pretrained_models/ 下或改本字段）
+dataset:
+  repo_id: ela3_demo
+  root: ./lerobot_data/ela3_demo
+  eval_split: 0.1              # 留出 10% episodes 做验证 loss（监控过拟合）
+  image_transforms:
+    enable: true
+    random_order: true
+eval_steps: 500
+policy:
+  type: pi05
+  pretrained_path: ./pretrained_models/pi05_base
+  dtype: bfloat16              # 视觉塔/投影层仍保持 fp32（modeling_pi05.py 内建）
+  # ===== 与 pi05_omy.yaml 的核心差异 =====
+  train_expert_only: false     # 全量微调：PaliGemma VLM(2B) + 动作专家(693M) 全部可训
+  freeze_vision_encoder: false # 96GB 显存富裕，SigLIP 视觉塔(~400M)也一起训（真·全量）；
+                               # 若换 40-48GB 卡跑此配置，改回 true（省 ~5GB）
+  gradient_checkpointing: true # bs=16 下保留作保险；关掉可提速 ~20% 但显存逼近上限
+  chunk_size: 50
+  n_action_steps: 50
+  tokenizer_max_length: 200
+  device: cuda
+  push_to_hub: false
+
+save_checkpoint: true
+output_dir: ./ckpt/pi05_ela3_fullft   # 与 expert_only 产物区分，避免覆盖
+batch_size: 16                 # 96GB 实测安全值区间 16~24；固定占用 ~35GB + 每样本激活 ~2GB
+job_name: pi05_ela3_fullft
+resume: false
+seed: 42
+num_workers: 8                 # 服务器 CPU 核数充足；100GB 内存对视频解码足够
+steps: 15_000                  # bs=16 × 15k = 240K 样本 ≈ 1.76 epoch（136K 帧训练 split）；
+                               # steps < 30000 时 warmup/decay 自动按比例缩放（见 configuration_pi05.py），
+                               # 数据量小，按 eval_loss 走势可提前停
+env_eval_freq: -1
+log_freq: 50
+save_freq: 3_000               # 全量微调的 training_state 含优化器状态，每个 checkpoint
+                               # 约 20~35GB；3k 间隔共 5 份 + last，预留磁盘 ≥ 150GB，
+                               # 或定期删除旧编号目录只留 last
+use_policy_training_preset: true   # pi05 预设: lr 2.5e-5, warmup 1000, cosine -> 2.5e-6
+                                   # （官方预设本身即面向全量微调，无需调 lr）
+
+wandb:
+  enable: false
+  project: pi05_ela3
+  entity: <your_wandb_entity>
+  disable_artifact: true

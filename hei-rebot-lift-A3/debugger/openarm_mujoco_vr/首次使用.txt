@@ -1,0 +1,4 @@
+conda activate yolo
+python mujoco_cartesian_control_fk.py
+ 4轮和升降结构python mujoco_cartesian_control_fk.py --mobile
+

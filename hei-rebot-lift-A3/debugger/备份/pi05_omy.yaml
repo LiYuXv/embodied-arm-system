@@ -1,0 +1,51 @@
+dataset:
+  repo_id: ela3_demo
+  root: ./lerobot_data/ela3_demo
+  eval_split: 0.1              # 留出 10% episodes 做验证 loss（监控过拟合）
+  image_transforms:
+    enable: true               # 图像增强（亮度/对比度等，见默认 tfs 配置）
+    random_order: true         # 随机顺序应用增强
+# 验证 loss 计算频率（步）：eval_split 只划分数据，eval_steps>0 才会真正计算
+eval_steps: 500
+policy:
+  type: pi05
+  # 从 pi0.5 官方预训练权重微调（VLM+动作专家都有机器人数据先验，不从零训练）；
+  # 权重为 lerobot/pi05_base（已下载到本地，加载时 state dict 自动重映射，0 missing/unexpected）
+  pretrained_path: ./pretrained_models/pi05_base
+  # RTX 4080S 16GB 显存约束，三项缺一不可：
+  # - bfloat16：模型权重约 7GB（视觉塔/投影层保持 fp32，见 modeling_pi05.py）
+  # - train_expert_only：冻结 PaliGemma VLM（2B），只训动作专家 gemma_300m
+  #   （约 310M 可训练参数，AdamW 状态约 2.5GB）；全量微调需 40GB+ 显存
+  # - gradient_checkpointing：激活重算，进一步压显存
+  dtype: bfloat16
+  train_expert_only: true
+  gradient_checkpointing: true
+  # pi0.5 原生 chunk=50（20fps 下 2.5s 动作视界），与预训练分布一致；
+  # 本数据集最短 episode 184 帧，chunk 50 无截断风险
+  chunk_size: 50
+  n_action_steps: 50
+  # pi0.5 的 state 归一化后离散化为 256 bin，以文本形式拼入 prompt
+  # （"Task: xxx, State: ...;\nAction: "），tokenizer_max_length 需覆盖
+  # state 7 维 + 任务文本，默认 200 足够
+  tokenizer_max_length: 200
+  device: cuda
+  push_to_hub: false
+
+save_checkpoint: true
+output_dir: ./ckpt/pi05_ela3_expert
+batch_size: 4                # 16GB 显存 + GUI 常驻 1.7GB 的实测安全值；关闭 GUI 后可改 8
+job_name: pi05_ela3_expert
+resume: false
+seed: 42
+num_workers: 4
+steps: 30_000                # 对齐 pi05 预设 scheduler_decay_steps=30000（余弦衰减终点）
+env_eval_freq: -1
+log_freq: 50
+save_freq: 2_000
+use_policy_training_preset: true   # pi05 预设: lr 2.5e-5, warmup 1000, cosine -> 2.5e-6
+
+wandb:
+  enable: false
+  project: pi05_ela3
+  entity: <your_wandb_entity>
+  disable_artifact: true

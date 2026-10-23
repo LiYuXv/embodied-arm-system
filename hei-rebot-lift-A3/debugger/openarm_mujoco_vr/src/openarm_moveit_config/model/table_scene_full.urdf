@@ -1,0 +1,463 @@
+<?xml version="1.0" ?>
+<robot name="openarm_bimanual_table_scene">
+  <link name="world"/>
+
+  <!-- 基座 -->
+  <link name="openarm_body_link0">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0 0 0"/>
+      <mass value="13.89"/>
+      <inertia ixx="1.653" ixy="0.0" ixz="0.0" iyy="1.653" iyz="0.0" izz="0.051"/>
+    </inertial>
+  </link>
+
+  <joint name="world_to_body" type="fixed">
+    <parent link="world"/>
+    <child link="openarm_body_link0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 左臂 -->
+  <link name="openarm_left_link0"/>
+  <joint name="openarm_left_joint0" type="fixed">
+    <parent link="openarm_body_link0"/>
+    <child link="openarm_left_link0"/>
+    <origin xyz="0.0 0.031 0.698" rpy="-1.5708 0 0"/>
+  </joint>
+
+  <link name="openarm_left_link1"/>
+  <joint name="openarm_left_joint1" type="revolute">
+    <parent link="openarm_left_link0"/>
+    <child link="openarm_left_link1"/>
+    <origin xyz="0.0 0.0 0.0625" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.490659" upper="1.396263" effort="40" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_left_link2"/>
+  <joint name="openarm_left_joint2" type="revolute">
+    <parent link="openarm_left_link1"/>
+    <child link="openarm_left_link2"/>
+    <origin xyz="-0.0301 0.0 0.06" rpy="-1.5708 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-3.316125" upper="0.174533" effort="40" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_left_link3"/>
+  <joint name="openarm_left_joint3" type="revolute">
+    <parent link="openarm_left_link2"/>
+    <child link="openarm_left_link3"/>
+    <origin xyz="0.0301 0.0 0.06625" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.570796" upper="1.570796" effort="27" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_left_link4"/>
+  <joint name="openarm_left_joint4" type="revolute">
+    <parent link="openarm_left_link3"/>
+    <child link="openarm_left_link4"/>
+    <origin xyz="-0.0 0.0315 0.15375" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="2.443461" effort="27" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_left_link5"/>
+  <joint name="openarm_left_joint5" type="revolute">
+    <parent link="openarm_left_link4"/>
+    <child link="openarm_left_link5"/>
+    <origin xyz="0.0 -0.0315 0.0955" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.570796" upper="1.570796" effort="7" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_left_link6"/>
+  <joint name="openarm_left_joint6" type="revolute">
+    <parent link="openarm_left_link5"/>
+    <child link="openarm_left_link6"/>
+    <origin xyz="0.0375 0.0 0.1205" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-0.785398" upper="0.785398" effort="7" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_left_link7"/>
+  <joint name="openarm_left_joint7" type="revolute">
+    <parent link="openarm_left_link6"/>
+    <child link="openarm_left_link7"/>
+    <origin xyz="-0.0375 0.0 0.0" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.570796" upper="1.570796" effort="7" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <!-- 左手 -->
+  <link name="openarm_left_hand"/>
+  <joint name="left_openarm_hand_joint" type="fixed">
+    <parent link="openarm_left_link7"/>
+    <child link="openarm_left_hand"/>
+    <origin xyz="0 -0.0 0.1001" rpy="0 0 0"/>
+  </joint>
+
+  <link name="openarm_left_hand_tcp"/>
+  <joint name="openarm_left_hand_tcp_joint" type="fixed">
+    <parent link="openarm_left_hand"/>
+    <child link="openarm_left_hand_tcp"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+  </joint>
+
+  <link name="openarm_left_left_finger"/>
+  <link name="openarm_left_right_finger"/>
+  <joint name="openarm_left_finger_joint1" type="prismatic">
+    <parent link="openarm_left_hand"/>
+    <child link="openarm_left_right_finger"/>
+    <origin xyz="0 -0.006 0.015" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.06" effort="333" velocity="1.0"/>
+    <!-- 控制爪子开合大小的 -->
+    <dynamics damping="2.0" stiffness="0.5"/>
+  </joint>
+
+  <joint name="openarm_left_finger_joint2" type="prismatic">
+    <parent link="openarm_left_hand"/>
+    <child link="openarm_left_left_finger"/>
+    <origin xyz="0 0.006 0.015" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="0.06" effort="333" velocity="1.0"/>
+    <dynamics damping="2.0" stiffness="0.5"/>
+    <mimic joint="openarm_left_finger_joint1"/>
+  </joint>
+
+  <!-- 右臂 -->
+  <link name="openarm_right_link0"/>
+  <joint name="openarm_right_joint0" type="fixed">
+    <parent link="openarm_body_link0"/>
+    <child link="openarm_right_link0"/>
+    <origin xyz="0.0 -0.031 0.698" rpy="1.5708 0 0"/>
+  </joint>
+
+  <link name="openarm_right_link1"/>
+  <joint name="openarm_right_joint1" type="revolute">
+    <parent link="openarm_right_link0"/>
+    <child link="openarm_right_link1"/>
+    <origin xyz="0.0 0.0 0.0625" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.396263" upper="3.490659" effort="40" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_right_link2"/>
+  <joint name="openarm_right_joint2" type="revolute">
+    <parent link="openarm_right_link1"/>
+    <child link="openarm_right_link2"/>
+    <origin xyz="-0.0301 0.0 0.06" rpy="1.5708 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-0.174533" upper="3.316125" effort="40" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_right_link3"/>
+  <joint name="openarm_right_joint3" type="revolute">
+    <parent link="openarm_right_link2"/>
+    <child link="openarm_right_link3"/>
+    <origin xyz="0.0301 0.0 0.06625" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.570796" upper="1.570796" effort="27" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_right_link4"/>
+  <joint name="openarm_right_joint4" type="revolute">
+    <parent link="openarm_right_link3"/>
+    <child link="openarm_right_link4"/>
+    <origin xyz="-0.0 0.0315 0.15375" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="2.443461" effort="27" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_right_link5"/>
+  <joint name="openarm_right_joint5" type="revolute">
+    <parent link="openarm_right_link4"/>
+    <child link="openarm_right_link5"/>
+    <origin xyz="0.0 -0.0315 0.0955" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.570796" upper="1.570796" effort="7" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_right_link6"/>
+  <joint name="openarm_right_joint6" type="revolute">
+    <parent link="openarm_right_link5"/>
+    <child link="openarm_right_link6"/>
+    <origin xyz="0.0375 0.0 0.1205" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-0.785398" upper="0.785398" effort="7" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <link name="openarm_right_link7"/>
+  <joint name="openarm_right_joint7" type="revolute">
+    <parent link="openarm_right_link6"/>
+    <child link="openarm_right_link7"/>
+    <origin xyz="-0.0375 0.0 0.0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.570796" upper="1.570796" effort="7" velocity="1.0"/>
+    <dynamics damping="0.4" friction="0.1"/>
+  </joint>
+
+  <!-- 右手 -->
+  <link name="openarm_right_hand"/>
+  <joint name="right_openarm_hand_joint" type="fixed">
+    <parent link="openarm_right_link7"/>
+    <child link="openarm_right_hand"/>
+    <origin xyz="0 -0.0 0.1001" rpy="0 0 0"/>
+  </joint>
+
+  <link name="openarm_right_hand_tcp"/>
+  <joint name="openarm_right_hand_tcp_joint" type="fixed">
+    <parent link="openarm_right_hand"/>
+    <child link="openarm_right_hand_tcp"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+  </joint>
+
+  <link name="openarm_right_left_finger"/>
+  <link name="openarm_right_right_finger"/>
+  <joint name="openarm_right_finger_joint1" type="prismatic">
+    <parent link="openarm_right_hand"/>
+    <child link="openarm_right_right_finger"/>
+    <origin xyz="0 -0.006 0.015" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="0.0" upper="0.06" effort="333" velocity="1.0"/>
+    <!-- 控制爪子开合大小的 -->
+    <dynamics damping="2.0" stiffness="0.5"/>
+  </joint>
+
+  <joint name="openarm_right_finger_joint2" type="prismatic">
+    <parent link="openarm_right_hand"/>
+    <child link="openarm_right_left_finger"/>
+    <origin xyz="0 0.006 0.015" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="0.06" effort="333" velocity="1.0"/>
+    <!-- 控制爪子开合大小的 -->
+    <dynamics damping="2.0" stiffness="0.5"/>
+    <mimic joint="openarm_right_finger_joint1"/>
+  </joint>
+
+  <!-- 相机 -->
+  <link name="cam_base"/>
+  <joint name="cam_base_joint" type="fixed">
+    <parent link="world"/>
+    <child link="cam_base"/>
+    <origin xyz="0.5 0 1.2" rpy="0 0 0"/>
+  </joint>
+
+  <!-- 调试标记 -->
+  <link name="marker_link_1"/>
+  <link name="marker_link_2"/>
+  <link name="debug_marker_final_link"/>
+
+  <joint name="marker_x" type="prismatic">
+    <parent link="world"/>
+    <child link="marker_link_1"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2" upper="2" effort="1000" velocity="1.0"/>
+    <dynamics damping="0.5"/>
+  </joint>
+
+  <joint name="marker_y" type="prismatic">
+    <parent link="marker_link_1"/>
+    <child link="marker_link_2"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2" upper="2" effort="1000" velocity="1.0"/>
+    <dynamics damping="0.5"/>
+  </joint>
+
+  <joint name="marker_z" type="prismatic">
+    <parent link="marker_link_2"/>
+    <child link="debug_marker_final_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2" upper="2" effort="1000" velocity="1.0"/>
+    <dynamics damping="0.5"/>
+  </joint>
+
+  <link name="cube_link_1"/>
+  <link name="cube_link_2"/>
+  <link name="red_cube_link">
+     <visual>
+       <geometry>
+         <box size="0.025 0.025 0.025"/>
+       </geometry>
+       <material name="Red">
+         <color rgba="1 0 0 1"/>
+       </material>
+     </visual>
+     <collision>
+       <geometry>
+         <box size="0.025 0.025 0.025"/>
+       </geometry>
+     </collision>
+     <inertial>
+       <mass value="0.1"/>
+       <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+     </inertial>
+  </link>
+
+  <joint name="cube_x" type="prismatic">
+    <parent link="world"/>
+    <child link="cube_link_1"/>
+    <origin xyz="0.4 0 0.45" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2" upper="2" effort="1000" velocity="1.0"/>
+    <dynamics damping="10.0"/>
+  </joint>
+
+  <joint name="cube_y" type="prismatic">
+    <parent link="cube_link_1"/>
+    <child link="cube_link_2"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2" upper="2" effort="1000" velocity="1.0"/>
+    <dynamics damping="10.0"/>
+  </joint>
+
+  <joint name="cube_z" type="prismatic">
+    <parent link="cube_link_2"/>
+    <child link="red_cube_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2" upper="2" effort="1000" velocity="1.0"/>
+    <dynamics damping="10.0"/>
+  </joint>
+
+  <!-- ros2_control -->
+  <ros2_control name="MujocoSystem" type="system">
+    <hardware>
+      <plugin>mujoco_ros2_control/MujocoSystem</plugin>
+    </hardware>
+
+    <!-- 左臂 -->
+    <joint name="openarm_left_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_joint2">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_joint3">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_joint4">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_joint5">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_joint6">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_joint7">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_left_finger_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- 右臂 -->
+    <joint name="openarm_right_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_joint2">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_joint3">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_joint4">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_joint5">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_joint6">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_joint7">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="openarm_right_finger_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- 调试标记 -->
+    <joint name="marker_x">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="marker_y">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="marker_z">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <joint name="cube_x">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="cube_y">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="cube_z">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+  </ros2_control>
+</robot>

@@ -1,0 +1,73 @@
+# pi0.5 全量微调配置（VLM + 动作专家全训；SigLIP 视觉塔冻结省显存）
+# 目标硬件：48GB 服务器（autodl/seetacloud），系统内存 ~100GB
+# ⚠️ 请勿在 RTX 4080S 16GB 上启动（全量微调需 40GB+，会立即 OOM）。
+#
+# 与 pi05_omy_fullft_recap.yaml 的唯一差异：
+#   sample_weighting.type = recap_pg（R3 优势加权策略改进，PI06_RL_迁移实施方案.md §5 R3）
+#   —— 以 critic ΔV ∪ 组优势 ∪ 人标 合并的逐帧优势，经 AWR/CRR/linear 算子映射权重，
+#      替代 R2 的启发式权重（good×1 / bad×0.1 / 干预×2）。
+#
+# 48GB 卡调整（相对 96GB 版本）：
+#   freeze_vision_encoder: true（冻结 SigLIP，省 ~5GB）+ batch_size: 8
+#   —— 显存富裕可试 batch_size 12~16。
+#
+# 前置数据准备（顺序，cd debugger）：
+#   1. visualize_data 生成训练 sidecar（make_recap_sidecar.py）
+#   2. python3 recap_group_advantage.py --dataset lerobot_data/ela3_demo5   # 组优势（需成组 rollout）
+#   3. python3 recap_critic.py --dataset lerobot_data/ela3_demo5 train --backend siglip --apply  # critic ΔV（视觉）
+#   4. python3 recap_pg.py --dataset lerobot_data/ela3_demo5 --operator awr --write  # pg_advantage 列
+#   （步骤 2/3/4 可缺省——weighter 会按可用来源自动降级，见 recap_pg.py 文档）
+dataset:
+  repo_id: ela3_demo5
+  root: ./lerobot_data/ela3_demo5
+  eval_split: 0.1              # 留出 10% episodes 做验证 loss（监控过拟合）
+  image_transforms:
+    enable: true
+    random_order: true
+eval_steps: 500
+policy:
+  type: pi05
+  pretrained_path: ./pretrained_models/pi05_base
+  dtype: bfloat16              # 视觉塔/投影层仍保持 fp32（modeling_pi05.py 内建）
+  train_expert_only: false     # 全量微调（VLM + 动作专家）
+  freeze_vision_encoder: true  # 48GB 卡冻结 SigLIP 视觉塔省 ~5GB；96GB 可改 false 一起训
+  gradient_checkpointing: true
+  chunk_size: 50
+  n_action_steps: 50
+  tokenizer_max_length: 200
+  device: cuda
+  push_to_hub: false
+
+save_checkpoint: true
+output_dir: ./ckpt/pi05_ela3_demo5_recap_pg_fullft   # 与 recap(加权SFT) 产物区分
+batch_size: 8                  # 48GB 安全值；显存富裕可试 12~16
+job_name: pi05_ela3_demo5_recap_pg_fullft
+resume: false
+seed: 42
+num_workers: 8
+steps: 15_000
+env_eval_freq: -1
+log_freq: 50
+save_freq: 3_000
+use_policy_training_preset: true
+
+# ===== π*0.6 R3：优势加权的策略改进（offline RL）=====
+# 权重由 recap_pg.py 生成的 pg_advantage（critic ΔV ∪ 组优势 ∪ 人标）经算子得出。
+# 对照实验：type 改回 recap（R2 加权 SFT）或删除本段（普通 SFT）。
+sample_weighting:
+  type: recap_pg
+  extra_params:
+    operator: awr               # awr=exp(A/τ) | crr=1[A>0]?1:negative | linear=1+βA
+    tau: 1.0                    # AWR 温度（τ↑ 更保守，τ↓ 更激进；τ→∞ 退化为均匀）
+    beta: 1.0                   # linear 算子斜率
+    negative: 0.1               # 负优势帧权重下限（降权非过滤，同 R2 bad×0.1）
+    intervention: 2.0           # 干预帧乘子（RECAP 恒正）
+    min_weight: 0.1
+    max_weight: 5.0
+    # advantage_conditioning（R1c P4）独立于本 weighter，如需同时开启见 recap yaml 说明
+
+wandb:
+  enable: false
+  project: pi05_ela3
+  entity: <your_wandb_entity>
+  disable_artifact: true

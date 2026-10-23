@@ -1,0 +1,114 @@
+<mujoco model="openarm_bimanual_scene">
+  <include file="openarm_bimanual.xml" actuator="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <statistic center="0 0 0.43" extent=".85" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.5 0.5 0.5" ambient="0.4 0.4 0.4" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="160" elevation="-10"/>
+    <quality shadowsize="8192"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="champagne_wood" rgba="0.5 0.5 0.5 1" specular="0.2" shininess="0.3"/>
+    <material name="white_carving" rgba="1.0 1.0 1.0 1" specular="0.1" shininess="0.1"/>
+  </asset>
+
+  <worldbody>
+    <body name="cam_base" pos="0.5 0 1.2" euler="0 0 0">
+      <camera name="my_cam" mode="fixed" fovy="45" resolution="640 480"/>
+      <!-- 盒子外壳：透明无影 -->
+      <geom type="box" size="0.05 0.03 0.03" rgba="0.1 0.1 0.1 0" contype="0" conaffinity="0"/>
+      <!-- 小红柱：也透明无影 -->
+      <geom type="cylinder" size="0.01 0.05" pos="0 0 -0.05" rgba="1 0 0 0" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- <body name="apple" pos="0.4 0 0.45">
+        <freejoint/>
+        <geom type="sphere" size="0.02" rgba="1 0 0 1" mass="0.1" friction="1 1.0 1.0"/>
+    </body> -->
+    <!-- <body name="red_cube" pos="0.4 0 0.5">
+    <freejoint name="cube_joint"/>
+    <geom name="red_cube"
+          type="box" 
+          size="0.02 0.02 0.02" 
+          rgba="1 0 0 1" 
+          mass="0.5" 
+          friction="1 0.005 0.0001" 
+          solref="0.002 1" 
+          condim="4"/>
+    <site name="cube_site" pos="0 0 0" size="0.001"/>
+    </body> -->
+    <body name="red_cube" pos="0.3 0 0.44">
+      <joint name="cube_x" type="slide" axis="1 0 0" damping="10.0"/>
+      <joint name="cube_y" type="slide" axis="0 1 0" damping="10.0"/>
+      <joint name="cube_z" type="slide" axis="0 0 1" damping="10.0"/>
+      
+      <geom type="sphere" 
+            size="0.025" 
+            rgba="1 0 0 1" 
+            mass="0.1" 
+            condim="4"
+            solref="0.005 1" 
+            solimp="0.95 0.99 0.001"
+            margin="0.005" />
+    </body>
+
+    <body name="debug_marker" pos="0 0 0">
+        <joint name="marker_x" type="slide" axis="1 0 0" damping="0.5"/>
+        <joint name="marker_y" type="slide" axis="0 1 0" damping="0.5"/>
+        <joint name="marker_z" type="slide" axis="0 0 1" damping="0.5"/>
+        <geom type="box" size="0.03 0.03 0.03" rgba="0 1 0 0.5" contype="0" conaffinity="0"/>
+    </body>
+
+    <body name="ornate_table" pos="0.5 0 0">
+       <geom name="table_top" type="cylinder" size="0.35 0.02" pos="0 0 0.40" material="champagne_wood" contype="1" conaffinity="1" friction="0.05 0.01 0.01"/>
+       <geom name="table_rim" type="cylinder" size="0.355 0.015" pos="0 0 0.385" material="white_carving"/>
+       <geom name="base_cross_1" type="box" size="0.22 0.03 0.02" pos="0 0 0.06" material="champagne_wood"/>
+       <geom name="base_cross_2" type="box" size="0.03 0.22 0.02" pos="0 0 0.06" material="champagne_wood"/>
+       <geom name="center_knob" type="cylinder" size="0.04 0.05" pos="0 0 0.05" material="white_carving"/>
+       <body name="leg_front">
+         <geom type="capsule" fromto="0.25 0 0.06  0.20 0 0.22" size="0.025" material="champagne_wood"/>
+         <geom type="capsule" fromto="0.20 0 0.22  0.30 0 0.38" size="0.035" material="champagne_wood"/>
+         <geom type="sphere" pos="0.30 0 0.36" size="0.04" material="white_carving"/>
+         <geom type="box" pos="0.25 0 0.04" size="0.04 0.03 0.02" material="champagne_wood"/>
+       </body>
+       <body name="leg_back">
+         <geom type="capsule" fromto="-0.25 0 0.06  -0.20 0 0.22" size="0.025" material="champagne_wood"/>
+         <geom type="capsule" fromto="-0.20 0 0.22  -0.30 0 0.38" size="0.035" material="champagne_wood"/>
+         <geom type="sphere" pos="-0.30 0 0.36" size="0.04" material="white_carving"/>
+         <geom type="box" pos="-0.25 0 0.04" size="0.04 0.03 0.02" material="champagne_wood"/>
+       </body>
+       <body name="leg_left">
+         <geom type="capsule" fromto="0 0.25 0.06  0 0.20 0.22" size="0.025" material="champagne_wood"/>
+         <geom type="capsule" fromto="0 0.20 0.22  0 0.30 0.38" size="0.035" material="champagne_wood"/>
+         <geom type="sphere" pos="0 0.30 0.36" size="0.04" material="white_carving"/>
+         <geom type="box" pos="0 0.25 0.04" size="0.03 0.04 0.02" material="champagne_wood"/>
+       </body>
+       <body name="leg_right">
+         <geom type="capsule" fromto="0 -0.25 0.06  0 -0.20 0.22" size="0.025" material="champagne_wood"/>
+         <geom type="capsule" fromto="0 -0.20 0.22  0 -0.30 0.38" size="0.035" material="champagne_wood"/>
+         <geom type="sphere" pos="0 -0.30 0.36" size="0.04" material="white_carving"/>
+         <geom type="box" pos="0 -0.25 0.04" size="0.03 0.04 0.02" material="champagne_wood"/>
+       </body>
+    </body>
+
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+  </worldbody>
+
+  <actuator>
+    <position joint="marker_x" kp="500" kv="50"/>
+    <position joint="marker_y" kp="500" kv="50"/>
+    <position joint="marker_z" kp="500" kv="50"/>
+    <position joint="cube_x" kp="20" kv="100"/>
+    <position joint="cube_y" kp="20" kv="100"/>
+    <position joint="cube_z" kp="20" kv="100"/>
+  </actuator>
+
+
+</mujoco>

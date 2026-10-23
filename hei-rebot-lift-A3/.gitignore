@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+
+# Local runtime/training artifacts (not published)
+.venv/
+.env
+.env.*
+settings/
+debugger/settings/
+debugger/lerobot_data/
+debugger/ckpt/
+debugger/pretrained_models/
+debugger/cloud_settings.json
+debugger/camera_settings.json
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.mp4
+*.parquet
+*.npz
+*.jsonl
+*.log
+*.apk
+*.zip
+*.tar.gz
+build/
+install/
+log/

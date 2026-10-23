@@ -1,0 +1,63 @@
+// VLA 云端推理服务协议（方案 A：全量云端推理）
+//
+// 设计要点：
+// - 每次 chunk 推理一次 unary RPC（与本地 request_chunk -> chunk_ready 模式 1:1 对应）
+// - 图像以 JPEG 字节传输（720x720 q90 约 100~150KB/张，2 请求/s ≈ 4Mbps 上行）
+// - trained RTC：上一段归一化 chunk 保留在服务端会话内，客户端只发 (rtc_k, rtc_d)
+// - 所有请求带 token 校验；reset=true 时服务端 policy.reset() 并清空 prefix 状态
+//
+// 生成 Python 代码（在 debugger/ 目录下执行）：
+//   python -m grpc_tools.protoc -I cloud_inference --python_out=cloud_inference \
+//       --grpc_python_out=cloud_inference cloud_inference/vla_inference.proto
+
+syntax = "proto3";
+
+package vla;
+
+service VLAInference {
+  // 心跳 / 握手：返回服务端模型能力信息（trained RTC 支持、图像尺寸等）
+  rpc Ping(PingRequest) returns (PingReply);
+  // 单次 chunk 推理：上行观测，下行完整动作 chunk
+  rpc InferChunk(InferenceRequest) returns (InferenceReply);
+}
+
+message PingRequest {
+  uint64 client_time_ms = 1;  // 客户端单调时钟毫秒（RTT 估算用）
+  string token = 2;
+}
+
+message PingReply {
+  uint64 server_time_ms = 1;
+  string policy_type = 2;          // 如 "pi05"
+  string model_path = 3;           // 服务端实际加载的 checkpoint 路径
+  string device = 4;               // cuda / cpu
+  int32 trained_max_delay = 5;     // checkpoint 的 rtc_training_max_delay，0=不支持 trained RTC
+  int32 image_height = 6;          // 模型期望的输入图像高（供客户端同步采集分辨率）
+  int32 image_width = 7;
+  string error = 8;                // 非空表示握手失败（如 token 错误）
+}
+
+message InferenceRequest {
+  uint64 request_id = 1;      // 单调递增，客户端用于丢弃过期/乱序响应
+  string token = 2;
+  bytes cam1_jpeg = 3;        // 720x720 JPEG（BGR 编码，服务端解码后转 RGB）
+  bytes cam2_jpeg = 4;
+  repeated float state = 5;   // 7 维 [x,y,z,rx,ry,rz,gripper_rad]
+  float torque = 6;           // 夹爪力矩 (Nm)
+  string task = 7;            // 任务文本（SmolVLA/pi05 条件）
+  int32 rtc_k = 8;            // trained RTC：本段已执行到的步索引（上一段 chunk 内）
+  int32 rtc_d = 9;            // trained RTC：预测延迟步数，0=不使用 prefix 条件
+  int32 avg_n = 10;           // 多次采样平均次数，1=关闭
+  bool reset = 11;            // true=服务端 policy.reset() 并清空 _last_raw_chunk
+  bool is_single = 12;        // 单次诊断推理（等价于本地"推理一次"，隐含 reset 语义）
+}
+
+message InferenceReply {
+  uint64 request_id = 1;
+  repeated float actions = 2;      // 展平的 (num_steps * action_dim)，行优先
+  int32 num_steps = 3;             // chunk 步数 H
+  int32 action_dim = 4;            // 动作维度 D（7）
+  float server_latency_ms = 5;     // 服务端纯推理耗时（不含网络/编解码）
+  int32 used_delay = 6;            // trained RTC 实际使用的 inference_delay（客户端更新 _last_used_delay）
+  string error = 7;                // 非空表示本次推理失败
+}
