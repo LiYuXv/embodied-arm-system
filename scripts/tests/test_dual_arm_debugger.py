@@ -193,15 +193,15 @@ class TestDualArmWindow(QtTestCase):
             self.assertEqual(len(panel.joint_panel._spinboxes), 7)
             self.assertEqual(panel.joint_panel._name_labels[-1].text(), "夹爪")
             self.assertEqual(panel.tabs.count(), 9)
-            self.assertIs(panel.tabs.widget(0), panel.joint_panel)
-            self.assertIs(panel.tabs.widget(1), panel.trajectory_panel)
-            self.assertIs(panel.tabs.widget(2), panel.teaching_panel)
-            self.assertIs(panel.tabs.widget(3), panel.diagnostics_panel)
-            self.assertIs(panel.tabs.widget(4), panel.gripper_panel)
-            self.assertIs(panel.tabs.widget(5), panel.gamepad_panel)
-            self.assertIs(panel.tabs.widget(6), panel.joycon_panel)
-            self.assertIs(panel.tabs.widget(7), panel.vr_panel)
-            self.assertIs(panel.tabs.widget(8), panel.kinematics_display)
+            self.assertIs(panel.tabs.widget(0).widget(), panel.joint_panel)
+            self.assertIs(panel.tabs.widget(1).widget(), panel.trajectory_panel)
+            self.assertIs(panel.tabs.widget(2).widget(), panel.teaching_panel)
+            self.assertIs(panel.tabs.widget(3).widget(), panel.diagnostics_panel)
+            self.assertIs(panel.tabs.widget(4).widget(), panel.gripper_panel)
+            self.assertIs(panel.tabs.widget(5).widget(), panel.gamepad_panel)
+            self.assertIs(panel.tabs.widget(6).widget(), panel.joycon_panel)
+            self.assertIs(panel.tabs.widget(7).widget(), panel.vr_panel)
+            self.assertIs(panel.tabs.widget(8).widget(), panel.kinematics_display)
             self.assertTrue(panel.trajectory_panel.drag_btn.isHidden())
             self.assertTrue(panel.trajectory_panel.sync_btn.isHidden())
             self.assertIsNotNone(panel.monitoring_window)
@@ -210,6 +210,46 @@ class TestDualArmWindow(QtTestCase):
             self.assertEqual(
                 panel.toolbar._get_selected_can_name(), panel.can_name
             )
+
+    def test_arm_tabs_scroll_when_short_and_release_scroll_when_tall(self):
+        from PyQt6.QtCore import QPoint
+        from PyQt6.QtWidgets import QScrollArea
+
+        self.assertNotIsInstance(self.window.centralWidget(), QScrollArea)
+        self.window.show()
+        for panel in self.window.arm_panels.values():
+            for index in range(panel.tabs.count()):
+                self.assertIsInstance(panel.tabs.widget(index), QScrollArea)
+            # Exercise several dense pages on both arms, including the reported
+            # teaching page, with a viewport smaller than their minimum height.
+            for index in (0, 1, 2, 3):
+                with self.subTest(arm=panel.arm_name, tab=index):
+                    panel.tabs.setCurrentIndex(index)
+                    panel.tabs.setFixedHeight(150)
+                    self.app.processEvents()
+                    scroll = panel.tabs.widget(index)
+                    content = scroll.widget()
+                    bar = scroll.verticalScrollBar()
+                    self.assertGreater(bar.maximum(), 0)
+                    self.assertGreaterEqual(
+                        content.height(), content.minimumSizeHint().height()
+                    )
+                    bar.setValue(bar.maximum())
+                    self.app.processEvents()
+                    bottom = content.mapTo(
+                        scroll.viewport(), QPoint(0, content.height() - 1)
+                    ).y()
+                    self.assertLess(bottom, scroll.viewport().height())
+                    self.assertGreaterEqual(bottom, 0)
+                    if index == 2:
+                        button = panel.teaching_panel.del_btn
+                        position = button.mapTo(
+                            scroll.viewport(), QPoint(0, button.height() - 1)
+                        )
+                        self.assertTrue(scroll.viewport().rect().contains(position))
+                    panel.tabs.setFixedHeight(content.minimumSizeHint().height() + 150)
+                    self.app.processEvents()
+                    self.assertEqual(bar.maximum(), 0)
 
     def test_per_arm_and_global_commands_route_to_the_correct_workers(self):
         left_submit = Mock()
@@ -503,12 +543,19 @@ class TestSingleArmJoyConPanel(QtTestCase):
         panel.set_arm(arm)
         panel.set_arm_enabled(True)
         panel.mode_combo.setCurrentIndex(1)
+        self.assertTrue(panel.rotation_scale_spin.isEnabled())
+        panel.scale_spin.setValue(1.5)
+        panel.rotation_scale_spin.setValue(0.5)
         panel._connect_input()
         self.assertEqual(panel._adapter.mode, "imu_motion")
         panel._start_control()
         controller = FakeJoyConController.instances[-1]
         self.assertTrue(controller.started.wait(1.0))
         self.assertFalse(panel.mode_combo.isEnabled())
+        self.assertFalse(panel.scale_spin.isEnabled())
+        self.assertFalse(panel.rotation_scale_spin.isEnabled())
+        self.assertEqual(controller.kwargs["scale"], 1.5)
+        self.assertEqual(controller.kwargs["rotation_scale"], 0.5)
 
         self.assertEqual(discovered, ["left"])
         self.assertIs(controller.kwargs["arm"], arm)

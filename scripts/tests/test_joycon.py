@@ -221,6 +221,26 @@ class TestJoyConInput(unittest.TestCase):
             self.source.snapshot().linear_acceleration, np.zeros(3), atol=1e-8
         )
 
+    def test_motion_gravity_compensation_tracks_rotation_while_clutched(self):
+        self._feed_stationary_imu()
+        self.source.handle_control_event(
+            LinuxEventCodes.EV_KEY,
+            getattr(LinuxEventCodes, JOYCON_PROFILES["left"].clutch), 1,
+        )
+        for step in range(1, 101):
+            self.clock.advance(0.01)
+            rotation = axis_rotation([1, 0, 0], step * 0.005)
+            accel = rotation.T @ np.array([0.0, 0.0, 1.0])
+            values = list(accel * 4096) + [np.rad2deg(0.5) * 14247, 0, 0]
+            for code, value in enumerate(values):
+                self.source.handle_imu_event(LinuxEventCodes.EV_ABS, code, round(value))
+            self.source.handle_imu_event(
+                LinuxEventCodes.EV_SYN, LinuxEventCodes.SYN_REPORT, 0, self.clock()
+            )
+            np.testing.assert_allclose(
+                self.source.snapshot().linear_acceleration, 0.0, atol=0.003
+            )
+
     def test_right_profile_uses_right_stick_and_zr_clutch(self):
         source = JoyConInput(
             make_binding("right"),
@@ -423,6 +443,26 @@ class TestJoyConPoseAdapter(unittest.TestCase):
         with self.assertRaises(ValueError):
             JoyConPoseAdapter(FakeSource(snapshot()), mode="space_position")
 
+    def test_imu_motion_passes_each_rotation_axis_and_gates_clutch(self):
+        for axis in np.eye(3):
+            for angle in (-0.3, 0.3):
+                with self.subTest(axis=axis.tolist(), angle=angle):
+                    clock = FakeClock()
+                    rotation = axis_rotation(axis, angle)
+                    source = FakeSource(snapshot(clutch=True, rotation=rotation))
+                    adapter = JoyConPoseAdapter(
+                        source, mode=JOYCON_MODE_IMU_MOTION, clock=clock
+                    )
+                    clock.advance(0.01)
+                    state = adapter.get_state()
+                    np.testing.assert_allclose(state.rotation, rotation)
+                    np.testing.assert_allclose(state.position, 0.0)
+                    self.assertEqual(state.grip, 1.0)
+                    for valid, clutch in ((True, False), (False, True)):
+                        source.state = snapshot(valid=valid, clutch=clutch, rotation=rotation)
+                        clock.advance(0.01)
+                        self.assertEqual(adapter.get_state().grip, 0.0)
+
     def test_imu_motion_total_clutch_freezes_and_restarts_from_zero_velocity(self):
         clock = FakeClock()
         source = FakeSource(snapshot(clutch=False, acceleration=[1.0, 0.0, 0.0]))
@@ -447,8 +487,8 @@ class TestJoyConPoseAdapter(unittest.TestCase):
 
         np.testing.assert_allclose(released.position, np.zeros(3))
         np.testing.assert_allclose(engaged.position, np.zeros(3))
-        np.testing.assert_allclose(adapter.virtual_velocity, [0.04, 0.0, 0.0])
-        np.testing.assert_allclose(moving.position, [0.0016, 0.0, 0.0])
+        np.testing.assert_allclose(adapter.virtual_velocity, [-0.04, 0.0, 0.0])
+        np.testing.assert_allclose(moving.position, [-0.0016, 0.0, 0.0])
 
         source.state = snapshot(clutch=False, acceleration=[5.0, 0.0, 0.0])
         clock.advance(0.04)
@@ -670,6 +710,127 @@ class TestJoyConPoseAdapter(unittest.TestCase):
         controller._tick()
         np.testing.assert_allclose(controller._target_pos, [0.2, 0, 0], atol=1e-8)
         np.testing.assert_allclose(controller._target_rot, held_rotation, atol=1e-8)
+
+
+        # 位置与姿态独立缩放，旋转围绕非零末端锚点计算。
+        for rotation_scale in (0.0, 0.5, 1.0, 1.5):
+            with self.subTest(rotation_scale=rotation_scale):
+                controller.scale = 2.0
+                controller.rotation_scale = rotation_scale
+                controller._clutched = False
+                controller._translation_free_anchored = False
+                controller._target_pos = np.zeros(3)
+                controller._target_rot = held_rotation.copy()
+                receiver.state = relative_state([0, 0, 0], rotation_z(0.2), grip=1.0)
+                controller._tick()
+                np.testing.assert_allclose(controller._target_rot, held_rotation)
+                receiver.state = relative_state([0.04, 0.02, -0.01], rotation_z(0.6), grip=1.0)
+                controller._tick()
+                np.testing.assert_allclose(controller._target_pos, [0.08, 0.04, -0.02])
+                expected_rot = held_rotation @ rotation_z(-0.4 * rotation_scale)
+                np.testing.assert_allclose(controller._target_rot, expected_rot, atol=1e-8)
+                receiver.state = relative_state([0.04, 0.02, -0.01], rotation_z(-0.5), grip=0.0)
+                controller._tick()
+                np.testing.assert_allclose(controller._target_rot, expected_rot, atol=1e-8)
+        controller.scale = 1.0
+        controller.rotation_scale = 1.0
+
+        # 从真实 evdev 事件一直验证到控制器/IK 目标；覆盖左右手柄的六个方向。
+        for side in ("left", "right"):
+            for axis in range(3):
+                for sign in (-1.0, 1.0):
+                    with self.subTest(side=side, axis=axis, sign=sign):
+                        clock = FakeClock()
+                        source = JoyConInput(
+                            make_binding(side), ecodes=LinuxEventCodes, clock=clock
+                        )
+                        source._running = True  # 不启动硬件读取线程。
+
+                        def feed(accel):
+                            for code, value in zip((0, 1, 2), accel):
+                                source.handle_imu_event(
+                                    LinuxEventCodes.EV_ABS, code, round(value * 4096)
+                                )
+                            source.handle_imu_event(
+                                LinuxEventCodes.EV_SYN, LinuxEventCodes.SYN_REPORT,
+                                0, clock(),
+                            )
+
+                        feed([0, 0, 1])  # 静止初始化重力方向。
+                        source.handle_control_event(
+                            LinuxEventCodes.EV_KEY,
+                            getattr(LinuxEventCodes, JOYCON_PROFILES[side].clutch), 1,
+                        )
+                        adapter = JoyConPoseAdapter(
+                            source, mode=JOYCON_MODE_IMU_MOTION, clock=clock
+                        )
+                        controller._state_getter = adapter.get_state
+                        controller._receiver = adapter
+                        controller._translation_free_anchored = False
+                        controller._target_rot = held_rotation.copy()
+                        start_pos = controller._target_pos.copy()
+                        clock.advance(0.01)
+                        controller._tick()
+                        acceleration = np.array([0.0, 0.0, 1.0])
+                        acceleration[axis] += sign * 0.1
+                        for _ in range(150):
+                            clock.advance(0.01)
+                            feed(acceleration)
+                            controller._tick()
+                            np.testing.assert_allclose(controller._target_rot, held_rotation)
+                        # 持续水平加速度不能被重力校正吞掉；默认死区/阻尼下仍运动。
+                        delta = controller._target_pos - start_pos
+                        mapped_sign = -sign if axis < 2 else sign
+                        self.assertGreater(mapped_sign * delta[axis], 0.01)
+                        np.testing.assert_allclose(np.delete(delta, axis), 0.0, atol=1e-8)
+                        self.assertGreater(sign * source.snapshot().linear_acceleration[axis], 0.9)
+                        self.assertGreater(mapped_sign * adapter.virtual_velocity[axis], 0.01)
+                        self.assertEqual(adapter.get_state().grip, 1.0)
+
+                        # 手柄姿态改变带动末端；断流立即冻结，恢复后重新锚定。
+                        source._orientation._rotation = rotation_z(0.7)
+                        clock.advance(0.01)
+                        feed(acceleration)
+                        controller._tick()
+                        self.assertFalse(np.allclose(controller._target_rot, held_rotation))
+                        frozen_rot = controller._target_rot.copy()
+                        frozen_pos = controller._target_pos.copy()
+                        clock.advance(0.6)
+                        controller._tick()
+                        np.testing.assert_allclose(controller._target_pos, frozen_pos)
+                        np.testing.assert_allclose(controller._target_rot, frozen_rot)
+                        np.testing.assert_allclose(adapter.virtual_velocity, 0.0)
+                        clock.advance(0.01)
+                        feed([0, 0, 1])
+                        controller._tick()
+                        np.testing.assert_allclose(controller._target_pos, frozen_pos)
+                        np.testing.assert_allclose(controller._target_rot, frozen_rot)
+                        source.handle_control_event(
+                            LinuxEventCodes.EV_KEY,
+                            getattr(LinuxEventCodes, JOYCON_PROFILES[side].clutch), 0,
+                        )
+                        clock.advance(0.01)
+                        feed(acceleration)
+                        controller._tick()
+                        np.testing.assert_allclose(controller._target_pos, frozen_pos)
+                        np.testing.assert_allclose(controller._target_rot, frozen_rot)
+                        # 松开时改变手柄方向，重新按下只锚定，不跳变。
+                        source._orientation._rotation = rotation_z(-0.4)
+                        source.handle_control_event(
+                            LinuxEventCodes.EV_KEY,
+                            getattr(LinuxEventCodes, JOYCON_PROFILES[side].clutch), 1,
+                        )
+                        clock.advance(0.01)
+                        feed([0, 0, 1])
+                        controller._tick()
+                        np.testing.assert_allclose(controller._target_pos, frozen_pos)
+                        np.testing.assert_allclose(controller._target_rot, frozen_rot)
+                        source.handle_control_event(
+                            LinuxEventCodes.EV_KEY,
+                            getattr(LinuxEventCodes, JOYCON_PROFILES[side].clutch), 0,
+                        )
+                        clock.advance(0.01)
+                        controller._tick()
 
 
 class RecordingController:

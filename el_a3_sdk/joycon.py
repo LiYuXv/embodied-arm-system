@@ -403,6 +403,8 @@ class ImuOrientationFilter:
         accel_g: Sequence[float],
         gyro_rad_s: Sequence[float],
         timestamp: float,
+        *,
+        correct_gravity: bool = True,
     ) -> np.ndarray:
         accel = np.asarray(accel_g, dtype=float)
         gyro = np.asarray(gyro_rad_s, dtype=float)
@@ -424,14 +426,14 @@ class ImuOrientationFilter:
         dt = min(dt, self.max_dt)
 
         stationary = abs(accel_norm - 1.0) < 0.12 and np.linalg.norm(gyro) < 0.05
-        if stationary:
+        if stationary and correct_gravity:
             alpha = min(dt / max(self.gyro_bias_time_constant, dt), 0.02)
             self._gyro_bias += alpha * (gyro - self._gyro_bias)
 
         corrected_gyro = gyro - self._gyro_bias
         self._rotation = self._rotation @ _rotation_vector_matrix(corrected_gyro * dt)
 
-        if 0.75 < accel_norm < 1.25:
+        if correct_gravity and 0.75 < accel_norm < 1.25:
             measured_world = self._rotation @ (accel / accel_norm)
             gravity_error_world = np.cross(measured_world, np.array([0.0, 0.0, 1.0]))
             correction = self.gravity_correction * gravity_error_world * dt
@@ -474,6 +476,8 @@ class JoyConInput:
         self._angular_velocity = np.zeros(3)
         self._last_imu_time: Optional[float] = None
         self._orientation = ImuOrientationFilter()
+        # 平移单独估计重力，标准模式的姿态滤波及其标定保持原样。
+        self._motion_orientation = ImuOrientationFilter()
         self._stick_calibration = self._read_stick_calibration()
         self._accel_resolution = self._axis_resolution("ABS_X", self.ACCEL_RESOLUTION)
         self._gyro_resolution = self._axis_resolution(
@@ -603,8 +607,14 @@ class JoyConInput:
             gyro_dps = self._axis_values[3:] / self._gyro_resolution
             gyro_rad_s = np.deg2rad(gyro_dps)
             self._orientation.update(accel_g, gyro_rad_s, sample_time)
+            self._motion_orientation.update(
+                accel_g, gyro_rad_s, sample_time,
+                # 水平平移也几乎满足 |a|≈1g，不能据此判定静止或校正倾角。
+                # 离合按住期间只用陀螺仪跟踪重力方向；松开后恢复重力校正。
+                correct_gravity=self._code(self.profile.clutch) not in self._buttons,
+            )
             if self._orientation.initialized:
-                accel_world_g = self._orientation.world_rotation @ accel_g
+                accel_world_g = self._motion_orientation.world_rotation @ accel_g
                 self._linear_acceleration = (
                     accel_world_g - np.array([0.0, 0.0, 1.0])
                 ) * STANDARD_GRAVITY
@@ -755,6 +765,10 @@ class JoyConPoseAdapter:
             self._reset_imu_motion()
             return
 
+        # 真机方向标定：固定系水平轴与机械臂基座相反，X/Y 取反，Z 保持。
+        # 仅用于 IMU 平移，不影响标准模式摇杆或姿态映射。
+        acceleration = acceleration * np.array([-1.0, -1.0, 1.0])
+
         if self.accel_lowpass_tau <= 0.0:
             alpha = 1.0
         else:
@@ -824,10 +838,11 @@ class JoyConPoseAdapter:
 
         self.exit_requested = self.exit_requested or state.exit
         return RelativePoseInput(
-            # 标准模式平移不依赖 IMU；动作模式的全位姿由有效离合门控。
+            # 标准模式平移不依赖 IMU；动作模式平移由适配器内的离合门控。
             valid=connected,
             position=self._position.copy(),
             rotation=state.rotation.copy(),
+            # 两种模式均由 ZL/ZR 接合旋转离合；动作模式同时门控平移。
             grip=1.0 if state.valid and state.clutch else 0.0,
             joystick_y=float(state.gripper_close) - float(state.gripper_open),
             button_a=state.zero,

@@ -94,13 +94,21 @@ class JoyConPanel(QWidget):
         self.control_btn.setEnabled(False)
         self.control_btn.clicked.connect(self._toggle_control)
         control_row.addWidget(self.control_btn)
-        control_row.addWidget(QLabel("运动缩放:"))
+        control_row.addWidget(QLabel("位置缩放:"))
         self.scale_spin = QDoubleSpinBox()
         self.scale_spin.setRange(0.1, 2.0)
         self.scale_spin.setSingleStep(0.1)
         self.scale_spin.setValue(1.0)
         self.scale_spin.valueChanged.connect(self._set_scale)
         control_row.addWidget(self.scale_spin)
+        control_row.addWidget(QLabel("姿态缩放:"))
+        self.rotation_scale_spin = QDoubleSpinBox()
+        self.rotation_scale_spin.setRange(0.0, 2.0)
+        self.rotation_scale_spin.setSingleStep(0.1)
+        self.rotation_scale_spin.setValue(1.0)
+        self.rotation_scale_spin.setToolTip("仅 IMU 动作模式；0 表示保持姿态，0.5 表示半幅旋转")
+        self.rotation_scale_spin.setEnabled(False)
+        control_row.addWidget(self.rotation_scale_spin)
         control_row.addStretch()
         control_layout.addLayout(control_row)
 
@@ -113,7 +121,7 @@ class JoyConPanel(QWidget):
 
         help_label = QLabel(
             "标准模式：摇杆/按键控制 XYZ（无需离合），ZL/ZR 只门控姿态。  |  "
-            "IMU 动作模式：按住 ZL/ZR，以手柄平移动作和姿态控制末端；松开立即冻结。  |  "
+            "IMU 动作模式：按住 ZL/ZR，手柄平移控制末端 XYZ，转动控制姿态；松开冻结位置和姿态。  |  "
             "方向键或面键：夹爪  |  "
             "摇杆按下：回零  |  L/R：回工作位"
         )
@@ -220,6 +228,9 @@ class JoyConPanel(QWidget):
                 state_getter=self._adapter.get_state,
                 update_rate=100.0,
                 scale=self.scale_spin.value(),
+                rotation_scale=(self.rotation_scale_spin.value()
+                                if self.mode_combo.currentData() == JOYCON_MODE_IMU_MOTION
+                                else 1.0),
                 position_fix=np.ones(3),
                 rotation_fix=JOYCON_ROTATION_FIX,
                 remap_rotation_rpy=False,
@@ -288,6 +299,7 @@ class JoyConPanel(QWidget):
         mode = self.mode_combo.currentData()
         if self._adapter is not None and hasattr(self._adapter, "set_mode"):
             self._adapter.set_mode(mode)
+        self._update_buttons()
         label = self.mode_combo.currentText()
         self.joycon_log.emit(f"Joy-Con 控制模式已切换为：{label}")
 
@@ -313,6 +325,15 @@ class JoyConPanel(QWidget):
             "disconnectBtn" if self._control_running else "enableBtn"
         )
         self.mode_combo.setEnabled(not self._control_running)
+        # 缩放以离合锚点为基准，运行中改变会导致目标跳变，停止后再调节。
+        self.scale_spin.setEnabled(
+            not self._control_running
+            or self.mode_combo.currentData() == JOYCON_MODE_STANDARD
+        )
+        self.rotation_scale_spin.setEnabled(
+            not self._control_running
+            and self.mode_combo.currentData() == JOYCON_MODE_IMU_MOTION
+        )
 
     def cleanup(self):
         if self._adapter is not None:

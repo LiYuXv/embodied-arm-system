@@ -21,11 +21,12 @@ from PyQt6.QtWidgets import (
 
 from el_a3_sdk import initialize_dual_arms
 from debugger.backend.arm_worker import ArmWorker
+from debugger.backend.vla_controller import DualArmVLAController
 from debugger.utils.theme_manager import ThemeManager
-from debugger.vla_features import DualArmActionDispatcher
 from debugger.widgets.dual_arm_panel import ArmControlPanel
 from debugger.widgets.dual_lerobot_panel import DualArmLeRobotPanel
 from debugger.widgets.triple_camera_panel import TripleCameraPanel
+from debugger.widgets.vla_inference_panel import VLAInferencePanel
 
 ARM_CAN_MAP = {
     "left_arm": "can0",
@@ -60,12 +61,12 @@ class MainWindow(QMainWindow):
         self._validate_arm_manager()
         self._init_workers(start_workers)
         self._init_ui()
-        self.vla_action_dispatcher = DualArmActionDispatcher(
-            self.left_worker,
-            self.right_worker,
-            execute=False,
-            print_fn=self._append_log,
+        self.vla_controller = DualArmVLAController(
+            self.vla_panel, self.left_worker, self.right_worker,
+            self._get_camera_frames, self._get_dual_arm_state,
+            self._get_dual_gripper_torque, self._append_log, parent=self,
         )
+        self.vla_action_dispatcher = self.vla_controller.dispatcher
         self._connect_signals()
         self.statusBar().showMessage(
             "就绪（双臂模拟模式）" if self._sim_mode else "就绪"
@@ -117,6 +118,8 @@ class MainWindow(QMainWindow):
             torque_callback=self._get_dual_gripper_torque,
         )
         root.addWidget(self.lerobot_panel)
+        self.vla_panel = VLAInferencePanel(self)
+        root.addWidget(self.vla_panel)
 
         vertical = QSplitter(Qt.Orientation.Vertical)
         root.addWidget(vertical, 1)
@@ -250,7 +253,12 @@ class MainWindow(QMainWindow):
 
     def preview_vla_action_chunk(self, action_chunk, step=0):
         """Split/print one dual VLA step; hardware execution stays disabled."""
-        return self.vla_action_dispatcher.dispatch(action_chunk, step=step)
+        execute = self.vla_action_dispatcher.execute
+        self.vla_action_dispatcher.execute = False
+        try:
+            return self.vla_action_dispatcher.dispatch(action_chunk, step=step)
+        finally:
+            self.vla_action_dispatcher.execute = execute
 
     def _connect_arm(self, arm_name):
         self.arm_panels[arm_name].request_connect()
@@ -261,6 +269,7 @@ class MainWindow(QMainWindow):
                 self._connect_arm(arm_name)
 
     def _disconnect_all(self):
+        self.vla_controller.stop()
         for worker in self.workers.values():
             worker.submit_command("disconnect")
 
@@ -270,15 +279,18 @@ class MainWindow(QMainWindow):
                 worker.submit_command("enable")
 
     def _disable_all(self):
+        self.vla_controller.stop()
         for worker in self.workers.values():
             worker.submit_command("disable")
 
     def _stop_all(self):
+        self.vla_controller.stop()
         for worker in self.workers.values():
             worker.submit_command("cancel_motion")
         self._append_log("已下发双臂停止运动命令")
 
     def _emergency_stop_all(self):
+        self.vla_controller.stop()
         for worker in self.workers.values():
             worker.submit_command("emergency_stop")
         self._append_log("已下发双臂急停命令")
@@ -287,10 +299,14 @@ class MainWindow(QMainWindow):
         self._connected[arm_name] = connected
         if not connected:
             self._enabled[arm_name] = False
+            if hasattr(self, "vla_controller"):
+                self.vla_controller.stop()
         self._update_system_status()
 
     def _on_enabled(self, arm_name, enabled):
         self._enabled[arm_name] = enabled
+        if not enabled and hasattr(self, "vla_controller"):
+            self.vla_controller.stop()
         self._update_system_status()
 
     def _update_system_status(self):
@@ -323,6 +339,7 @@ class MainWindow(QMainWindow):
             return
         self._closing = True
         self._append_log("正在停止双臂与摄像头…")
+        self.vla_controller.shutdown()
         self.lerobot_panel.cleanup()
         self.camera_panel.cleanup()
         for panel in self.arm_panels.values():

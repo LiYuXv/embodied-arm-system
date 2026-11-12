@@ -1,9 +1,13 @@
 """Three independent USB camera previews for the dual-arm debugger."""
 
-from PyQt6.QtCore import Qt, pyqtSignal
+import time
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -38,6 +42,10 @@ class CameraStreamWidget(QGroupBox):
         self._thread = None
         self._last_pixmap = None
         self._last_frame = None
+        self._autofocus_enabled = False
+        self._focus_value = 0.5
+        self._exposure_locked = True
+        self._locked_exposure = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -64,6 +72,34 @@ class CameraStreamWidget(QGroupBox):
         row.addWidget(self.status_label)
         row.addStretch()
         layout.addLayout(row)
+
+        camera_controls = QHBoxLayout()
+        self.chk_autofocus = QCheckBox("自动对焦")
+        self.chk_autofocus.setChecked(self._autofocus_enabled)
+        self.chk_autofocus.toggled.connect(self._on_autofocus_toggled)
+        camera_controls.addWidget(self.chk_autofocus)
+
+        camera_controls.addWidget(QLabel("焦距:"))
+        self.focus_spin = QDoubleSpinBox()
+        self.focus_spin.setRange(0.0, 1.0)
+        self.focus_spin.setSingleStep(0.05)
+        self.focus_spin.setDecimals(2)
+        self.focus_spin.setValue(self._focus_value)
+        self.focus_spin.setFixedWidth(70)
+        self.focus_spin.setEnabled(not self._autofocus_enabled)
+        self.focus_spin.valueChanged.connect(self._on_focus_changed)
+        camera_controls.addWidget(self.focus_spin)
+
+        self.chk_exposure_lock = QCheckBox("锁定曝光")
+        self.chk_exposure_lock.setChecked(self._exposure_locked)
+        self.chk_exposure_lock.setToolTip(
+            "勾选：先让自动曝光收敛，再冻结当前曝光；\n"
+            "取消：恢复自动曝光。"
+        )
+        self.chk_exposure_lock.toggled.connect(self._on_exposure_lock_toggled)
+        camera_controls.addWidget(self.chk_exposure_lock)
+        camera_controls.addStretch()
+        layout.addLayout(camera_controls)
 
     @staticmethod
     def _default_capture_factory(index):
@@ -121,6 +157,15 @@ class CameraStreamWidget(QGroupBox):
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+        self._apply_focus(cap)
+        if self._exposure_locked:
+            if self._locked_exposure is not None:
+                self._apply_exposure_lock(cap)
+            else:
+                QTimer.singleShot(
+                    800, lambda c=cap: self._apply_exposure_lock_deferred(c)
+                )
+
         thread = self._thread_factory(index, cap)
         thread.frame_ready.connect(self._on_frame)
         if hasattr(thread, "error_occurred"):
@@ -133,6 +178,95 @@ class CameraStreamWidget(QGroupBox):
         self.status_label.setText(f"运行中 · video{index}")
         self.log_message.emit(f"{self.stream_name}: 已启动 /dev/video{index}")
         return True
+
+    def _apply_focus(self, cap):
+        if cap is None:
+            return
+        try:
+            cap.set(
+                cv2.CAP_PROP_AUTOFOCUS,
+                1 if self._autofocus_enabled else 0,
+            )
+            if not self._autofocus_enabled:
+                cap.set(cv2.CAP_PROP_FOCUS, float(self._focus_value))
+        except Exception as exc:
+            self.log_message.emit(f"{self.stream_name}: 设置对焦失败: {exc}")
+
+    def _on_autofocus_toggled(self, checked):
+        self._autofocus_enabled = bool(checked)
+        self.focus_spin.setEnabled(not checked)
+        self._apply_focus(self._cap)
+
+    def _on_focus_changed(self, value):
+        self._focus_value = float(value)
+        if not self._autofocus_enabled:
+            self._apply_focus(self._cap)
+
+    def _set_exposure_mode(self, cap, auto):
+        if cap is None:
+            return False
+        plans = (
+            [(3, (3.0, 0.75)), (0, (0.0,))]
+            if auto
+            else [(1, (1.0, 0.25))]
+        )
+        for target, values in plans:
+            for value in values:
+                try:
+                    if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, value):
+                        continue
+                    mode = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                    if (
+                        int(round(mode)) == target
+                        or abs(mode - target * 0.25) < 1e-3
+                    ):
+                        return True
+                except Exception:
+                    continue
+        self.log_message.emit(
+            f"{self.stream_name}: "
+            f"{'自动' if auto else '手动'}曝光模式切换失败"
+        )
+        return False
+
+    def _apply_exposure_lock(self, cap):
+        if cap is None:
+            return
+        try:
+            if self._exposure_locked:
+                if not self._set_exposure_mode(cap, auto=False):
+                    return
+                if self._locked_exposure is None:
+                    time.sleep(0.05)
+                    locked = cap.get(cv2.CAP_PROP_EXPOSURE)
+                    if locked is not None and locked > 0:
+                        self._locked_exposure = float(locked)
+                else:
+                    cap.set(
+                        cv2.CAP_PROP_EXPOSURE,
+                        float(self._locked_exposure),
+                    )
+                actual = cap.get(cv2.CAP_PROP_EXPOSURE)
+                self.log_message.emit(
+                    f"{self.stream_name}: 曝光已锁定 "
+                    f"(value={actual:.1f})"
+                )
+            else:
+                self._set_exposure_mode(cap, auto=True)
+                self.log_message.emit(f"{self.stream_name}: 自动曝光已恢复")
+        except Exception as exc:
+            self.log_message.emit(f"{self.stream_name}: 设置曝光失败: {exc}")
+
+    def _apply_exposure_lock_deferred(self, cap):
+        if not self._exposure_locked or self._cap is not cap:
+            return
+        self._apply_exposure_lock(cap)
+
+    def _on_exposure_lock_toggled(self, checked):
+        self._exposure_locked = bool(checked)
+        if not checked:
+            self._locked_exposure = None
+        self._apply_exposure_lock(self._cap)
 
     def stop_stream(self):
         thread, cap = self._thread, self._cap

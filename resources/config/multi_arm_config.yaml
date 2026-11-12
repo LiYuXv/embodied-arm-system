@@ -3,8 +3,14 @@ arms:
     enabled: true
     can_interface: can0
     host_can_id: 253
+    inertia_config_path: inertia_params.yaml
+    per_joint_kd_min: {4: 0.005, 5: 0.005, 6: 0.005, 7: 0.02}
+    per_joint_kd_max: {4: 0.10, 5: 0.05, 6: 0.05, 7: 0.10}
 
   right_arm:
     enabled: true
     can_interface: can1
     host_can_id: 253
+    inertia_config_path: inertia_params.yaml
+    per_joint_kd_min: {4: 0.005, 5: 0.005, 6: 0.005, 7: 0.02}
+    per_joint_kd_max: {4: 0.10, 5: 0.05, 6: 0.05, 7: 0.10}

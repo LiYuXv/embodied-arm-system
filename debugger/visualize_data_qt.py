@@ -21,6 +21,7 @@ import time
 import math
 import logging
 import warnings
+import threading
 import numpy as np
 import pandas as pd
 import torch
@@ -112,6 +113,10 @@ ARM_JOINT_NAMES = [
     "L4_joint", "L5_joint", "L6_joint", "L7_joint",
 ]
 
+DUAL_ARM_DOF = 14
+GRIPPER_TORQUE_DOF = 2
+ACTION_STATE_HORIZON = 5
+CAMERA_KEYS = tuple(f"observation.images.cam{i}" for i in range(1, 4))
 
 def quat_to_rpy_recording(qw, qx, qy, qz):
     """与录制端 euler_to_quat（XYZ 内旋，R=Rx·Ry·Rz）配对的四元数→欧拉角解算。
@@ -131,12 +136,104 @@ def quat_to_rpy_recording(qw, qx, qy, qz):
     return rx, ry, rz
 
 
+def parse_state_trajectory(states, gripper_torque=None):
+    """把支持的 state 矩阵解析为绘图/统计使用的纯 numpy 序列。
+
+    仅 8 维被视为旧四元数末端位姿；14 维严格按 left7 + right7
+    关节空间解析，避免把双臂数据误当成四元数。
+    """
+    states = np.asarray(states, dtype=np.float64)
+    if states.ndim != 2:
+        raise ValueError(f"state 必须是二维矩阵，实际 shape={states.shape}")
+    n, dim = states.shape
+    if dim == 14:
+        result = {'dual_arm': True, 'state_dim': 14}
+        for j in range(6):
+            result[f'left_j{j + 1}'] = states[:, j]
+            result[f'right_j{j + 1}'] = states[:, 7 + j]
+        result['left_gripper'] = states[:, 6]
+        result['right_gripper'] = states[:, 13]
+    elif dim == 8:
+        qx, qy, qz, qw = (states[:, i] for i in range(3, 7))
+        rx_arr = np.empty(n); ry_arr = np.empty(n); rz_arr = np.empty(n)
+        for i in range(n):
+            rx_arr[i], ry_arr[i], rz_arr[i] = quat_to_rpy_recording(
+                float(qw[i]), float(qx[i]), float(qy[i]), float(qz[i]))
+        result = {
+            'dual_arm': False, 'state_dim': 8,
+            'x': states[:, 0], 'y': states[:, 1], 'z': states[:, 2],
+            'rx': rx_arr, 'ry': ry_arr, 'rz': rz_arr,
+            'gripper': np.radians(states[:, 7]),
+        }
+    elif dim == 7:
+        result = {
+            'dual_arm': False, 'state_dim': 7,
+            'x': states[:, 0], 'y': states[:, 1], 'z': states[:, 2],
+            'rx': states[:, 3], 'ry': states[:, 4], 'rz': states[:, 5],
+            'gripper': states[:, 6],
+        }
+    else:
+        raise ValueError(f"不支持的 state 维度 {dim}；仅支持 7、8、14 维")
+
+    if gripper_torque is not None:
+        torque = np.asarray(gripper_torque, dtype=np.float64)
+        if torque.ndim == 1:
+            torque = torque.reshape(-1, 1)
+        if torque.ndim == 2 and torque.shape[0] == n and torque.shape[1] >= 1:
+            result['gripper_torque'] = torque[:, 0]
+            if result['dual_arm'] and torque.shape[1] >= 2:
+                result['right_gripper_torque'] = torque[:, 1]
+    return result
+
+
+def find_best_action_horizon(states, actions, episode_indices=None,
+                             max_horizon=20, atol=1e-6):
+    """在每个 episode 内搜索 action[t] 与 state[t+h] 的最佳 h（1..20）。"""
+    states = np.asarray(states, dtype=np.float64)
+    actions = np.asarray(actions, dtype=np.float64)
+    if states.ndim != 2 or actions.ndim != 2 or states.shape != actions.shape:
+        return None, []
+    if episode_indices is None:
+        episode_indices = np.zeros(len(states), dtype=np.int64)
+    episode_indices = np.asarray(episode_indices)
+    if len(episode_indices) != len(states):
+        return None, []
+
+    horizons = []
+    for horizon in range(1, max(1, int(max_horizon)) + 1):
+        abs_sum = 0.0
+        value_count = 0
+        exact_frames = 0
+        frame_count = 0
+        for ep in np.unique(episode_indices):
+            idx = np.flatnonzero(episode_indices == ep)
+            if len(idx) <= horizon:
+                continue
+            delta = np.abs(actions[idx[:-horizon]] - states[idx[horizon:]])
+            abs_sum += float(delta.sum())
+            value_count += int(delta.size)
+            exact_frames += int(np.count_nonzero(np.max(delta, axis=1) <= atol))
+            frame_count += int(len(delta))
+        if frame_count:
+            horizons.append({
+                'horizon': horizon,
+                'mae': abs_sum / max(value_count, 1),
+                'exact_frames': exact_frames,
+                'frame_count': frame_count,
+                'exact_fraction': exact_frames / frame_count,
+            })
+    if not horizons:
+        return None, []
+    best = min(horizons, key=lambda item: (item['mae'], -item['exact_fraction'], item['horizon']))
+    return best, horizons
+
+
 def solve_episode_joint_angles(states):
     """对整段 episode 的末端位姿序列批量反求关节角度。
 
     Args:
         states: (N, M) 数组，自动识别两种格式：
-          - M>=8 旧格式 [x,y,z,qx,qy,qz,qw,gripper_deg...]
+          - M==8 旧格式 [x,y,z,qx,qy,qz,qw,gripper_deg]
           - M==7 新格式 [x,y,z,rx,ry,rz,gripper_rad]
 
     Returns:
@@ -145,10 +242,12 @@ def solve_episode_joint_angles(states):
     if _KIN is None or states is None or len(states) == 0:
         return None
     states = np.asarray(states, dtype=float)
+    if states.ndim != 2 or states.shape[1] not in (7, 8):
+        return None
     n = len(states)
     result = np.zeros((n, 7), dtype=float)
     q_prev = [0.0] * 6
-    is_quat = states.shape[1] >= 8  # 旧四元数格式
+    is_quat = states.shape[1] == 8  # 只有 8 维才是旧四元数格式
     # 批量反解时降低 kinematics 日志级别，避免个别近奇异帧刷屏（仍沿用上一帧解）
     _kin_logger = logging.getLogger("el_a3_sdk.kinematics")
     _orig_level = _kin_logger.level
@@ -215,8 +314,11 @@ class OfflineDataset:
         self.fps = self.info.get("fps", 20)
         self.num_frames = len(self.data_df)
         
-        # 缓存视频读取器: {(episode_index, camera_name): cap}
+        # 缓存视频读取器: {(episode_index, camera_name): (cap, frame_idx, rgb)}
+        # GUI 主线程预览和 PlaybackThread 都会访问这里；OpenCV/FFmpeg 的
+        # VideoCapture 不能并发读/seek/release，同一把 RLock 串行化所有操作。
         self._video_caps = {}
+        self._video_lock = threading.RLock()
         
     def get_video_path(self, episode_index, camera_name):
         """根据 episodes 元数据查找视频文件路径"""
@@ -246,12 +348,18 @@ class OfflineDataset:
         return None
     
     def get_video_frame(self, episode_index, frame_index, camera_name):
-        """从视频中读取指定帧，返回 RGB numpy 数组。
+        """线程安全地读取指定视频帧，返回 RGB numpy 数组。"""
+        with self._video_lock:
+            return self._get_video_frame_unlocked(
+                episode_index, frame_index, camera_name
+            )
 
-        使用 imageio.v3 的 imiter 顺序读取。playback 通常是按帧顺序 0,1,2...
-        调用，因此缓存 generator 可大幅提升速度。随机访问时重新打开并跳过。
+    def _get_video_frame_unlocked(self, episode_index, frame_index, camera_name):
+        """实际视频读取逻辑；调用方必须持有 ``_video_lock``。
+
+        使用 OpenCV 缓存三路 VideoCapture；顺序播放直接读下一帧，拖动进度条时
+        通过 CAP_PROP_POS_FRAMES 定位，不依赖可选的 imageio 包。
         """
-        import imageio.v3 as iio
 
         video_path = self.get_video_path(episode_index, camera_name)
         if video_path is None:
@@ -261,29 +369,28 @@ class OfflineDataset:
         cached = self._video_caps.get(key)
 
         try:
-            if cached is not None:
-                gen, current_idx = cached
-                if frame_index == current_idx + 1:
-                    # 顺序读取：最快路径
-                    frame = next(gen)
-                    self._video_caps[key] = (gen, frame_index)
-                    return frame
-                elif frame_index == current_idx:
-                    # 重复请求同一帧：不支持回退，重新打开
-                    self._close_video_reader(key)
-                # 否则跳帧或倒退，需要重新定位
+            if cached is None:
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    cap.release()
+                    return None
+                current_idx = -1
+                last_rgb = None
+            else:
+                cap, current_idx, last_rgb = cached
 
-            # 新建 generator 并跳到目标帧
-            gen = iio.imiter(video_path)
-            # 跳过前 frame_index 帧
-            for _ in range(frame_index):
-                next(gen)
-            frame = next(gen)
-            self._video_caps[key] = (gen, frame_index)
-            return frame
-        except StopIteration:
-            # 帧索引超出范围
-            return None
+            if frame_index == current_idx and last_rgb is not None:
+                return last_rgb.copy()
+            if frame_index != current_idx + 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                self._close_video_reader(key)
+                return None
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self._video_caps[key] = (cap, int(frame_index), rgb)
+            return rgb.copy()
         except Exception as e:
             print(f"[OfflineDataset] 读取视频帧失败 ep={episode_index}, frame={frame_index}: {e}")
             # 失败后清理缓存，下次重试
@@ -294,22 +401,39 @@ class OfflineDataset:
         """关闭指定视频 reader"""
         cached = self._video_caps.pop(key, None)
         if cached is not None:
-            gen, _ = cached
+            cap = cached[0]
             try:
-                gen.close()
+                cap.release()
             except Exception:
                 pass
 
     def release_video_caps(self):
-        """释放所有视频读取器"""
-        for key in list(self._video_caps.keys()):
-            self._close_video_reader(key)
-        self._video_caps.clear()
+        """线程安全地释放所有视频读取器。"""
+        with self._video_lock:
+            for key in list(self._video_caps.keys()):
+                self._close_video_reader(key)
+            self._video_caps.clear()
     
     def is_video_feature(self, camera_name):
         """判断指定 camera 是否为 video 类型"""
         feature = self.features.get(camera_name, {})
         return feature.get("dtype") == "video" or feature.get("type") == "video"
+
+    def get_camera_names(self):
+        """动态枚举元数据、视频/图片目录和 parquet 中的全部相机特征。"""
+        names = set()
+        for name, feature in self.features.items():
+            dtype = feature.get("dtype") or feature.get("type")
+            if dtype in ("image", "video") or name.startswith("observation.images."):
+                names.add(name)
+        for base in (self.videos_dir, self.images_dir):
+            if base.is_dir():
+                names.update(p.name for p in base.iterdir() if p.is_dir())
+        names.update(
+            str(name) for name in self.data_df.columns
+            if str(name).startswith("observation.images.")
+        )
+        return sorted(names)
 
     def _load_episodes(self):
         """加载 episodes 元数据"""
@@ -1246,6 +1370,20 @@ class TrajectoryPlotWidget(QWidget):
             ymax = ymin + 1.0
         return ymin, ymax
 
+    def _curve_key_groups(self):
+        """返回当前数据模式下三幅子图及力矩轴对应的数据键。"""
+        if self._data and self._data.get('dual_arm'):
+            return (
+                ['left_j1', 'left_j2', 'left_j3', 'right_j1', 'right_j2', 'right_j3'],
+                ['left_j4', 'left_j5', 'left_j6', 'right_j4', 'right_j5', 'right_j6'],
+                ['left_gripper', 'right_gripper'],
+                ['gripper_torque', 'right_gripper_torque'],
+            )
+        return (
+            ['x', 'y', 'z'], ['rx', 'ry', 'rz'],
+            ['gripper'], ['gripper_torque'],
+        )
+
     def _capture_backgrounds(self):
         """捕获三幅子图的背景，用于 blit 快速更新播放竖线。"""
         try:
@@ -1351,7 +1489,9 @@ class TrajectoryPlotWidget(QWidget):
 
         self.ax_grip.set_xlabel(x_label)
 
-        title = "Episode 末端位姿变化曲线"
+        title = ("Episode 双臂关节轨迹曲线"
+                 if self._data and self._data.get('dual_arm')
+                 else "Episode 末端位姿变化曲线")
         if self._segment_mode:
             title += f"  [片段 {self._segment_start}~{self._segment_end}]"
         self.ax_pos.set_title(title)
@@ -1360,7 +1500,8 @@ class TrajectoryPlotWidget(QWidget):
             self._empty_plot()
             return
 
-        n = len(self._data.get('x', []))
+        anchor_key = 'left_j1' if self._data.get('dual_arm') else 'x'
+        n = len(self._data.get(anchor_key, []))
         if n == 0:
             self._empty_plot()
             return
@@ -1374,64 +1515,117 @@ class TrajectoryPlotWidget(QWidget):
         # 绘制静止区间灰色条（在曲线下层）
         self._draw_stationary_bars()
 
-        # 位置曲线（原始值）
-        sx = self._data.get('x', [])[s:e]
-        sy = self._data.get('y', [])[s:e]
-        sz = self._data.get('z', [])[s:e]
-        self.ax_pos.set_ylabel("位置 (m)")
-        self.lines['x'], = self.ax_pos.plot(indices, sx, 'r-', label='X', linewidth=1.2, zorder=2)
-        self.lines['y'], = self.ax_pos.plot(indices, sy, 'g-', label='Y', linewidth=1.2, zorder=2)
-        self.lines['z'], = self.ax_pos.plot(indices, sz, 'b-', label='Z', linewidth=1.2, zorder=2)
-        self.ax_pos.legend(loc='upper right', fontsize=8)
+        if self._data.get('dual_arm'):
+            # 双臂关节空间：上图 J1~J3，中图 J4~J6，下图双夹爪 + 双夹爪力矩
+            left_top = [('left_j1', 'L-J1'), ('left_j2', 'L-J2'), ('left_j3', 'L-J3')]
+            right_top = [('right_j1', 'R-J1'), ('right_j2', 'R-J2'), ('right_j3', 'R-J3')]
+            left_mid = [('left_j4', 'L-J4'), ('left_j5', 'L-J5'), ('left_j6', 'L-J6')]
+            right_mid = [('right_j4', 'R-J4'), ('right_j5', 'R-J5'), ('right_j6', 'R-J6')]
+            colors = ['r', 'g', 'b']
+            self.ax_pos.set_ylabel("关节 J1~J3 (rad)")
+            self.ax_euler.set_ylabel("关节 J4~J6 (rad)")
+            for i, (key, label) in enumerate(left_top):
+                self.ax_pos.plot(indices, self._data[key][s:e], color=colors[i],
+                                 linestyle='-', label=label, linewidth=1.1)
+            for i, (key, label) in enumerate(right_top):
+                self.ax_pos.plot(indices, self._data[key][s:e], color=colors[i],
+                                 linestyle='--', label=label, linewidth=1.1)
+            for i, (key, label) in enumerate(left_mid):
+                self.ax_euler.plot(indices, self._data[key][s:e], color=colors[i],
+                                   linestyle='-', label=label, linewidth=1.1)
+            for i, (key, label) in enumerate(right_mid):
+                self.ax_euler.plot(indices, self._data[key][s:e], color=colors[i],
+                                   linestyle='--', label=label, linewidth=1.1)
+            self.ax_pos.legend(loc='upper right', fontsize=7, ncol=2)
+            self.ax_euler.legend(loc='upper right', fontsize=7, ncol=2)
 
-        # 欧拉角曲线（rx/ry/rz，弧度）
-        rx = self._data.get('rx', [])[s:e]
-        ry = self._data.get('ry', [])[s:e]
-        rz = self._data.get('rz', [])[s:e]
-        self.ax_euler.set_ylabel("欧拉角 (rad)")
-        self.lines['rx'], = self.ax_euler.plot(indices, rx, 'c-', label='rx', linewidth=1.2, zorder=2)
-        self.lines['ry'], = self.ax_euler.plot(indices, ry, 'm-', label='ry', linewidth=1.2, zorder=2)
-        self.lines['rz'], = self.ax_euler.plot(indices, rz, 'y-', label='rz', linewidth=1.2, zorder=2)
-        self.ax_euler.legend(loc='upper right', fontsize=8)
+            self.ax_grip.set_ylabel("夹爪 (rad)")
+            self.ax_grip.plot(indices, self._data['left_gripper'][s:e], '-', label='左夹爪', linewidth=1.4)
+            self.ax_grip.plot(indices, self._data['right_gripper'][s:e], '--', label='右夹爪', linewidth=1.4)
+            self.ax_grip.legend(loc='upper left', fontsize=8)
 
-        # 夹爪曲线（弧度）
-        grip = self._data.get('gripper', [])[s:e]
-        self.ax_grip.set_ylabel("夹爪 (rad)")
-        self.lines['gripper'], = self.ax_grip.plot(
-            indices, grip, '#FF5722', label='夹爪', linewidth=1.5, zorder=2
-        )
-        self.ax_grip.legend(loc='upper left', fontsize=8)
-
-        # 夹爪力矩曲线（Nm，右侧 twin axis；仅有数据时绘制）
-        if self._has_torque and 'gripper_torque' in self._data:
-            torque = self._data.get('gripper_torque', [])[s:e]
-            self.ax_torque.set_ylabel("力矩 (Nm)")
-            self.lines['gripper_torque'], = self.ax_torque.plot(
-                indices, torque, '#9C27B0', label='力矩', linewidth=1.2,
-                alpha=0.8, zorder=2
-            )
-            self.ax_torque.legend(loc='upper right', fontsize=8)
+            if self._has_torque and 'gripper_torque' in self._data:
+                self.ax_torque.set_ylabel("力矩 (Nm)")
+                self.ax_torque.plot(indices, self._data['gripper_torque'][s:e],
+                                    '-', label='左力矩', linewidth=1.0, alpha=0.8)
+                if 'right_gripper_torque' in self._data:
+                    self.ax_torque.plot(indices, self._data['right_gripper_torque'][s:e],
+                                        '--', label='右力矩', linewidth=1.0, alpha=0.8)
+                self.ax_torque.legend(loc='upper right', fontsize=8)
+            else:
+                self.ax_torque.set_yticks([])
         else:
-            self.ax_torque.set_yticks([])
+            # 单臂旧格式兼容
+            sx = self._data.get('x', [])[s:e]
+            sy = self._data.get('y', [])[s:e]
+            sz = self._data.get('z', [])[s:e]
+            self.ax_pos.set_ylabel("位置 (m)")
+            self.lines['x'], = self.ax_pos.plot(indices, sx, 'r-', label='X', linewidth=1.2, zorder=2)
+            self.lines['y'], = self.ax_pos.plot(indices, sy, 'g-', label='Y', linewidth=1.2, zorder=2)
+            self.lines['z'], = self.ax_pos.plot(indices, sz, 'b-', label='Z', linewidth=1.2, zorder=2)
+            self.ax_pos.legend(loc='upper right', fontsize=8)
 
-        # 降噪预览：以虚线叠加平滑后的位置/欧拉角/夹爪曲线
+            rx = self._data.get('rx', [])[s:e]
+            ry = self._data.get('ry', [])[s:e]
+            rz = self._data.get('rz', [])[s:e]
+            self.ax_euler.set_ylabel("欧拉角 (rad)")
+            self.lines['rx'], = self.ax_euler.plot(indices, rx, 'c-', label='rx', linewidth=1.2, zorder=2)
+            self.lines['ry'], = self.ax_euler.plot(indices, ry, 'm-', label='ry', linewidth=1.2, zorder=2)
+            self.lines['rz'], = self.ax_euler.plot(indices, rz, 'y-', label='rz', linewidth=1.2, zorder=2)
+            self.ax_euler.legend(loc='upper right', fontsize=8)
+
+            grip = self._data.get('gripper', [])[s:e]
+            self.ax_grip.set_ylabel("夹爪 (rad)")
+            self.lines['gripper'], = self.ax_grip.plot(
+                indices, grip, '#FF5722', label='夹爪', linewidth=1.5, zorder=2
+            )
+            self.ax_grip.legend(loc='upper left', fontsize=8)
+
+            if self._has_torque and 'gripper_torque' in self._data:
+                torque = self._data.get('gripper_torque', [])[s:e]
+                self.ax_torque.set_ylabel("力矩 (Nm)")
+                self.lines['gripper_torque'], = self.ax_torque.plot(
+                    indices, torque, '#9C27B0', label='力矩', linewidth=1.2,
+                    alpha=0.8, zorder=2
+                )
+                self.ax_torque.legend(loc='upper right', fontsize=8)
+            else:
+                self.ax_torque.set_yticks([])
+
+        # 降噪预览：叠加平滑后的全部单臂/双臂维度
         if self._smoothed is not None:
             sm = self._smoothed
             labeled = False
-            for key, color in [('x', 'r'), ('y', 'g'), ('z', 'b')]:
+            if self._data.get('dual_arm'):
+                top_preview = [
+                    ('left_j1', 'r'), ('left_j2', 'g'), ('left_j3', 'b'),
+                    ('right_j1', 'r'), ('right_j2', 'g'), ('right_j3', 'b'),
+                ]
+                mid_preview = [
+                    ('left_j4', 'r'), ('left_j5', 'g'), ('left_j6', 'b'),
+                    ('right_j4', 'r'), ('right_j5', 'g'), ('right_j6', 'b'),
+                ]
+                grip_preview = [('left_gripper', '#FF5720'), ('right_gripper', '#1565C0')]
+            else:
+                top_preview = [('x', 'r'), ('y', 'g'), ('z', 'b')]
+                mid_preview = [('rx', 'c'), ('ry', 'm'), ('rz', 'y')]
+                grip_preview = [('gripper', '#FF5720')]
+            for key, color in top_preview:
                 if key in sm and len(sm[key]) >= e:
                     self.ax_pos.plot(
-                        indices, sm[key][s:e], color + '--', alpha=0.85, linewidth=1.0,
+                        indices, sm[key][s:e], color=color, linestyle=':',
+                        alpha=0.85, linewidth=1.0,
                         zorder=2, label='平滑预览' if not labeled else None
                     )
                     labeled = True
-            for key, color in [('rx', 'c'), ('ry', 'm'), ('rz', 'y')]:
+            for key, color in mid_preview:
                 if key in sm and len(sm[key]) >= e:
-                    self.ax_euler.plot(indices, sm[key][s:e], color + '--',
+                    self.ax_euler.plot(indices, sm[key][s:e], color=color, linestyle=':',
                                        alpha=0.85, linewidth=1.0, zorder=2)
-            if 'gripper' in sm and len(sm['gripper']) >= e:
-                self.ax_grip.plot(indices, sm['gripper'][s:e], '#FF5720',
-                                  linestyle='--', alpha=0.85, linewidth=1.0, zorder=2)
+            for key, color in grip_preview:
+                if key in sm and len(sm[key]) >= e:
+                    self.ax_grip.plot(indices, sm[key][s:e], color=color,
+                                      linestyle=':', alpha=0.85, linewidth=1.0, zorder=2)
             if labeled:
                 self.ax_pos.legend(loc='upper right', fontsize=8)
 
@@ -1486,7 +1680,11 @@ class TrajectoryPlotWidget(QWidget):
             return
 
         n = self._total_frames
-        keys = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
+        if self._data.get('dual_arm'):
+            keys = [f'left_j{i}' for i in range(1, 7)] + ['left_gripper']
+            keys += [f'right_j{i}' for i in range(1, 7)] + ['right_gripper']
+        else:
+            keys = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
 
         # 每个指标以整段 Episode 的最大绝对值作为变化基准
         scales = {}
@@ -1554,33 +1752,36 @@ class TrajectoryPlotWidget(QWidget):
             self._empty_plot()
             return
 
-        x = frames_data.get('x')
-        if x is None or len(x) == 0:
+        anchor_key = 'left_j1' if frames_data.get('dual_arm') else 'x'
+        anchor = frames_data.get(anchor_key)
+        if anchor is None or len(anchor) == 0:
             self._empty_plot()
             return
 
-        self._total_frames = len(x)
+        self._total_frames = len(anchor)
         self._segment_start = 0
         self._segment_end = self._total_frames - 1
 
-        # 先计算 Y 范围，_plot_data 中的 cursor_label 会用到
-        ymin, ymax = self._compute_y_range(['x', 'y', 'z'], 0, self._total_frames - 1)
+        # 先计算 Y 范围，双臂时把左右两侧都纳入范围
+        top_keys, mid_keys, grip_keys, torque_keys = self._curve_key_groups()
+
+        ymin, ymax = self._compute_y_range(top_keys, 0, self._total_frames - 1)
         self._y_center = (ymin + ymax) / 2.0
-        self._y_base_half_range = (ymax - ymin) / 2.0
+        self._y_base_half_range = max((ymax - ymin) / 2.0, 1e-6)
         self._y_half_range = self._y_base_half_range
 
-        qmin, qmax = self._compute_y_range(['rx', 'ry', 'rz'], 0, self._total_frames - 1)
+        qmin, qmax = self._compute_y_range(mid_keys, 0, self._total_frames - 1)
         self._euler_y_center = (qmin + qmax) / 2.0
         self._euler_y_half_range = max((qmax - qmin) / 2.0, 1e-6)
 
-        gmin, gmax = self._compute_y_range(['gripper'], 0, self._total_frames - 1)
+        gmin, gmax = self._compute_y_range(grip_keys, 0, self._total_frames - 1)
         self._grip_y_center = (gmin + gmax) / 2.0
         self._grip_y_half_range = max((gmax - gmin) / 2.0, 1e-6)
 
         # 夹爪力矩 Y 轴范围（仅有数据时计算）
         self._has_torque = 'gripper_torque' in (frames_data or {})
         if self._has_torque:
-            tmin, tmax = self._compute_y_range(['gripper_torque'], 0, self._total_frames - 1)
+            tmin, tmax = self._compute_y_range(torque_keys, 0, self._total_frames - 1)
             self._torque_y_center = (tmin + tmax) / 2.0
             self._torque_y_half_range = max((tmax - tmin) / 2.0, 1e-6)
         else:
@@ -1624,22 +1825,23 @@ class TrajectoryPlotWidget(QWidget):
         self._segment_end = end
         segment_len = end - start + 1
 
-        # 先计算片段 Y 范围
-        ymin, ymax = self._compute_y_range(['x', 'y', 'z'], start, end)
+        # 先计算片段 Y 范围（双臂包含左右全部曲线）
+        top_keys, mid_keys, grip_keys, torque_keys = self._curve_key_groups()
+        ymin, ymax = self._compute_y_range(top_keys, start, end)
         self._y_center = (ymin + ymax) / 2.0
-        self._y_base_half_range = (ymax - ymin) / 2.0
+        self._y_base_half_range = max((ymax - ymin) / 2.0, 1e-6)
         self._y_half_range = self._y_base_half_range
 
-        qmin, qmax = self._compute_y_range(['rx', 'ry', 'rz'], start, end)
+        qmin, qmax = self._compute_y_range(mid_keys, start, end)
         self._euler_y_center = (qmin + qmax) / 2.0
         self._euler_y_half_range = max((qmax - qmin) / 2.0, 1e-6)
 
-        gmin, gmax = self._compute_y_range(['gripper'], start, end)
+        gmin, gmax = self._compute_y_range(grip_keys, start, end)
         self._grip_y_center = (gmin + gmax) / 2.0
         self._grip_y_half_range = max((gmax - gmin) / 2.0, 1e-6)
 
         if self._has_torque:
-            tmin, tmax = self._compute_y_range(['gripper_torque'], start, end)
+            tmin, tmax = self._compute_y_range(torque_keys, start, end)
             self._torque_y_center = (tmin + tmax) / 2.0
             self._torque_y_half_range = max((tmax - tmin) / 2.0, 1e-6)
 
@@ -2821,6 +3023,7 @@ def _smooth_pose_matrix(mat, method, window, polyorder, sigma):
     - 旧 8 维四元数格式（第 4~7 维 qx,qy,qz,qw）：先做符号连续化（q 与 -q 等价），
       滤波后重新单位化，保证输出仍是合法旋转。
     - 新 7 维欧拉角格式：所有维度直接滤波（欧拉角无需符号连续化/单位化）。
+    - 双臂 14 维关节格式：左右臂所有维度逐维滤波，绝不进入四元数逻辑。
     """
     mat = np.asarray(mat, dtype=np.float64)
     if mat.ndim != 2 or mat.shape[0] < 3:
@@ -2829,7 +3032,7 @@ def _smooth_pose_matrix(mat, method, window, polyorder, sigma):
     for d in range(mat.shape[1]):
         out[:, d] = _smooth_1d(mat[:, d], method, window, polyorder, sigma)
     # 仅旧 8 维四元数格式才需要四元数符号连续化 + 单位化
-    if mat.shape[1] >= 8:
+    if mat.shape[1] == 8:
         q = mat[:, 3:7].copy()
         for i in range(1, len(q)):
             if float(np.dot(q[i], q[i - 1])) < 0.0:
@@ -3008,20 +3211,14 @@ class RobotArmReplayWidget(QWidget):
         self._joint_angles = None      # (N, 7) 预反解结果，None 表示未就绪
         self._current_frame = 0
         self._viewer = None
-        self._enabled = _KIN is not None
+        # 已有关节角时 Viewer3DPanel 可直接驱动，不应依赖 IK/pinocchio 是否可用。
+        self._enabled = True
         self._init_ui(urdf_path, mesh_dir)
 
     def _init_ui(self, urdf_path, mesh_dir):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-
-        if not self._enabled:
-            label = QLabel("逆运动学模块 (pinocchio) 未加载，机械臂反解不可用")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setStyleSheet("color: #b00; font-size: 12px; padding: 24px;")
-            layout.addWidget(label)
-            return
 
         try:
             from debugger.widgets.viewer_3d import Viewer3DPanel
@@ -3130,10 +3327,86 @@ class RobotArmReplayWidget(QWidget):
         return self._joint_angles is not None and len(self._joint_angles) > 0
 
 
+class DualArmReplayWidget(QWidget):
+    """自适应单/双臂 3D 回放。
+
+    双臂数据使用同一个 VTK Viewer，通过下拉框切换左/右臂，避免同时创建
+    两个 QtInteractor 导致部分显卡/驱动上的 OpenGL context/VAO 崩溃。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._joint_angles = None
+        self._current_frame = 0
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("3D 显示:"))
+        self.arm_selector = QComboBox()
+        self.arm_selector.addItems(["左臂", "右臂"])
+        self.arm_selector.currentIndexChanged.connect(self._on_arm_changed)
+        selector_row.addWidget(self.arm_selector)
+        selector_row.addStretch()
+        layout.addLayout(selector_row)
+
+        self.arm_viewer = RobotArmReplayWidget(self)
+        layout.addWidget(self.arm_viewer, 1)
+        self.arm_selector.setVisible(False)
+
+    def _selected_angles(self):
+        if self._joint_angles is None:
+            return None
+        if self._joint_angles.shape[1] == 14:
+            return (
+                self._joint_angles[:, :7]
+                if self.arm_selector.currentIndex() == 0
+                else self._joint_angles[:, 7:14]
+            )
+        return self._joint_angles[:, :7]
+
+    def _on_arm_changed(self, _index):
+        selected = self._selected_angles()
+        if selected is None:
+            return
+        self.arm_viewer.set_joint_angles(selected)
+        self.arm_viewer.show_frame(self._current_frame)
+
+    def set_joint_angles(self, angles):
+        arr = np.asarray(angles) if angles is not None else None
+        if arr is None or arr.ndim != 2 or arr.shape[1] not in (7, 14):
+            self.clear()
+            return
+
+        self._joint_angles = arr[:, :14] if arr.shape[1] == 14 else arr[:, :7]
+        self._current_frame = 0
+        self.arm_selector.setVisible(arr.shape[1] == 14)
+        self._on_arm_changed(self.arm_selector.currentIndex())
+
+    def show_frame(self, frame_idx):
+        if self._joint_angles is None or len(self._joint_angles) == 0:
+            return
+        self._current_frame = max(
+            0, min(int(frame_idx), len(self._joint_angles) - 1)
+        )
+        self.arm_viewer.show_frame(self._current_frame)
+
+    def clear(self):
+        self._joint_angles = None
+        self._current_frame = 0
+        self.arm_selector.setVisible(False)
+        self.arm_viewer.clear()
+
+    def has_data(self):
+        return self._joint_angles is not None and len(self._joint_angles) > 0
+
+
 # ==================== 回放线程 ====================
 class PlaybackThread(QThread):
     """真机数据纯图像回放线程，支持暂停/继续"""
-    frame_data = pyqtSignal(object, object, object, object, int, object, object)  # cam1_rgb, cam2_rgb, action, state, step, timestamp, task_name
+    frame_data = pyqtSignal(object, object, object, object, object, object, int, object, object)
+    # cam1, cam2, cam3, action, state, torque, step, timestamp, task
     frame_updated = pyqtSignal(int, int)  # current_frame, total_frames
     episode_finished = pyqtSignal()
     playback_finished = pyqtSignal()
@@ -3201,10 +3474,12 @@ class PlaybackThread(QThread):
         # 获取图像
         cam1_img = self._load_image(ep_idx, step, "observation.images.cam1")
         cam2_img = self._load_image(ep_idx, step, "observation.images.cam2")
+        cam3_img = self._load_image(ep_idx, step, "observation.images.cam3")
         
         # 获取 action 和 state
-        action = np.array(row.get("action", [0] * 7))
-        state = np.array(row.get("observation.state", [0] * 7))
+        action = np.array(row.get("action", [0] * 14))
+        state = np.array(row.get("observation.state", [0] * 14))
+        torque = np.array(row.get("observation.gripper_torque", [0] * 2))
         timestamp = row.get("timestamp", step / self.dataset.fps)
         task_index = int(row.get("task_index", 0))
         
@@ -3214,7 +3489,10 @@ class PlaybackThread(QThread):
             task_name = self.dataset.tasks[task_index].get("task", "")
         
         # 发送帧数据
-        self.frame_data.emit(cam1_img, cam2_img, action, state, step, timestamp, task_name)
+        self.frame_data.emit(
+            cam1_img, cam2_img, cam3_img, action, state, torque,
+            step, timestamp, task_name
+        )
         self.frame_updated.emit(step + 1, total_frames)
         
     def run(self):
@@ -3336,11 +3614,11 @@ class PlaybackThread(QThread):
 
 # ==================== 数据集统计分布分析对话框 ====================
 class DatasetStatsDialog(QDialog):
-    """分析所选数据集所有 Episode 的位置 xyz、欧拉角、夹爪角度分布。
+    """分析所选数据集所有 Episode 的单臂位姿或双臂关节分布。
 
     以 Episode 编号为横轴，每个指标绘制 min~max 范围带与均值曲线，
     超出全局 均值±3σ 的 Episode 标记为异常值，便于发现极值与异常轨迹。
-    自动兼容 7 维欧拉角新格式与 8 维四元数旧格式（旧格式自动转欧拉角）。
+    兼容 7 维欧拉角、8 维四元数以及 14 维 left7 + right7 双臂格式。
     """
 
     def __init__(self, parent, dataset):
@@ -3356,6 +3634,7 @@ class DatasetStatsDialog(QDialog):
         hint = QLabel(
             "横轴为 Episode 编号；每幅子图灰色带表示该指标在该 Episode 内的最小值~最大值范围，"
             "蓝色实线为均值；红色点为异常值（该 Episode 均值偏离全局均值超过 3σ）。"
+            "双臂 14 维数据按左右 J1~J6 与夹爪分别统计。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("QLabel { color: #555; font-size: 11px; padding: 2px; }")
@@ -3402,36 +3681,22 @@ class DatasetStatsDialog(QDialog):
             return
 
         n_rows = states.shape[0]
-        zeros = np.zeros(n_rows)
-        # 自动识别格式：>=8 列为旧四元数格式，==7 为新欧拉角格式
-        if states.shape[1] >= 8:
-            qx = states[:, 3].astype(np.float64)
-            qy = states[:, 4].astype(np.float64)
-            qz = states[:, 5].astype(np.float64)
-            qw = states[:, 6].astype(np.float64)
-            rx_c = np.empty(n_rows); ry_c = np.empty(n_rows); rz_c = np.empty(n_rows)
-            for i in range(n_rows):
-                rx_c[i], ry_c[i], rz_c[i] = quat_to_rpy_recording(
-                    float(qw[i]), float(qx[i]), float(qy[i]), float(qz[i]))
-            metric_cols = {
-                'x': states[:, 0],
-                'y': states[:, 1],
-                'z': states[:, 2],
-                'rx': rx_c,
-                'ry': ry_c,
-                'rz': rz_c,
-                'gripper': np.radians(states[:, 7]),
-            }
+        try:
+            parsed = parse_state_trajectory(states)
+        except ValueError as e:
+            self.summary_text.setText(str(e))
+            return
+
+        if parsed['dual_arm']:
+            metrics = [f'left_j{i}' for i in range(1, 7)] + ['left_gripper']
+            metrics += [f'right_j{i}' for i in range(1, 7)] + ['right_gripper']
+            titles = [f'左臂 J{i} (rad)' for i in range(1, 7)] + ['左夹爪 (rad)']
+            titles += [f'右臂 J{i} (rad)' for i in range(1, 7)] + ['右夹爪 (rad)']
         else:
-            metric_cols = {
-                'x': states[:, 0],
-                'y': states[:, 1],
-                'z': states[:, 2],
-                'rx': states[:, 3] if states.shape[1] > 3 else zeros,
-                'ry': states[:, 4] if states.shape[1] > 4 else zeros,
-                'rz': states[:, 5] if states.shape[1] > 5 else zeros,
-                'gripper': states[:, 6] if states.shape[1] > 6 else zeros,
-            }
+            metrics = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
+            titles = ['位置 X (m)', '位置 Y (m)', '位置 Z (m)', '欧拉角 rx (rad)',
+                      '欧拉角 ry (rad)', '欧拉角 rz (rad)', '夹爪角度 (rad)']
+        metric_cols = {name: np.asarray(parsed[name]) for name in metrics}
 
         if "episode_index" in df.columns:
             ep_col = df["episode_index"].to_numpy()
@@ -3444,10 +3709,6 @@ class DatasetStatsDialog(QDialog):
         unique_eps, start_idx = np.unique(ep_sorted, return_index=True)
         split_points = start_idx[1:]
         x = np.arange(len(unique_eps))
-
-        metrics = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
-        titles = ['位置 X (m)', '位置 Y (m)', '位置 Z (m)', '欧拉角 rx (rad)',
-                  '欧拉角 ry (rad)', '欧拉角 rz (rad)', '夹爪角度 (rad)']
 
         stats = {}
         for m in metrics:
@@ -3462,6 +3723,8 @@ class DatasetStatsDialog(QDialog):
 
         # 绘图
         self.figure.clear()
+        n_rows_plot = int(math.ceil(len(metrics) / 2.0))
+        self.figure.set_size_inches(11, max(9, n_rows_plot * 2.0), forward=True)
         color_band = '#CFD8DC'
         color_line = '#1565C0'
         color_outlier = '#E53935'
@@ -3470,7 +3733,7 @@ class DatasetStatsDialog(QDialog):
         summary_lines = [f"全局统计（共 {len(unique_eps)} 个 Episode，{n_rows} 帧）：\n"]
 
         for idx, m in enumerate(metrics):
-            ax = self.figure.add_subplot(4, 2, idx + 1)
+            ax = self.figure.add_subplot(n_rows_plot, 2, idx + 1)
             s = stats[m]
             ax.fill_between(x, s['min'], s['max'], color=color_band, alpha=0.7, label='min~max 范围')
             ax.plot(x, s['mean'], color=color_line, linewidth=1.2, marker='.', markersize=3, label='均值')
@@ -3522,10 +3785,10 @@ class DatasetCheckDialog(QDialog):
     """检查数据集是否存在 数据问题分析.md 中记录的 5 类问题，给出能否训练的结论。
 
     问题1: meta/episodes 的 data 文件映射失效
-    问题2: 视频 to_timestamp 与实际视频时长不符
+    问题2: cam1/cam2/cam3 视频 to_timestamp 与实际视频时长不符
     问题3: data parquet 中 frame_index / timestamp 列错乱
     问题4: meta/stats.json 统计量不一致（count/维度）
-    问题5: action 与 observation.state 完全相同（恒等映射）
+    问题5: action[t] 必须与 observation.state[t+5] 对齐
     """
 
     def __init__(self, parent, dataset):
@@ -3570,11 +3833,27 @@ class DatasetCheckDialog(QDialog):
         lines = []
         lines.append(f"数据集: {self.root}")
         lines.append(f"总帧数: {N}  |  Episodes: {len(ds.episodes)}  |  FPS: {fps}")
-        lines.append(f"state 维度: {ds.features.get('observation.state', {}).get('shape', '?')}")
+        camera_names = ds.get_camera_names()
+        lines.append(f"相机特征: {', '.join(camera_names) if camera_names else '无'}")
         lines.append("=" * 64)
 
-        states = np.vstack(df["observation.state"].to_numpy()) if "observation.state" in df.columns else np.zeros((0, 1))
-        actions = np.vstack(df["action"].to_numpy()) if "action" in df.columns else np.zeros((0, 1))
+        def _stack_column(name):
+            if name not in df.columns or len(df) == 0:
+                return np.empty((0, 0), dtype=np.float64)
+            try:
+                arr = np.vstack(df[name].to_numpy()).astype(np.float64)
+                return arr if arr.ndim == 2 else arr.reshape(len(df), -1)
+            except Exception:
+                return np.empty((0, 0), dtype=np.float64)
+
+        states = _stack_column("observation.state")
+        actions = _stack_column("action")
+        torques = _stack_column("observation.gripper_torque")
+        lines.insert(-1, (
+            f"state/action/torque 维度: {states.shape[1] if states.ndim == 2 else 0} / "
+            f"{actions.shape[1] if actions.ndim == 2 else 0} / "
+            f"{torques.shape[1] if torques.ndim == 2 else 0}"
+        ))
         ep_col = df["episode_index"].to_numpy() if "episode_index" in df.columns else np.zeros(N, dtype=int)
         unique_eps = sorted(np.unique(ep_col))
 
@@ -3613,14 +3892,17 @@ class DatasetCheckDialog(QDialog):
         if ep_meta_files:
             for _, r in ep_df.iterrows():
                 ep = int(r["episode_index"]); length = int(r["length"])
-                for cam in ["cam1", "cam2"]:
-                    col_ci = f"videos/observation.images.{cam}/chunk_index"
-                    col_fi = f"videos/observation.images.{cam}/file_index"
-                    col_ts = f"videos/observation.images.{cam}/to_timestamp"
+                for camera_name in CAMERA_KEYS:
+                    cam = camera_name.rsplit('.', 1)[-1]
+                    col_ci = f"videos/{camera_name}/chunk_index"
+                    col_fi = f"videos/{camera_name}/file_index"
+                    col_ts = f"videos/{camera_name}/to_timestamp"
                     if col_ci not in r.index:
+                        ok2 = False
+                        vid_details.append(f"  ✗ ep{ep} {cam}: episodes 元数据缺少视频映射")
                         continue
                     ci = int(r[col_ci]); fi = int(r[col_fi])
-                    vp = ds.videos_dir / f"observation.images.{cam}" / f"chunk-{ci:03d}" / f"file-{fi:03d}.mp4"
+                    vp = ds.videos_dir / camera_name / f"chunk-{ci:03d}" / f"file-{fi:03d}.mp4"
                     if not vp.is_file():
                         ok2 = False; vid_details.append(f"  ✗ ep{ep} {cam}: {vp.name} 不存在")
                         continue
@@ -3633,8 +3915,8 @@ class DatasetCheckDialog(QDialog):
                         vid_details.append(
                             f"  ✗ ep{ep} {cam}: frames={nb} vs length={length} "
                             f"{'✓' if frame_ok else '✗'} | to_ts={to_ts} vs {length/fps:.2f} {'✓' if ts_ok else '✗'}")
-                    # 只打印前 3 个正常的 + 全部异常的
-                    elif len([d for d in vid_details if '✗' in d]) == 0 and ep in unique_eps[:3] and cam == "cam1":
+                    # 前 3 个 episode 的每路相机都打印，确保 cam3 等新增相机可见。
+                    elif ep in unique_eps[:3]:
                         vid_details.append(f"  ✓ ep{ep} {cam}: frames={nb}={length}, to_ts={to_ts:.2f}")
         if ok2:
             lines.append("  ✓ 全部视频帧数与 meta length 一致，to_timestamp=length/fps")
@@ -3666,13 +3948,14 @@ class DatasetCheckDialog(QDialog):
         results.append(ok3)
 
         # ---- 问题4: stats 一致性 ----
-        lines.append("\n【问题4】stats.json count 一致性")
+        lines.append("\n【问题4】stats.json count / 实际维度一致性")
         ok4 = True; bad4 = []
         # 注意：image/video 特征的 count 是“像素采样数”（LeRobot 对下采样后的像素做统计），
         # 不等于帧数 N；只有标量特征（state/action/timestamp/frame_index 等）的 count 才应 == N。
         # 因此对 image/video 特征只校验统计存在(>0)，不与 N 比较，避免误报。
-        for key in ["observation.state", "action", "observation.images.cam1",
-                     "observation.images.cam2", "timestamp", "frame_index"]:
+        checked_keys = ["observation.state", "action", "observation.gripper_torque",
+                        "timestamp", "frame_index", *CAMERA_KEYS]
+        for key in checked_keys:
             c = ds.stats.get(key, {}).get("count", [0])
             c = c[0] if isinstance(c, list) else c
             dtype = ds.features.get(key, {}).get("dtype", "")
@@ -3682,45 +3965,115 @@ class DatasetCheckDialog(QDialog):
             else:
                 if int(c) != N:
                     ok4 = False; bad4.append(f"{key}: count={c} ≠ N={N}")
-        dim_info = ds.features.get("observation.state", {}).get("shape", [0])[0]
-        dim_actual = states.shape[1] if states.size else 0
-        if int(dim_info) != dim_actual:
-            ok4 = False; bad4.append(f"state维度: info={dim_info} ≠ 实际={dim_actual}")
+        actual_mats = {
+            "observation.state": (states, DUAL_ARM_DOF),
+            "action": (actions, DUAL_ARM_DOF),
+            "observation.gripper_torque": (torques, GRIPPER_TORQUE_DOF),
+        }
+
+        dim_parts = []
+        for key, (mat, expected_dim) in actual_mats.items():
+            shape = ds.features.get(key, {}).get("shape", [])
+            dim_info = int(shape[0]) if shape else 0
+            dim_actual = int(mat.shape[1]) if mat.ndim == 2 and len(mat) else 0
+            dim_parts.append(f"{key.split('.')[-1]}={dim_actual}")
+            if dim_info != expected_dim or dim_actual != expected_dim:
+                ok4 = False
+                bad4.append(
+                    f"{key} 维度: info={dim_info}, 实际={dim_actual}, 要求={expected_dim}"
+                )
+        if int(fps) != 20:
+            ok4 = False
+            bad4.append(f"fps={fps}，要求=20")
+
         if ok4:
-            lines.append(f"  ✓ 标量特征 count={N}；图像特征 count 为像素采样数（正常）；维度一致(dim={dim_actual})")
+            lines.append(
+                f"  ✓ count 与维度一致（{', '.join(dim_parts)}）；"
+                "图像特征 count 为像素采样数（正常）；fps=20"
+            )
         else:
             for b in bad4:
                 lines.append(f"  ✗ {b}")
         results.append(ok4)
 
-        # ---- 问题5: 恒等映射 ----
-        lines.append("\n【问题5】action == observation.state 恒等映射")
-        diff = np.abs(actions - states).max(axis=1) if states.size else np.array([0])
-        match = 0; tot = 0
-        for ep in unique_eps:
-            mask = ep_col == ep
-            s = states[mask]; a = actions[mask]
-            if len(s) > 1:
-                d = np.abs(a[:-1] - s[1:]).max(axis=1)
-                match += int((d < 1e-6).sum()); tot += len(d)
-        identity = diff.max() < 1e-6 if len(diff) else True
-        pct = 100 * match / max(tot, 1)
-        lines.append(f"  max|a-s|={diff.max():.4f}, mean|a-s|={diff.mean():.6f}")
-        lines.append(f"  action[t]==state[t+1]: {match}/{tot} ({pct:.1f}%)")
-        if identity:
-            lines.append("  ✗ 存在 action==state 恒等映射！模型会退化为忽略视觉")
+        # ---- 问题5: action/state 时序对齐 / 恒等映射 ----
+        lines.append("\n【问题5】action/state 时序对齐")
+        comparable = (
+            states.ndim == 2 and actions.ndim == 2
+            and states.shape == actions.shape and states.size > 0
+        )
+        same_frame_identity = False
+        best = None
+        horizon_stats = []
+        if comparable:
+            same_frame_diff = np.max(np.abs(actions - states), axis=1)
+            same_frame_identity = bool(np.max(same_frame_diff) <= 1e-6)
+            lines.append(
+                f"  同帧 max|action-state|={same_frame_diff.max():.8g} "
+                f"→ {'✗ 恒等映射' if same_frame_identity else '✓ 非恒等映射'}"
+            )
+            best, horizon_stats = find_best_action_horizon(
+                states, actions, ep_col, max_horizon=20, atol=1e-6
+            )
+            if best is not None:
+                lines.append(
+                    f"  扫描 t+1..t+20 的最佳偏移: t+{best['horizon']} "
+                    f"(MAE={best['mae']:.8g}, 精确匹配={best['exact_fraction'] * 100:.1f}%)"
+                )
         else:
-            lines.append("  ✓ 无恒等映射问题")
-        results.append(not identity)
-        # 静止帧统计
-        static_pct = 100 * (diff < 1e-6).mean()
-        lines.append(f"  静止帧占比: {static_pct:.1f}% {'(偏高，建议裁剪)' if static_pct > 30 else ''}")
+            lines.append(f"  ✗ state/action 无法比较：shape={states.shape}/{actions.shape}")
+
+        is_dual = comparable and states.shape[1] == DUAL_ARM_DOF
+        if is_dual:
+            target = next(
+                (item for item in horizon_stats
+                 if item['horizon'] == ACTION_STATE_HORIZON),
+                None
+            )
+            aligned = bool(
+                target is not None
+                and target['frame_count'] > 0
+                and target['exact_frames'] == target['frame_count']
+                and best is not None
+                and best['horizon'] == ACTION_STATE_HORIZON
+            )
+            if target is not None:
+                lines.append(
+                    f"  双臂目标 t+{ACTION_STATE_HORIZON}: "
+                    f"{target['exact_frames']}/{target['frame_count']} "
+                    f"({target['exact_fraction'] * 100:.1f}%)"
+                )
+            lines.append(
+                f"  {'✓ 双臂 action[t]=state[t+5] 对齐正确' if aligned else '✗ 双臂 t+5 对齐异常'}"
+            )
+            ok5 = aligned
+        else:
+            # 旧单臂数据不强制 t+5，只要求不是同帧恒等映射且能找到有效前瞻关系。
+            ok5 = comparable and not same_frame_identity and best is not None
+        results.append(ok5)
+
+        # 静止帧统计：按 episode 对相邻 state 的全部实际维度（双臂即 14 维）判断。
+        static_frames = 0
+        transition_frames = 0
+        if states.size:
+            for ep in unique_eps:
+                s = states[ep_col == ep]
+                if len(s) > 1:
+                    delta = np.max(np.abs(np.diff(s, axis=0)), axis=1)
+                    static_frames += int(np.count_nonzero(delta <= 1e-6))
+                    transition_frames += len(delta)
+        static_pct = 100 * static_frames / max(transition_frames, 1)
+        lines.append(
+            f"  相邻 state 全 {states.shape[1] if states.ndim == 2 else 0} 维静止占比: "
+            f"{static_frames}/{transition_frames} ({static_pct:.1f}%) "
+            f"{'(偏高，建议裁剪)' if static_pct > 30 else ''}"
+        )
 
         # ---- 总结 ----
         all_ok = all(results)
         lines.append("\n" + "=" * 64)
         names = ["问题1 data文件映射", "问题2 视频帧数/to_ts", "问题3 frame_index/ts",
-                 "问题4 stats一致性", "问题5 恒等映射"]
+                 "问题4 stats/维度", "问题5 action/state时序"]
         for name, ok in zip(names, results):
             lines.append(f"  {'✓ 通过' if ok else '✗ 存在问题'}  {name}")
         lines.append("")
@@ -4034,22 +4387,32 @@ class MainWindow(QMainWindow):
         # 图像回放（上方）
         image_group = QGroupBox("图像回放")
         image_layout = QVBoxLayout(image_group)
+        camera_layout = QHBoxLayout()
         
         self.cam1_label = ImageLabel("摄像头 1 (Cam1)")
         self.cam1_label.setStyleSheet("background-color: #222; color: #fff; font-size: 12px; border: 1px solid #444;")
-        self.cam1_label.setMinimumSize(320, 180)
+        self.cam1_label.setMinimumSize(240, 180)
         self.cam1_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
-        image_layout.addWidget(self.cam1_label)
+        camera_layout.addWidget(self.cam1_label)
 
         self.cam2_label = ImageLabel("摄像头 2 (Cam2)")
         self.cam2_label.setStyleSheet("background-color: #222; color: #fff; font-size: 12px; border: 1px solid #444;")
-        self.cam2_label.setMinimumSize(320, 180)
+        self.cam2_label.setMinimumSize(240, 180)
         self.cam2_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
-        image_layout.addWidget(self.cam2_label)
+        camera_layout.addWidget(self.cam2_label)
+
+        self.cam3_label = ImageLabel("摄像头 3 (Cam3)")
+        self.cam3_label.setStyleSheet("background-color: #222; color: #fff; font-size: 12px; border: 1px solid #444;")
+        self.cam3_label.setMinimumSize(240, 180)
+        self.cam3_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        camera_layout.addWidget(self.cam3_label)
+        image_layout.addLayout(camera_layout)
 
         # 双击图像弹出全分辨率查看窗口
         self.cam1_label.doubleClicked.connect(
@@ -4058,30 +4421,32 @@ class MainWindow(QMainWindow):
         self.cam2_label.doubleClicked.connect(
             lambda: self._on_image_double_clicked("observation.images.cam2")
         )
+        self.cam3_label.doubleClicked.connect(
+            lambda: self._on_image_double_clicked("observation.images.cam3")
+        )
         
         self.frame_info_label = QLabel("帧信息: 未开始播放")
         self.frame_info_label.setStyleSheet("QLabel { color: #666; font-size: 11px; padding: 5px; }")
         self.frame_info_label.setWordWrap(True)
-        self.frame_info_label.setMinimumHeight(80)
+        self.frame_info_label.setMinimumHeight(135)
         image_layout.addWidget(self.frame_info_label)
         middle_layout.addWidget(image_group, stretch=4)
 
-        # 机械臂 3D 可视化（下方：根据末端位姿反解关节角度并实时显示）
-        arm_group = QGroupBox("机械臂可视化 (末端位姿反解关节角度)")
+        # 机械臂 3D 可视化：双臂关节直接驱动；旧单臂位姿继续 IK。
+        arm_group = QGroupBox("双臂 3D 关节回放")
         arm_layout = QVBoxLayout(arm_group)
         arm_layout.setContentsMargins(2, 2, 2, 2)
-        self.robot_arm_widget = RobotArmReplayWidget()
+        self.robot_arm_widget = DualArmReplayWidget()
         arm_layout.addWidget(self.robot_arm_widget)
         middle_layout.addWidget(arm_group, stretch=5)
 
         splitter.addWidget(middle_panel)
 
-        # ===== 右侧面板: 位置曲线 =====
+        # ===== 右侧面板: 双臂关节轨迹 =====
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
-        # Episode 末端位姿变化曲线（移至右侧）
-        trajectory_group = QGroupBox("位置曲线")
+        trajectory_group = QGroupBox("双臂关节轨迹")
         trajectory_layout = QVBoxLayout(trajectory_group)
         self.trajectory_plot = TrajectoryPlotWidget()
         self.trajectory_plot.trim_stationary_requested.connect(self._trim_stationary_segments)
@@ -4503,14 +4868,19 @@ class MainWindow(QMainWindow):
             row = ep_frames.iloc[frame_idx]
             cam1 = self._load_image_for_preview(self._current_episode_idx, frame_idx, "observation.images.cam1")
             cam2 = self._load_image_for_preview(self._current_episode_idx, frame_idx, "observation.images.cam2")
-            action = np.array(row.get("action", [0] * 7))
-            state = np.array(row.get("observation.state", [0] * 7))
+            cam3 = self._load_image_for_preview(self._current_episode_idx, frame_idx, "observation.images.cam3")
+            action = np.array(row.get("action", [0] * 14))
+            state = np.array(row.get("observation.state", [0] * 14))
+            torque = np.array(row.get("observation.gripper_torque", [0] * 2))
             timestamp = row.get("timestamp", frame_idx / self.dataset.fps if self.dataset.fps else 0)
             task_index = int(row.get("task_index", 0))
             task_name = ""
             if self.dataset.tasks and task_index < len(self.dataset.tasks):
                 task_name = self.dataset.tasks[task_index].get("task", "")
-            self._display_frame(cam1, cam2, action, state, frame_idx, timestamp, task_name)
+            self._display_frame(
+                cam1, cam2, cam3, action, state, torque,
+                frame_idx, timestamp, task_name
+            )
             self._current_frame_idx = frame_idx
             self.progress_label.setText(f"{frame_idx + 1} / {total}")
             # 同步位置曲线竖线
@@ -4528,7 +4898,11 @@ class MainWindow(QMainWindow):
             frames_data = self._load_episode_position_data(self._current_episode_idx)
             if frames_data is None:
                 return
-            keys = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
+            if frames_data.get('dual_arm'):
+                keys = [f'left_j{i}' for i in range(1, 7)] + ['left_gripper']
+                keys += [f'right_j{i}' for i in range(1, 7)] + ['right_gripper']
+            else:
+                keys = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'gripper']
             mat = np.stack([np.asarray(frames_data[k], dtype=np.float64) for k in keys], axis=1)
             smoothed = _smooth_pose_matrix(
                 mat, params.get("method", "savgol"), params.get("window", 11),
@@ -5389,10 +5763,12 @@ class MainWindow(QMainWindow):
             # 加载图像
             cam1_img = self._load_image_for_preview(episode_idx, 0, "observation.images.cam1")
             cam2_img = self._load_image_for_preview(episode_idx, 0, "observation.images.cam2")
+            cam3_img = self._load_image_for_preview(episode_idx, 0, "observation.images.cam3")
             
             # 获取 action 和 state
-            action = np.array(row.get("action", [0] * 7))
-            state = np.array(row.get("observation.state", [0] * 7))
+            action = np.array(row.get("action", [0] * 14))
+            state = np.array(row.get("observation.state", [0] * 14))
+            torque = np.array(row.get("observation.gripper_torque", [0] * 2))
             timestamp = row.get("timestamp", 0.0)
             task_index = int(row.get("task_index", 0))
             
@@ -5402,7 +5778,10 @@ class MainWindow(QMainWindow):
                 task_name = self.dataset.tasks[task_index].get("task", "")
             
             # 更新显示
-            self._display_frame(cam1_img, cam2_img, action, state, 0, timestamp, task_name)
+            self._display_frame(
+                cam1_img, cam2_img, cam3_img, action, state, torque,
+                0, timestamp, task_name
+            )
             
             # 更新进度条为初始状态
             self._current_total_frames = total_frames
@@ -5435,9 +5814,7 @@ class MainWindow(QMainWindow):
     # 机械臂关节反解（IK）
     # ------------------------------------------------------------------
     def _start_ik_solve(self, episode_idx, current_frame=0):
-        """后台批量反解整段 episode 的关节角度，避免阻塞 UI。"""
-        if _KIN is None:
-            return
+        """双臂14维关节数据直接回放；旧单臂位姿数据才做 IK。"""
         if self.dataset is None or episode_idx < 0:
             return
         # 同一 episode 已反解完成，直接刷新当前帧
@@ -5459,6 +5836,19 @@ class MainWindow(QMainWindow):
             states = np.vstack(ep_frames["observation.state"].to_numpy())
         except Exception as e:
             print(f"[IK] 提取位姿数据失败: {e}")
+            self._ik_solving = False
+            return
+
+        if states.ndim == 2 and states.shape[1] == 14:
+            self.robot_arm_widget.set_joint_angles(states)
+            self.robot_arm_widget.show_frame(current_frame)
+            self._ik_solving = False
+            self.status_bar.showMessage(
+                f"双臂关节回放已加载: Episode {episode_idx}, {len(states)} 帧"
+            )
+            return
+
+        if _KIN is None:
             self._ik_solving = False
             return
 
@@ -5499,7 +5889,7 @@ class MainWindow(QMainWindow):
         print(f"[IK] 反解失败: {error_msg}")
 
     def _load_episode_position_data(self, episode_idx):
-        """从 data_df 中提取指定 episode 的位姿序列。
+        """从 data_df 中提取指定 episode 的单臂位姿或双臂关节序列。
 
         返回 dict: {
             'x': array, 'y': array, 'z': array,
@@ -5507,9 +5897,10 @@ class MainWindow(QMainWindow):
             'gripper': array,  # 夹爪 (rad)
             'timestamps': array
         }
-        自动兼容两种格式：
+        自动兼容三种格式：
           - 7 维新格式 [x,y,z,rx,ry,rz,gripper_rad]：直接读取
           - 8 维旧格式 [x,y,z,qx,qy,qz,qw,gripper_deg]：四元数→欧拉角，度→弧度
+          - 14 维双臂格式 [left J1~J6,gripper,right J1~J6,gripper]
         如果数据不存在则返回 None。
         """
         if self.dataset is None or episode_idx < 0:
@@ -5522,57 +5913,15 @@ class MainWindow(QMainWindow):
             if "observation.state" not in ep_frames.columns:
                 return None
 
-            states = ep_frames["observation.state"].to_numpy()
-            states = np.vstack(states)
-            if states.shape[1] < 3:
-                return None
-            n = states.shape[0]
-
-            result = {
-                'x': states[:, 0],
-                'y': states[:, 1],
-                'z': states[:, 2],
-            }
-
-            if states.shape[1] >= 8:
-                # 旧格式：[x,y,z,qx,qy,qz,qw,gripper_deg] → 转欧拉角(弧度)
-                qx = states[:, 3].astype(np.float64)
-                qy = states[:, 4].astype(np.float64)
-                qz = states[:, 5].astype(np.float64)
-                qw = states[:, 6].astype(np.float64)
-                rx_arr = np.empty(n); ry_arr = np.empty(n); rz_arr = np.empty(n)
-                for i in range(n):
-                    rx_arr[i], ry_arr[i], rz_arr[i] = quat_to_rpy_recording(
-                        float(qw[i]), float(qx[i]), float(qy[i]), float(qz[i]))
-                result['rx'] = rx_arr
-                result['ry'] = ry_arr
-                result['rz'] = rz_arr
-                # 夹爪度→弧度
-                result['gripper'] = np.radians(states[:, 7])
-            elif states.shape[1] >= 7:
-                # 新格式：[x,y,z,rx,ry,rz,gripper_rad] 直接读取
-                result['rx'] = states[:, 3]
-                result['ry'] = states[:, 4]
-                result['rz'] = states[:, 5]
-                result['gripper'] = states[:, 6]
-            else:
-                # 不足 7 列：欧拉角补零
-                result['rx'] = np.zeros(n)
-                result['ry'] = np.zeros(n)
-                result['rz'] = np.zeros(n)
-                result['gripper'] = np.zeros(n)
+            states = np.vstack(ep_frames["observation.state"].to_numpy())
+            torque = None
+            if "observation.gripper_torque" in ep_frames.columns:
+                torque = np.vstack(ep_frames["observation.gripper_torque"].to_numpy())
+            result = parse_state_trajectory(states, torque)
 
             if "timestamp" in ep_frames.columns:
                 result['timestamps'] = ep_frames["timestamp"].to_numpy()
 
-            # 夹爪力矩 (Nm)：新录制的数据集含 observation.gripper_torque 列
-            if "observation.gripper_torque" in ep_frames.columns:
-                try:
-                    tq = ep_frames["observation.gripper_torque"].to_numpy()
-                    tq = np.vstack(tq).reshape(-1)
-                    result['gripper_torque'] = tq.astype(np.float64)
-                except Exception:
-                    pass
             return result
         except Exception as e:
             print(f"[Trajectory] 提取位姿数据失败: {e}")
@@ -5636,7 +5985,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "警告", "无法加载当前帧图像")
                 return
 
-            cam_display_name = "摄像头 1" if "cam1" in camera_name else "摄像头 2"
+            cam_suffix = camera_name.rsplit('.', 1)[-1]
+            cam_display_name = f"摄像头 {cam_suffix[3:]}" if cam_suffix.startswith("cam") else cam_suffix
             title = (
                 f"{cam_display_name} 全分辨率图像 - "
                 f"Episode {self._current_episode_idx} / 帧 {self._current_frame_idx}"
@@ -5647,17 +5997,33 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"打开全分辨率图像失败:\n{str(e)}")
         
     @staticmethod
-    def _format_state_text(state, step, timestamp, task_name):
-        """把单帧 state 数组格式化为信息文本，自动兼容 7 维欧拉角 / 8 维四元数格式。"""
-        state = np.asarray(state, dtype=float)
-        pos = state[:3]
-        if state.shape[0] >= 8:
-            # 旧四元数格式：转欧拉角显示，夹爪度→弧度
+    def _format_state_text(state, action, torque, step, timestamp, task_name):
+        """格式化单帧 state/action/torque，双臂数据按 left7 + right7 显示。"""
+        state = np.asarray(state, dtype=float).reshape(-1)
+        action = np.asarray(action, dtype=float).reshape(-1)
+        torque = np.asarray(torque, dtype=float).reshape(-1)
+        if state.shape[0] == 14:
+            state_left, state_right = state[:7], state[7:14]
+            action_left = action[:7] if action.size >= 14 else np.zeros(7)
+            action_right = action[7:14] if action.size >= 14 else np.zeros(7)
+            left_torque = torque[0] if torque.size >= 1 else 0.0
+            right_torque = torque[1] if torque.size >= 2 else 0.0
+            fmt = lambda values: ', '.join(f'{v:+.3f}' for v in values)
+            return (
+                f"帧: {step} | 时间: {timestamp:.3f}s | 任务: {task_name}\n"
+                f"State 左臂[7]: [{fmt(state_left)}]\n"
+                f"State 右臂[7]: [{fmt(state_right)}]\n"
+                f"Action 左臂[7]: [{fmt(action_left)}]\n"
+                f"Action 右臂[7]: [{fmt(action_right)}]\n"
+                f"夹爪力矩[2]: 左={left_torque:+.4f} Nm, 右={right_torque:+.4f} Nm"
+            )
+
+        pos = state[:3] if state.shape[0] >= 3 else np.zeros(3)
+        if state.shape[0] == 8:
             rx, ry, rz = quat_to_rpy_recording(
                 float(state[6]), float(state[3]), float(state[4]), float(state[5]))
-            grip = math.radians(float(state[7])) if state.shape[0] > 7 else 0.0
+            grip = math.radians(float(state[7]))
         elif state.shape[0] >= 7:
-            # 新欧拉角格式：直接读取
             rx, ry, rz = float(state[3]), float(state[4]), float(state[5])
             grip = float(state[6])
         else:
@@ -5669,23 +6035,27 @@ class MainWindow(QMainWindow):
             f"夹爪(rad): {grip:.3f}"
         )
 
-    def _display_frame(self, rgb_cam1, rgb_cam2, action, state, step, timestamp, task_name):
-        """显示单帧图像和数据（不依赖播放线程）"""
+    def _display_frame(self, rgb_cam1, rgb_cam2, rgb_cam3, action, state, torque,
+                       step, timestamp, task_name):
+        """显示单帧（三相机；state 自动兼容 7/8/14 维）。"""
         self.cam1_label.setImage(rgb_cam1)
         self.cam2_label.setImage(rgb_cam2)
+        self.cam3_label.setImage(rgb_cam3)
         self._current_frame_idx = step
         self.frame_info_label.setText(
-            self._format_state_text(state, step, timestamp, task_name))
+            self._format_state_text(state, action, torque, step, timestamp, task_name))
 
-    def _on_frame_data(self, rgb_cam1, rgb_cam2, action, state, step, timestamp, task_name):
+    def _on_frame_data(self, rgb_cam1, rgb_cam2, rgb_cam3, action, state, torque,
+                       step, timestamp, task_name):
         self.cam1_label.setImage(rgb_cam1)
         self.cam2_label.setImage(rgb_cam2)
+        self.cam3_label.setImage(rgb_cam3)
         # 播放线程推送新帧时同步播放头位置
         if self._current_total_frames > 0:
             self.trim_slider.set_current_frame(step)
         # 自动兼容 7 维欧拉角 / 8 维四元数格式
         self.frame_info_label.setText(
-            self._format_state_text(state, step, timestamp, task_name))
+            self._format_state_text(state, action, torque, step, timestamp, task_name))
         
     def _update_data_panel(self, step, timestamp, pos, quat, action, task_name=""):
         """更新机械臂数据面板显示（已删除面板，方法保留兼容）"""
@@ -5770,6 +6140,8 @@ class MainWindow(QMainWindow):
         self.cam1_label.clearImage()
         self.cam2_label.setText("摄像头 2 (Cam2)")
         self.cam2_label.clearImage()
+        self.cam3_label.setText("摄像头 3 (Cam3)")
+        self.cam3_label.clearImage()
         self.frame_info_label.setText("帧信息: 未开始播放")
 
         # 清空位置曲线

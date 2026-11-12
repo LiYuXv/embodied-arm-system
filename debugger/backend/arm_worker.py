@@ -73,6 +73,7 @@ class ArmWorker(QThread):
 
         self._slow_poll_counter = 0
         self._trajectory_playing = False
+        self._sim_control_loop_running = False
 
         # Simulation state
         self._sim_positions = [0.0] * 7
@@ -87,6 +88,16 @@ class ArmWorker(QThread):
     @property
     def is_enabled(self):
         return self._enabled
+
+    @property
+    def is_control_loop_running(self):
+        """Expose loop readiness without reaching through the worker in GUI code."""
+        if self._sim_mode:
+            return self._sim_control_loop_running
+        return bool(
+            self.arm
+            and getattr(self.arm, "control_loop_running", False)
+        )
 
     # 高频流式运动指令：同类只保留最新一条，防止队列无限积压
     _STREAMING_CMDS = {"end_pose_ctrl", "end_pose_ctrl_quat", "joint_ctrl", "gripper_ctrl"}
@@ -259,6 +270,7 @@ class ArmWorker(QThread):
         if self._sim_mode:
             self._connected = False
             self._enabled = False
+            self._sim_control_loop_running = False
             self.connected_changed.emit(False)
             self.enabled_changed.emit(False)
             self.log_message.emit("已断开（模拟模式）")
@@ -378,6 +390,7 @@ class ArmWorker(QThread):
     def _do_disable(self):
         if self._sim_mode:
             self._enabled = False
+            self._sim_control_loop_running = False
             self.enabled_changed.emit(False)
             self.log_message.emit("电机已失能（模拟模式）")
             return
@@ -393,6 +406,7 @@ class ArmWorker(QThread):
     def _do_emergency_stop(self):
         if self._sim_mode:
             self._enabled = False
+            self._sim_control_loop_running = False
             self.enabled_changed.emit(False)
             self.log_message.emit("急停已触发（模拟模式）")
             return
@@ -439,6 +453,10 @@ class ArmWorker(QThread):
             return
         if self.arm and self._enabled:
             self._ensure_control_loop()
+            if self.arm.is_moving():
+                self.arm.cancel_motion()
+                self.log_message.emit("切换到流式 joint_ctrl，已取消上一轨迹")
+            self._trajectory_playing = False
             self.arm.JointCtrlList(positions[:7])
 
     def _do_move_j(self, positions, duration=2.0, block=False):
@@ -450,7 +468,8 @@ class ArmWorker(QThread):
             self._ensure_control_loop()
             # 确保传入7个关节位置（包含夹爪L7）
             full_positions = list(positions[:7]) + [0.0] * (7 - len(positions))
-            self.arm.MoveJ(full_positions[:6], duration=duration, block=block)
+            submitted = self.arm.MoveJ(full_positions[:6], duration=duration, block=block)
+            self._trajectory_playing = bool(submitted) and not block
             # 单独控制夹爪L7
             if len(full_positions) >= 7:
                 self.arm.GripperCtrl(gripper_angle=full_positions[6])
@@ -539,6 +558,7 @@ class ArmWorker(QThread):
             return
         if self.arm:
             self.arm.cancel_motion()
+            self._trajectory_playing = False
             self.log_message.emit("运动已取消")
 
     _ZERO_TORQUE_KD = [0.05, 0.05, 0.05, 0.0125, 0.0125, 0.0125, 0.05]
@@ -734,6 +754,7 @@ class ArmWorker(QThread):
 
     def _do_start_control_loop(self, rate_hz=200.0):
         if self._sim_mode:
+            self._sim_control_loop_running = True
             self.control_loop_changed.emit(True)
             self.log_message.emit(f"控制循环已启动（模拟）{rate_hz}Hz")
             return
@@ -744,6 +765,7 @@ class ArmWorker(QThread):
 
     def _do_stop_control_loop(self):
         if self._sim_mode:
+            self._sim_control_loop_running = False
             self.control_loop_changed.emit(False)
             self.log_message.emit("控制循环已停止（模拟）")
             return
@@ -789,7 +811,7 @@ class ArmWorker(QThread):
         try:
             if not self.arm.is_moving():
                 self._trajectory_playing = False
-                self.log_message.emit("轨迹回放完成")
+                self.log_message.emit("轨迹运动完成")
         except Exception as e:
             logger.debug(f"检查轨迹状态失败: {e}")
             self._trajectory_playing = False

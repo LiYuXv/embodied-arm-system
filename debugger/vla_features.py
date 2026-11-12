@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from el_a3_sdk.protocol import DEFAULT_JOINT_LIMITS
+
 
 STATE_KEY = "observation.state"
 TORQUE_KEY = "observation.gripper_torque"
@@ -121,9 +123,11 @@ def validate_policy_checkpoint(config, mode="dual"):
 
 
 def _vector(value, dim, name):
-    result = np.asarray(value, dtype=np.float32).reshape(-1)
+    result = np.asarray(value, dtype=np.float32)
     if result.shape != (dim,):
         raise ValueError(f"{name} must have shape ({dim},), got {result.shape}")
+    if not np.isfinite(result).all():
+        raise ValueError(f"{name} contains NaN or Inf")
     return np.array(result, dtype=np.float32, copy=True)
 
 
@@ -136,8 +140,20 @@ def build_vla_observation(images, state, gripper_torque, task, mode="dual"):
         if frame is None:
             raise ValueError(f"missing camera frame: {name}")
         array = np.asarray(frame)
-        if array.ndim != 3 or array.shape[-1] != 3:
+        if (
+            array.ndim != 3
+            or array.shape[-1] != 3
+            or array.shape[0] <= 0
+            or array.shape[1] <= 0
+        ):
             raise ValueError(f"{name} must have shape [H,W,3], got {array.shape}")
+        if not (
+            np.issubdtype(array.dtype, np.integer)
+            or np.issubdtype(array.dtype, np.floating)
+        ):
+            raise ValueError(f"{name} must contain numeric pixels, got {array.dtype}")
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} contains NaN or Inf")
         observation[key] = np.array(array, copy=True)
     observation[STATE_KEY] = _vector(state, spec.state_dim, STATE_KEY)
     observation[TORQUE_KEY] = _vector(gripper_torque, spec.torque_dim, TORQUE_KEY)
@@ -155,17 +171,11 @@ def observation_to_torch(observation, *, device="cpu", bgr_images=False):
             image = np.asarray(value)
             if bgr_images:
                 image = image[..., ::-1]
-            image = np.ascontiguousarray(image)
-            result[key] = (
-                torch.from_numpy(image)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .float()
-                .div_(255.0)
-                .to(device)
-            )
+            image = np.ascontiguousarray(np.transpose(image, (2, 0, 1))[None, ...])
+            result[key] = torch.tensor(image, dtype=torch.float32, device=device).div_(255.0)
         elif key in {STATE_KEY, TORQUE_KEY}:
-            result[key] = torch.from_numpy(np.asarray(value, dtype=np.float32)).unsqueeze(0).to(device)
+            vector = np.ascontiguousarray(np.asarray(value, dtype=np.float32)[None, ...])
+            result[key] = torch.tensor(vector, dtype=torch.float32, device=device)
         elif key == TASK_KEY:
             result[key] = [str(value)]
     return result
@@ -214,6 +224,10 @@ def as_action_chunk(action, mode="dual"):
         raise ValueError(
             f"{spec.name}-arm action chunk must have shape [N,{spec.action_dim}], got {chunk.shape}"
         )
+    if chunk.shape[0] == 0:
+        raise ValueError("action chunk must contain at least one step")
+    if not np.isfinite(chunk).all():
+        raise ValueError("action chunk contains NaN or Inf")
     return np.array(chunk, dtype=np.float32, copy=True)
 
 
@@ -221,6 +235,84 @@ def split_dual_action(action):
     """Return ``left[...,0:7]`` and ``right[...,7:14]`` from a 14D chunk."""
     chunk = as_action_chunk(action, DUAL_ARM_SPEC)
     return np.array(chunk[..., :7], copy=True), np.array(chunk[..., 7:14], copy=True)
+
+
+DUAL_JOINT_NAMES = tuple(
+    [f"left_J{i}" for i in range(1, 7)]
+    + ["left_gripper"]
+    + [f"right_J{i}" for i in range(1, 7)]
+    + ["right_gripper"]
+)
+
+
+@dataclass(frozen=True)
+class DualArmSafetyResult:
+    """One safe absolute dual-arm command plus its clipping diagnostics."""
+
+    action: np.ndarray
+    joint_limit_indices: tuple[int, ...]
+    delta_limit_indices: tuple[int, ...]
+
+    @property
+    def was_modified(self):
+        return bool(self.joint_limit_indices or self.delta_limit_indices)
+
+
+def dual_joint_limit_arrays():
+    """Return SDK limits in left J1..J7, right J1..J7 ordering."""
+    per_arm = [DEFAULT_JOINT_LIMITS[index] for index in range(1, 8)]
+    lower = np.asarray([item[0] for item in per_arm] * 2, dtype=np.float32)
+    upper = np.asarray([item[1] for item in per_arm] * 2, dtype=np.float32)
+    return lower, upper
+
+
+def sanitize_dual_arm_action(action, current_state, max_delta_rad):
+    """Clamp one absolute 14D action to SDK and per-command delta limits.
+
+    ``current_state`` and ``action`` use the public dual-arm ordering:
+    left J1..J6 + gripper, then right J1..J6 + gripper.
+    """
+    command = np.asarray(action, dtype=np.float32)
+    current = np.asarray(current_state, dtype=np.float32)
+    if command.shape != (14,):
+        raise ValueError(f"dual-arm command must have shape (14,), got {command.shape}")
+    if current.shape != (14,):
+        raise ValueError(f"current dual-arm state must have shape (14,), got {current.shape}")
+    if not np.isfinite(command).all():
+        raise ValueError("dual-arm command contains NaN or Inf")
+    if not np.isfinite(current).all():
+        raise ValueError("current dual-arm state contains NaN or Inf")
+    try:
+        max_delta = float(max_delta_rad)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("maximum per-command delta must be a finite positive number") from exc
+    if not np.isfinite(max_delta) or max_delta <= 0:
+        raise ValueError("maximum per-command delta must be a finite positive number")
+
+    lower, upper = dual_joint_limit_arrays()
+    tolerance = 1e-4
+    if np.any(current < lower - tolerance) or np.any(current > upper + tolerance):
+        bad = np.flatnonzero((current < lower - tolerance) | (current > upper + tolerance))
+        names = ", ".join(DUAL_JOINT_NAMES[index] for index in bad)
+        raise ValueError(f"current arm state is outside SDK joint limits: {names}")
+
+    absolute_safe = np.clip(command, lower, upper)
+    joint_indices = tuple(
+        int(index) for index in np.flatnonzero(~np.isclose(command, absolute_safe, atol=1e-7))
+    )
+    delta_safe = np.clip(absolute_safe, current - max_delta, current + max_delta)
+    # The intersection is non-empty because the measured state was verified to
+    # be inside the SDK limits. Clamp once more for floating-point edge cases.
+    safe = np.clip(delta_safe, lower, upper).astype(np.float32, copy=False)
+    delta_indices = tuple(
+        int(index)
+        for index in np.flatnonzero(~np.isclose(absolute_safe, safe, atol=1e-7))
+    )
+    return DualArmSafetyResult(
+        action=np.array(safe, dtype=np.float32, copy=True),
+        joint_limit_indices=joint_indices,
+        delta_limit_indices=delta_indices,
+    )
 
 
 class DualArmActionDispatcher:
@@ -232,22 +324,27 @@ class DualArmActionDispatcher:
         self.execute = bool(execute)
         self.print_fn = print_fn
 
-    def dispatch(self, action, *, step=0):
+    def require_ready(self):
+        """Refuse real execution unless both workers are connected and enabled."""
+        workers = (self.left_worker, self.right_worker)
+        if not all(getattr(worker, "is_connected", False) for worker in workers):
+            raise RuntimeError("both arms must be connected before VLA execution")
+        if not all(getattr(worker, "is_enabled", False) for worker in workers):
+            raise RuntimeError("both arms must be enabled before VLA execution")
+
+    def dispatch(self, action, *, step=0, log=True):
         left, right = split_dual_action(action)
         if step < 0 or step >= len(left):
             raise IndexError(f"step {step} outside action chunk of length {len(left)}")
         left_step = left[step]
         right_step = right[step]
-        self.print_fn(
-            f"[dual-vla dry-run={not self.execute}] step={step} "
-            f"left={left_step.tolist()} right={right_step.tolist()}"
-        )
+        if log:
+            self.print_fn(
+                f"[VLA] dry-run={not self.execute} step={step} "
+                f"left={left_step.tolist()} right={right_step.tolist()}"
+            )
         if self.execute:
-            workers = (self.left_worker, self.right_worker)
-            if not all(getattr(worker, "is_connected", False) for worker in workers):
-                raise RuntimeError("both arms must be connected before VLA execution")
-            if not all(getattr(worker, "is_enabled", False) for worker in workers):
-                raise RuntimeError("both arms must be enabled before VLA execution")
+            self.require_ready()
             self.left_worker.submit_command("joint_ctrl", left_step.tolist())
             self.right_worker.submit_command("joint_ctrl", right_step.tolist())
         return {"left_action": left, "right_action": right, "executed": self.execute}

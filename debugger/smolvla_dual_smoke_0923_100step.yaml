@@ -1,0 +1,48 @@
+dataset:
+  repo_id: ela3_dual_smoke_0923
+  root: ./debugger/lerobot_data/ela3_dual_smoke_0923
+  eval_split: 0.0
+  image_transforms:
+    enable: false
+
+policy:
+  type: smolvla_torque
+  robot_mode: dual
+  torque_key: observation.gripper_torque
+  pretrained_path: ./pretrained_models/smolvla_base_local
+  pretrained_revision: null
+  vlm_model_name: ./pretrained_models/smolvlm2-500m-video-instruct
+  load_vlm_weights: false
+  chunk_size: 50
+  n_action_steps: 20
+  max_state_dim: 32
+  max_action_dim: 32
+  device: cuda
+  push_to_hub: false
+  freeze_vision_encoder: true
+  train_expert_only: true
+  train_state_proj: true
+  attention_mode: cross_attn
+  prefix_length: 0
+  pad_language_to: max_length
+  num_vlm_layers: 16
+  self_attn_every_n_layers: 2
+  expert_width_multiplier: 0.75
+
+save_checkpoint: true
+output_dir: ./debugger/ckpt/smolvla_dual_smoke_0923_manual
+
+batch_size: 1
+job_name: smolvla_dual_smoke_0923_manual
+resume: false
+seed: 42
+num_workers: 0
+steps: 100
+env_eval_freq: -1
+eval_steps: 0
+log_freq: 10
+save_freq: 100
+use_policy_training_preset: true
+
+wandb:
+  enable: false

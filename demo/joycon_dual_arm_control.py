@@ -46,6 +46,7 @@ def build_dual_joycon_controllers(
     update_rate: float = 100.0,
     scale: float = 1.0,
     controller_factory: Callable = VRArmController,
+    rotation_scale: float = 1.0,
 ) -> Dict[str, object]:
     """按固定左右关系创建控制器，核心运动链路复用 VRArmController。"""
     controllers = {}
@@ -57,6 +58,7 @@ def build_dual_joycon_controllers(
             state_getter=adapter.get_state,
             update_rate=update_rate,
             scale=scale,
+            rotation_scale=rotation_scale if getattr(adapter, "mode", "standard") == JOYCON_MODE_IMU_MOTION else 1.0,
             position_fix=np.ones(3),
             rotation_fix=JOYCON_ROTATION_FIX,
             remap_rotation_rpy=False,
@@ -91,7 +93,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="EL-A3 Joy-Con 双臂遥操")
     parser.add_argument("--config", default=None, help="双臂 YAML；默认使用 SDK 配置")
     parser.add_argument("--rate", type=float, default=100.0, help="控制频率 Hz")
-    parser.add_argument("--scale", type=float, default=1.0, help="相对运动缩放")
+    parser.add_argument("--scale", "--position-scale", dest="scale", type=float,
+                        default=1.0, help="位置缩放（默认 1.0）")
+    parser.add_argument("--rotation-scale", type=float, default=1.0,
+                        help="IMU 动作模式姿态缩放，0 表示保持姿态（默认 1.0）")
     parser.add_argument(
         "--mode", choices=JOYCON_CONTROL_MODES, default="standard",
         help="Joy-Con 控制模式：standard 或 imu_motion（实验）",
@@ -169,6 +174,7 @@ def main() -> int:
             adapters,
             update_rate=args.rate,
             scale=args.scale,
+            rotation_scale=args.rotation_scale,
         )
         _print_mapping(args.mode)
         for side, controller in controllers.items():

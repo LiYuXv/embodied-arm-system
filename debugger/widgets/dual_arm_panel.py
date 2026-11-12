@@ -4,9 +4,9 @@ import logging
 import os
 import time
 
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QPushButton
-from PyQt6.QtWidgets import QTabWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QFrame, QLayout, QScrollArea, QTabWidget, QVBoxLayout, QWidget
 
 try:
     from el_a3_sdk.kinematics import ELA3Kinematics
@@ -142,7 +142,15 @@ class ArmControlPanel(QWidget):
             (self.kinematics_display, "末端状态"),
         )
         for panel, title in panels:
-            self.tabs.addTab(panel, title)
+            # Keep each page's controls at their layout minimum size.  Only the
+            # tab viewport shrinks when the arm workspace loses vertical space.
+            panel.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setWidget(panel)
+            self.tabs.addTab(scroll, title)
         layout.addWidget(self.tabs, 1)
 
         self.joint_panel.set_enabled(False)

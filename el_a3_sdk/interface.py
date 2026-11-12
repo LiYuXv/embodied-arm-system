@@ -103,6 +103,7 @@ class ELA3Interface:
         serial_port: Optional[str] = None,
         serial_baudrate: int = 2000000,
         can_bitrate: int = 1000000,
+        per_joint_zero_torque_gravity_ratio: Optional[Dict[int, float]] = None,
     ):
         """
         Args:
@@ -132,6 +133,7 @@ class ELA3Interface:
             zero_torque_kd_max: 自适应 Kd 全局上限
             per_joint_kd_min: 每关节 Kd 下限 {motor_id: value}，覆盖全局值
             per_joint_kd_max: 每关节 Kd 上限 {motor_id: value}，覆盖全局值
+            per_joint_zero_torque_gravity_ratio: 零力矩示教各关节重力补偿比例；未设置的关节沿用全局比例
             kd_velocity_ref: 自适应 Kd 速度参考值 (rad/s)
             kd_smoothing_alpha: 自适应 Kd EMA 平滑系数
             pp_velocity: PP 模式最大速度 (rad/s)
@@ -195,6 +197,10 @@ class ELA3Interface:
         self._max_acceleration = max_acceleration
         self._velocity_limit = velocity_limit
         self._gravity_feedforward_ratio = clamp(gravity_feedforward_ratio, 0.0, 1.0)
+        self._per_joint_zero_torque_gravity_ratio = {
+            mid: clamp(ratio, 0.0, 1.0)
+            for mid, ratio in (per_joint_zero_torque_gravity_ratio or {}).items()
+        }
 
         # 关节限位保护
         self._limit_margin = limit_margin
@@ -207,6 +213,7 @@ class ELA3Interface:
 
         # 零力矩 / 自适应 Kd
         self._zero_torque_mode = False
+        self._zero_torque_gravity_enabled = False
         self._zero_torque_kd = 1.0
         self._adaptive_kd_enabled = adaptive_kd_enabled
         self._zero_torque_kd_min = zero_torque_kd_min
@@ -420,6 +427,7 @@ class ELA3Interface:
 
         with self._state_lock:
             zero_torque = self._zero_torque_mode
+            zero_torque_gravity = self._zero_torque_gravity_enabled
             first_cmd = self._first_command
 
         if first_cmd:
@@ -454,7 +462,10 @@ class ELA3Interface:
                 alpha * gravity_raw_positions[i]
                 + (1.0 - alpha) * self._gravity_input_positions[i]
             )
-        gravity_torques = self._compute_gravity_vector(self._gravity_input_positions)
+        gravity_torques = (
+            self._compute_gravity_vector(self._gravity_input_positions)
+            if not zero_torque or zero_torque_gravity else None
+        )
 
         # --- Read target velocities ---
         with self._cmd_lock:
@@ -500,7 +511,7 @@ class ELA3Interface:
 
                 # Pinocchio 重力模型只有 L1-L6 六维；L7 不参与重力补偿。
                 grav_torque = (
-                    gravity_torques[i] * direction
+                    gravity_torques[i] * direction * self._zero_torque_gravity_ratio(mid)
                     if gravity_torques is not None and i < len(gravity_torques)
                     else 0.0
                 )
@@ -604,6 +615,11 @@ class ELA3Interface:
         except Exception:
             return None
 
+    def _zero_torque_gravity_ratio(self, motor_id: int) -> float:
+        """零力矩示教的关节比例；其它控制模式仍使用全局比例。"""
+        return self._per_joint_zero_torque_gravity_ratio.get(
+            motor_id, self._gravity_feedforward_ratio)
+
     def _compute_adaptive_kd(self, joint_idx: int, velocity: float, prev_kd: float) -> float:
         """
         自适应 Kd 计算（洛伦兹衰减 + EMA 平滑）
@@ -699,6 +715,7 @@ class ELA3Interface:
             with self._state_lock:
                 self._state = ArmState.IDLE
                 self._zero_torque_mode = False
+                self._zero_torque_gravity_enabled = False
         return success
 
     # ================================================================
@@ -718,6 +735,7 @@ class ELA3Interface:
 
         with self._state_lock:
             self._zero_torque_mode = False
+            self._zero_torque_gravity_enabled = False
             self._state = ArmState.IDLE
         logger.warning("急停已执行！所有电机已失能")
         return success
@@ -899,13 +917,14 @@ class ELA3Interface:
     # ================================================================
 
     def ZeroTorqueMode(self, enable: bool, kd: float = 1.0,
-                       gravity_torques: Optional[List[float]] = None) -> bool:
+                       gravity_torques: Optional[List[float]] = None,
+                       *, gravity_compensation: bool = False) -> bool:
         """
         零力矩模式（Kp=0，可手动拖动机械臂，包括 L7 夹爪关节）。
 
         进入零力矩：
         - L1-L7 全部处于 MOTION_CONTROL；
-        - L1-L6 使用 Kp=0 + 自适应 Kd + 重力补偿；
+        - L1-L6 使用 Kp=0 + 自适应 Kd；可选重力补偿；
         - L7 使用 Kp=0 + 自适应 Kd，重力前馈固定为 0，可手动开合。
 
         退出零力矩：
@@ -929,6 +948,7 @@ class ELA3Interface:
             self._zero_torque_kd = kd
             # ENABLED 状态不会进入 _control_loop_tick，用它作为模式切换过渡态。
             self._state = ArmState.ENABLED
+            self._zero_torque_gravity_enabled = False
             if not enable:
                 self._zero_torque_mode = False
 
@@ -1019,13 +1039,14 @@ class ELA3Interface:
                     current_pos = fb.position if (fb and fb.is_valid) else 0.0
                     direction = self._joint_directions.get(mid, 1.0)
                     # 只有 L1-L6 有重力模型；L7 前馈恒为 0。
-                    motor_torque = grav[i] * direction if i < len(grav) else 0.0
+                    motor_torque = grav[i] * direction * self._zero_torque_gravity_ratio(mid) if i < len(grav) else 0.0
                     self._driver.send_motion_control(
                         mid, current_pos, 0.0, 0.0, kd, motor_torque
                     )
                     _busy_wait_us(150)
 
             with self._state_lock:
+                self._zero_torque_gravity_enabled = gravity_compensation
                 self._zero_torque_mode = True
                 self._state = ArmState.ZERO_TORQUE
 
@@ -1083,6 +1104,7 @@ class ELA3Interface:
 
         with self._state_lock:
             self._zero_torque_mode = False
+            self._zero_torque_gravity_enabled = False
             self._state = ArmState.ENABLED
             self._first_command = True
 
@@ -1115,15 +1137,17 @@ class ELA3Interface:
                 kd_list = [float(kd)] * self.NUM_JOINTS
 
             if self._control_running:
-                self._zero_torque_kd = kd_list[0]
-                return self.ZeroTorqueMode(True, kd=kd_list[0])
+                return self.ZeroTorqueMode(
+                    True, kd=kd_list[0], gravity_compensation=True)
 
             kin = self._get_kinematics()
             if kin is None:
                 logger.warning("Pinocchio 不可用，使用无重力补偿零力矩模式")
                 return self.ZeroTorqueMode(True, kd=kd_list[0])
 
-            self.ZeroTorqueMode(True, kd=kd_list[0])
+            if not self.ZeroTorqueMode(True, kd=kd_list[0],
+                                       gravity_compensation=True):
+                return False
             self._zt_gravity_running = True
             self._zt_gravity_thread = threading.Thread(
                 target=self._zero_torque_gravity_loop,
@@ -1160,7 +1184,7 @@ class ELA3Interface:
                 fb = self._driver.get_feedback(mid)
                 current_pos = fb.position if (fb and fb.is_valid) else 0.0
                 direction = self._joint_directions.get(mid, 1.0)
-                motor_torque = grav[i] * direction
+                motor_torque = grav[i] * direction * self._zero_torque_gravity_ratio(mid)
 
                 vel = fb.velocity * direction if (fb and fb.is_valid) else 0.0
                 if self._adaptive_kd_enabled:

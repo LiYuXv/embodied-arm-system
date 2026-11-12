@@ -108,6 +108,7 @@ class VRArmController:
         remap_rotation_rpy: bool = True,
         rotation_vector_sign: Optional[np.ndarray] = None,
         input_name: str = "VR",
+        rotation_scale: float = 1.0,
     ):
         self._arm = arm
         self._receiver = receiver
@@ -141,6 +142,7 @@ class VRArmController:
 
         # 运动缩放
         self.scale = scale
+        self.rotation_scale = float(rotation_scale)
 
         # 离合与锚点状态
         self._clutched = False
@@ -284,7 +286,8 @@ class VRArmController:
         print("  B            →  回工作位 (Home)")
         print("  Ctrl+C       →  退出")
         print("=" * 52)
-        print(f"  运动缩放:    {self.scale:.1f}x")
+        print(f"  位置缩放:    {self.scale:.1f}x")
+        print(f"  姿态缩放:    {self.rotation_scale:.1f}x")
         print(f"  末端目标:    ({self._target_pos[0]:.3f}, "
               f"{self._target_pos[1]:.3f}, {self._target_pos[2]:.3f}) m")
         print(f"  等待 {self._input_name} 数据...")
@@ -425,6 +428,13 @@ class VRArmController:
                 target_rot = self._ee_anchor_rot @ self._pin.exp3(corrected_rotvec)
             else:
                 target_rot = self._ee_anchor_rot @ dR
+
+        if gripped and self.rotation_scale != 1.0:
+            # 围绕接合时的末端姿态缩放相对旋转，避免缩放绝对欧拉角。
+            relative_rotvec = self._pin.log3(self._ee_anchor_rot.T @ target_rot)
+            target_rot = self._ee_anchor_rot @ self._pin.exp3(
+                np.asarray(relative_rotvec) * self.rotation_scale
+            )
 
         self._target_pos = target_pos
         self._target_rot = target_rot
