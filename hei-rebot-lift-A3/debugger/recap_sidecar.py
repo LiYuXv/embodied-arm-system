@@ -153,11 +153,18 @@ def gripper_dim_scale(
     调用方（模型 forward patch / ACT 自定义循环）把 losses 乘上本缩放后再做
     样本级加权。
     """
+    if action_dim not in (7, 14):
+        raise ValueError(f"RECAP action 仅支持单臂 7 维或双臂 14 维，收到 {action_dim} 维；"
+                         "历史 18 维数据需匹配旧设备或重新训练")
     gi = cfg.gripper_index if cfg.gripper_index >= 0 else action_dim + cfg.gripper_index
+    if not 0 <= gi < action_dim:
+        raise ValueError(f"夹爪下标 {gi} 超出 action {action_dim} 维")
     scale = np.ones((len(is_negative), action_dim), dtype=np.float32)
     neg = np.asarray(is_negative, dtype=bool)
     if neg.any():
         scale[neg, gi] = 1.0 / max(cfg.negative_weight, 1e-6)
+        if action_dim == 14 and cfg.gripper_index == -1:
+            scale[neg, 6] = 1.0 / max(cfg.negative_weight, 1e-6)
     return scale
 
 
@@ -171,7 +178,7 @@ class SidecarDataset:
     """
 
     def __init__(self, dataset, dataset_root, cfg: RecapWeightConfig | None = None,
-                 action_dim: int = 7):
+                 action_dim: int = 14):
         self._dataset = dataset
         self._cfg = cfg or RecapWeightConfig()
         sc = load_sidecar(dataset_root)

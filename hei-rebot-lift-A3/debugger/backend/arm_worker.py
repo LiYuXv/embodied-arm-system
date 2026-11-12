@@ -68,6 +68,9 @@ class ArmWorker(QThread):
         self._arm2_connected = False
         self._arm2_enabled = False
         self._cmd_queue: Queue = Queue()
+        self._stopping = False
+        self.work_mode = "dual"
+        self._executing_command = None
         self._poll_rate_hz = 50.0
         self._sim_mode = False
 
@@ -113,6 +116,8 @@ class ArmWorker(QThread):
 
     def submit_command(self, cmd: str, *args, **kwargs):
         with self._cmd_queue.mutex:
+            if self._stopping:
+                return False
             if cmd in self._PRIORITY_CMDS:
                 self._cmd_queue.queue = deque(
                     item for item in self._cmd_queue.queue
@@ -126,6 +131,21 @@ class ArmWorker(QThread):
             self._cmd_queue.queue.append((cmd, args, kwargs))
             self._cmd_queue.unfinished_tasks += 1
             self._cmd_queue.not_empty.notify()
+            return True
+
+    def try_set_work_mode(self, mode):
+        """Switch only while disconnected and idle, atomically with command intake."""
+        if mode not in ("single", "dual"):
+            return False
+        with self._cmd_queue.mutex:
+            if (self._stopping or self.is_connected or self.is_enabled
+                    or self.arm is not None or self.arm2 is not None
+                    or self._cmd_queue.queue or self._executing_command is not None
+                    or self._trajectory_playing
+                    or any(t.is_alive() for t in self._gripper_move_threads.values())):
+                return False
+            self.work_mode = mode
+        return True
 
     def run(self):
         self._running = True
@@ -134,6 +154,8 @@ class ArmWorker(QThread):
             t0 = time.time()
             try:
                 self._process_commands()
+                if not self._running:
+                    break
                 if self._connected or self._arm2_connected:
                     self._poll_feedback()
                 # 检查非阻塞轨迹是否完成
@@ -146,28 +168,65 @@ class ArmWorker(QThread):
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def stop(self):
-        self._running = False
+    def stop(self, timeout_ms=3000, before_shutdown=None):
+        # 与 submit_command 共用队列锁，关停开始后不再接受迟到命令。
+        with self._cmd_queue.mutex:
+            first_stop = not self._stopping
+            if first_stop:
+                self._stopping = True
+                self._cmd_queue.queue.clear()
         self._cancel_gripper_move()
-        self.wait(3000)
+        # 回调可能提交命令，不能在队列锁内执行。
+        if first_stop and before_shutdown is not None:
+            try:
+                before_shutdown()
+            except Exception as e:
+                self._motion_sources_stop_failed = True
+                self.error_occurred.emit(f"停止运动源失败: {e}")
+        with self._cmd_queue.mutex:
+            if first_stop:
+                if self.is_connected:
+                    self._cmd_queue.queue.append(("emergency_stop", (), {}))
+                    if not getattr(self, "_motion_sources_stop_failed", False):
+                        self._cmd_queue.queue.append(("disconnect", (), {}))
+                self._cmd_queue.queue.append(("shutdown", (), {}))
+                self._cmd_queue.not_empty.notify()
+        # 队列不能中断已阻塞的 SDK/CAN 调用；超时后线程可能仍在运行。
+        if not self.wait(timeout_ms):
+            self.error_occurred.emit("停机超时：工作线程仍在运行，急停/断开未确认；请使用现场急停并排查通信")
+            return False
+        if getattr(self, "_motion_sources_stop_failed", False):
+            return False
+        if self.is_connected or self.is_enabled:
+            self.error_occurred.emit("停机未确认安全：仍有机械臂连接或失能失败；请使用现场急停")
+            return False
+        return True
 
     def _process_commands(self):
         while True:
-            try:
-                cmd, args, kwargs = self._cmd_queue.get_nowait()
-            except Empty:
-                break
+            with self._cmd_queue.mutex:
+                if not self._cmd_queue.queue:
+                    break
+                cmd, args, kwargs = self._cmd_queue.queue.popleft()
+                self._executing_command = cmd
             try:
                 self._execute_command(cmd, args, kwargs)
             except Exception as e:
                 logger.error(f"Command '{cmd}' failed: {e}")
                 self.error_occurred.emit(f"命令 {cmd} 失败: {e}")
+            finally:
+                with self._cmd_queue.mutex:
+                    self._executing_command = None
+            if cmd == "shutdown":
+                break
 
     def _execute_command(self, cmd: str, args, kwargs):
         if cmd == "connect":
             self._do_connect(*args, **kwargs)
         elif cmd == "disconnect":
             self._do_disconnect()
+        elif cmd == "shutdown":
+            self._running = False
         elif cmd == "enable":
             self._do_enable()
         elif cmd == "disable":
@@ -304,10 +363,16 @@ class ArmWorker(QThread):
         任一臂失败不影响另一臂（保留成功臂）。"""
         if self._connected or self._arm2_connected:
             return
+        if getattr(self, "work_mode", "dual") == "single":
+            # Defense in depth: stale toolbar/queued dual parameters cannot open can1.
+            arm2 = None
+            if backend != "slcan" and can_name != "can0":
+                self.error_occurred.emit("单臂模式仅允许臂1 can0")
+                return
         self._sim_mode = sim_mode
         if sim_mode:
             self._connected = True
-            self._arm2_connected = True
+            self._arm2_connected = getattr(self, "work_mode", "dual") != "single"
             self.connected_changed.emit(True)
             self.log_message.emit("已连接（模拟模式，双臂）")
             return
@@ -355,28 +420,33 @@ class ArmWorker(QThread):
             self.enabled_changed.emit(False)
             self.log_message.emit("已断开（模拟模式）")
             return
-        try:
-            if self.arm:
-                if self._enabled:
-                    self.arm.DisableArm()
-                self.arm.DisconnectPort()
-                self.arm = None
-            if self.arm2:
-                if self._arm2_enabled:
-                    self.arm2.DisableArm()
-                self.arm2.DisconnectPort()
-                self.arm2 = None
-            self._connected = False
-            self._enabled = False
-            self._arm2_connected = False
-            self._arm2_enabled = False
-            self.connected_changed.emit(False)
-            self.enabled_changed.emit(False)
+        self._cancel_gripper_move()
+        for label, arm_attr, connected_attr, enabled_attr in (
+                ("臂1", "arm", "_connected", "_enabled"),
+                ("臂2", "arm2", "_arm2_connected", "_arm2_enabled")):
+            arm = getattr(self, arm_attr)
+            if arm is None:
+                continue
+            # worker 标志可能在部分使能失败或急停后为 False，仍须核对 SDK 结果。
+            try:
+                if not arm.DisableArm():
+                    self.error_occurred.emit(f"{label}失能失败：保持连接，未确认电机安全失能")
+                    continue
+            except Exception as e:
+                self.error_occurred.emit(f"{label}失能失败：{e}；保持连接，未确认电机安全失能")
+                continue
+            try:
+                arm.DisconnectPort()
+            except Exception as e:
+                self.error_occurred.emit(f"{label}断开失败: {e}")
+                continue
+            setattr(self, arm_attr, None)
+            setattr(self, connected_attr, False)
+            setattr(self, enabled_attr, False)
+        self.connected_changed.emit(self.is_connected)
+        self.enabled_changed.emit(self.is_enabled)
+        if not self.is_connected:
             self.log_message.emit("已断开连接")
-        except Exception as e:
-            self.error_occurred.emit(f"断开失败: {e}")
-        finally:
-            self._cancel_gripper_move()
 
     # ---- 使能前安全检查（角度单位：度） ----
     _ENABLE_JOINT_ABS_LIMIT_DEG = 50.0    # J1~J6 必须在 ±50° 以内
@@ -405,7 +475,7 @@ class ArmWorker(QThread):
             return
         if self._sim_mode:
             self._enabled = True
-            self._arm2_enabled = True
+            self._arm2_enabled = self._arm2_connected
             self.enabled_changed.emit(True)
             self.log_message.emit("电机已使能（模拟模式，双臂）")
             return
@@ -416,6 +486,7 @@ class ArmWorker(QThread):
         for label, arm in (("臂1", self.arm), ("臂2", self.arm2)):
             if arm is None:
                 continue
+            enable_attempted = False
             try:
                 # 1) 先成功读取全部 7 个关节的位置反馈，否则不允许使能
                 positions = self._read_joint_positions_for_enable(arm)
@@ -435,7 +506,17 @@ class ArmWorker(QThread):
                     continue
 
                 # 3) 检查通过，执行使能
-                arm.EnableArm()
+                enable_attempted = True
+                if not arm.EnableArm():
+                    # SDK 可能已使能部分电机；失败时将该臂退回失能状态。
+                    if not arm.DisableArm():
+                        self.error_occurred.emit(f"{label} 使能失败后失能未成功，请执行急停")
+                    if arm is self.arm:
+                        self._enabled = False
+                    else:
+                        self._arm2_enabled = False
+                    failures.append(f"{label} 使能失败：SDK 返回失败")
+                    continue
                 if arm is self.arm:
                     self._enabled = True
                 else:
@@ -443,6 +524,16 @@ class ArmWorker(QThread):
                 enabled_any = True
                 self.log_message.emit(f"{label}电机已使能")
             except Exception as e:
+                if enable_attempted:
+                    try:
+                        if not arm.DisableArm():
+                            self.error_occurred.emit(f"{label} 使能异常后失能未成功，请执行急停")
+                    except Exception as disable_error:
+                        self.error_occurred.emit(f"{label} 使能异常后失能失败: {disable_error}")
+                    if arm is self.arm:
+                        self._enabled = False
+                    else:
+                        self._arm2_enabled = False
                 failures.append(f"{label} 使能失败: {e}")
 
         if enabled_any:
@@ -544,17 +635,20 @@ class ArmWorker(QThread):
             self.enabled_changed.emit(False)
             self.log_message.emit("急停已触发（模拟模式）")
             return
-        try:
-            if self.arm:
-                self.arm.EmergencyStop()
-            if self.arm2:
-                self.arm2.EmergencyStop()
-            self._enabled = False
-            self._arm2_enabled = False
-            self.enabled_changed.emit(False)
-            self.log_message.emit("急停已触发")
-        except Exception as e:
-            self.error_occurred.emit(f"急停失败: {e}")
+        for label, arm, enabled_attr in (
+                ("臂1", self.arm, "_enabled"),
+                ("臂2", self.arm2, "_arm2_enabled")):
+            if arm is None:
+                continue
+            try:
+                if arm.EmergencyStop():
+                    setattr(self, enabled_attr, False)
+                else:
+                    self.error_occurred.emit(f"{label}急停未成功")
+            except Exception as e:
+                self.error_occurred.emit(f"{label}急停失败: {e}")
+        self.enabled_changed.emit(self.is_enabled)
+        self.log_message.emit("急停已触发")
 
     def _ensure_control_loop(self, arm=None):
         """运动命令前自动启动控制循环（200Hz EMA 平滑 + 速度前馈 + 重力补偿）"""
@@ -761,10 +855,13 @@ class ArmWorker(QThread):
             return
         kd = self._ZERO_TORQUE_KD[0] if enable else 1.0
         state = "开启" if enable else "关闭"
-        for label, arm in (("臂1", self.arm), ("臂2", self.arm2)):
-            if arm:
-                arm.ZeroTorqueMode(enable, kd=kd)
-                self.log_message.emit(f"{label}零力矩模式{state}")
+        for label, arm, enabled in (("臂1", self.arm, self._enabled),
+                                    ("臂2", self.arm2, self._arm2_enabled)):
+            if arm and enabled:
+                if arm.ZeroTorqueMode(enable, kd=kd):
+                    self.log_message.emit(f"{label}零力矩模式{state}")
+                else:
+                    self.error_occurred.emit(f"{label}零力矩模式{state}失败")
 
     def _do_zero_torque_gravity(self, enable):
         if self._sim_mode:
@@ -772,11 +869,14 @@ class ArmWorker(QThread):
             self.log_message.emit(f"重力补偿零力矩{state}（模拟，双臂）")
             return
         state = "开启" if enable else "关闭"
-        for label, arm in (("臂1", self.arm), ("臂2", self.arm2)):
-            if arm:
-                arm.ZeroTorqueModeWithGravity(
-                    enable, kd=self._ZERO_TORQUE_KD, update_rate=100.0)
-                self.log_message.emit(f"{label}重力补偿零力矩{state}")
+        for label, arm, enabled in (("臂1", self.arm, self._enabled),
+                                    ("臂2", self.arm2, self._arm2_enabled)):
+            if arm and enabled:
+                if arm.ZeroTorqueModeWithGravity(
+                        enable, kd=self._ZERO_TORQUE_KD, update_rate=100.0):
+                    self.log_message.emit(f"{label}重力补偿零力矩{state}")
+                else:
+                    self.error_occurred.emit(f"{label}重力补偿零力矩{state}失败")
 
     def _do_set_torque_limits(self, l13_limit, l46_limit, enabled):
         """设置双臂关节软力矩限制：L1-L3 与 L4-L6 分组限值 (Nm)，enabled 开关"""
@@ -1129,6 +1229,8 @@ class ArmWorker(QThread):
                             self.motor_feedback_updated2.emit(motor_fb_list2)
                 except Exception as e:
                     logger.debug(f"Arm2 poll error: {e}")
+            if self.arm is None:
+                return
             try:
                 if not self._enabled:
                     self._trigger_feedback_poll(self.arm)
@@ -1199,11 +1301,12 @@ class ArmWorker(QThread):
             self.velocities_updated.emit(vs)
             es = ArmJointStates.from_list(torques, timestamp=now)
             self.efforts_updated.emit(es)
-            js2 = ArmJointStates.from_list(list(self._sim_positions2), timestamp=now)
-            js2.hz = self._poll_rate_hz
-            self.joints_updated2.emit(js2)
-            es2 = ArmJointStates.from_list(list(self._sim_torques2), timestamp=now)
-            self.efforts_updated2.emit(es2)
+            if self._arm2_connected:
+                js2 = ArmJointStates.from_list(list(self._sim_positions2), timestamp=now)
+                js2.hz = self._poll_rate_hz
+                self.joints_updated2.emit(js2)
+                es2 = ArmJointStates.from_list(list(self._sim_torques2), timestamp=now)
+                self.efforts_updated2.emit(es2)
             self.can_fps_updated.emit(200.0)
 
     def _update_sim_state(self):

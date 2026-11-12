@@ -31,6 +31,7 @@ class TeachingPanel(QWidget):
         super().__init__(parent)
         self.recorder = TrajectoryRecorder(sample_rate_hz=10.0)
         self._zero_torque_active = False
+        self._zero_torque_gravity_active = False
         self._current_positions = [0.0] * 7
         self._current_positions2 = [0.0] * 7
         self._has_arm2 = False  # 是否收到过臂2反馈
@@ -166,20 +167,23 @@ class TeachingPanel(QWidget):
         self._zero_torque_active = not self._zero_torque_active
 
         if self._zero_torque_active:
+            self._zero_torque_gravity_active = self.gravity_check.isChecked()
+            self.gravity_check.setEnabled(False)
             self.zt_toggle_btn.setText(tr("teach.zt_off"))
             sc = SCENE_COLORS[ThemeManager.instance().theme]
             self.zt_toggle_btn.setStyleSheet(
                 f"background-color: {sc['zt_active_bg']}; color: white; border-radius: 6px;"
             )
-            if self.gravity_check.isChecked():
+            if self._zero_torque_gravity_active:
                 self.zero_torque_gravity_requested.emit(True)
             else:
                 self.zero_torque_requested.emit(True)
         else:
+            self.gravity_check.setEnabled(True)
             self.zt_toggle_btn.setText(tr("teach.zt_on"))
             self.zt_toggle_btn.setStyleSheet("")
             self.zt_toggle_btn.setObjectName("enableBtn")
-            if self.gravity_check.isChecked():
+            if self._zero_torque_gravity_active:
                 self.zero_torque_gravity_requested.emit(False)
             else:
                 self.zero_torque_requested.emit(False)
@@ -295,6 +299,10 @@ class TeachingPanel(QWidget):
 
         # 臂2 轨迹（录制时含臂2数据才回放臂2；两臂独立规划、同时开始）
         sdk_points2 = None
+        if (getattr(self, "work_mode", "dual") == "single"
+                and traj.points[0].positions2 is not None):
+            QMessageBox.warning(self, "示教回放", "双臂轨迹不能在单臂模式回放，请断开后切换双臂模式。")
+            return
         if traj.points[0].positions2 is not None:
             sdk_points2 = self._plan_arm_spline(traj.points, lambda pt: pt.positions2)
 

@@ -1130,7 +1130,8 @@ class ELA3Interface:
                 logger.warning("Pinocchio 不可用，使用无重力补偿零力矩模式")
                 return self.ZeroTorqueMode(True, kd=kd_list[0])
 
-            self.ZeroTorqueMode(True, kd=kd_list[0])
+            if not self.ZeroTorqueMode(True, kd=kd_list[0]):
+                return False
             self._zt_gravity_running = True
             self._zt_gravity_thread = threading.Thread(
                 target=self._zero_torque_gravity_loop,

@@ -40,6 +40,7 @@ class JointControlPanel(QWidget):
         self._enabled = False
         # 每臂一组控件: {sliders, spinboxes, pos/vel/torque/temp labels, name_labels}
         self._arms = []
+        self._arm_layouts = []
         self._header_labels = []
         self._arm_title_labels = []
         self._init_ui()
@@ -88,6 +89,7 @@ class JointControlPanel(QWidget):
             grid.setColumnStretch(3, 0)
             grid.setColumnStretch(4, 0)
             grid.setColumnStretch(5, 0)
+            self._arm_layouts.append(grid)
             layout.addLayout(grid)
 
         btn_layout = QHBoxLayout()

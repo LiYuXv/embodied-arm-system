@@ -7,7 +7,7 @@ import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QDockWidget, QTabWidget,
     QWidget, QVBoxLayout, QTextEdit, QApplication,
-    QMessageBox,
+    QMessageBox, QSplitter, QScrollArea, QLabel, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -31,13 +31,13 @@ from debugger.widgets.diagnostics_panel import DiagnosticsPanel
 from debugger.widgets.gripper_panel import GripperPanel
 from debugger.widgets.gamepad_panel import GamepadPanel
 from debugger.widgets.vr_panel import VrPanel
+from debugger.widgets.joycon_panel import JoyConPanel
 from debugger.utils.i18n import tr
 from debugger.utils.theme_manager import ThemeManager
-from debugger.utils.system_config import load_config
+from debugger.utils.system_config import load_config, save_config
+from debugger.utils.work_mode import normalize_mode
+from debugger.utils.mode_ui import set_layout_visible, set_arm_selector
 from debugger.widgets.settings_dialog import SettingsDialog
-
-# 底盘 + 升降控制面板（工控机本地 CAN 电机，复用 chassis_lift_status）
-from chassis_lift_status import create_embedded_panel
 
 # 摄像头帧信号 - 用于后续lerobot数据集收集
 from debugger.widgets.camera_pyqt import CameraWidget
@@ -53,14 +53,19 @@ class MainWindow(QMainWindow):
     def __init__(self, urdf_path=None, mesh_dir=None, auto_connect=None):
         super().__init__()
         self.setWindowTitle(tr("win.title"))
-        self.setMinimumSize(800, 1100)
-        self.resize(900, 1400)
+        # 横屏工作台：左右可调视觉/控制区，底部独立日志。
+        self.setMinimumSize(1120, 700)
+        self.resize(1640, 940)
 
         # 加载系统设置（settings/main_system_config.json）
         self._sys_config = load_config()
+        self.work_mode = normalize_mode(self._sys_config.get("work_mode"))
+        self._mobile_enabled = bool(self._sys_config.get("mobile_base_enabled", False))
+        self._chassis_win = None
+        self.chassis_panel = None
         if auto_connect is None:
             auto_connect = bool(
-                self._sys_config.get("auto_connect_on_startup", True))
+                self._sys_config.get("auto_connect_on_startup", False))
         # 自动连接成功后自动使能（跟随自动连接开关）
         self._auto_enable_pending = False
 
@@ -97,6 +102,9 @@ class MainWindow(QMainWindow):
         self._init_worker()
         self._init_ui()
         self._connect_signals()
+        self._apply_work_mode_ui()
+        if self._mobile_enabled and self._chassis_win is not None:
+            QTimer.singleShot(0, self._on_chassis_ready)
 
         tm = ThemeManager.instance()
         tm.language_changed.connect(lambda _: self._retranslate_ui())
@@ -114,8 +122,6 @@ class MainWindow(QMainWindow):
                 int(self._sys_config.get("can_bitrate", 500000)))
         except Exception as e:
             logger.warning(f"[MainWindow] 应用 CAN 波特率配置失败: {e}")
-
-        QTimer.singleShot(500, self._on_chassis_ready)
 
         if auto_connect:
             QTimer.singleShot(1000, self._auto_connect_arms)
@@ -144,11 +150,16 @@ class MainWindow(QMainWindow):
             camera_ports = self.camera_widget.camera_usb_ports()
         except Exception:
             camera_ports = None
-        dlg = SettingsDialog(self, camera_ports=camera_ports)
+        dlg = SettingsDialog(
+            self, camera_ports=camera_ports,
+            camera_binding_guard=self.camera_widget.prepare_camera_binding_change,
+            camera_binding_restore=self.camera_widget.restore_camera_binding_capture,
+            work_mode=self.work_mode)
         dlg.settings_saved.connect(self._on_settings_saved)
         dlg.exec()
 
     def _on_settings_saved(self, cfg: dict):
+        restart_mobile = bool(cfg.get("mobile_base_enabled", False)) != self._mobile_enabled
         self._sys_config.update(cfg)
         try:
             self.toolbar.set_can_bitrate(int(cfg.get("can_bitrate", 500000)))
@@ -169,17 +180,25 @@ class MainWindow(QMainWindow):
             f"[设置] 已保存: 自动连接="
             f"{'开' if cfg.get('auto_connect_on_startup') else '关'}, "
             f"CAN 波特率={int(cfg.get('can_bitrate', 500000)) // 1000}K")
+        if restart_mobile:
+            QMessageBox.information(self, "设置", "底盘 / 升降开关已保存，请重启上位机生效。")
 
     def _init_worker(self):
         self.worker = ArmWorker()
+        self.worker.try_set_work_mode(self.work_mode)
         self.worker.start()
 
     def _init_ui(self):
         # --- 顶部工具栏（单行固定高度） ---
-        toolbar_widget = ToolbarPanel()
+        toolbar_widget = ToolbarPanel(work_mode=self.work_mode)
         self.toolbar = toolbar_widget
         self.toolbar_dock = QDockWidget(tr("win.toolbar"), self)
-        self.toolbar_dock.setWidget(toolbar_widget)
+        self.toolbar_scroll = QScrollArea()
+        self.toolbar_scroll.setWidgetResizable(True)
+        self.toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.toolbar_scroll.setWidget(toolbar_widget)
+        self.toolbar_dock.setWidget(self.toolbar_scroll)
         self.toolbar_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         empty_title = QWidget()
         empty_title.setFixedHeight(0)
@@ -187,13 +206,8 @@ class MainWindow(QMainWindow):
         self.toolbar_dock.setStyleSheet("QDockWidget { border: none; }")
         self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.toolbar_dock)
 
-        # --- 底盘 + 升降控制面板（作为底部 Tab 的第一分页） ---
-        self._chassis_win, self.chassis_panel = create_embedded_panel()
-
         # --- 底部：功能面板 Tab（竖屏布局，横跨整个窗口宽度） ---
         self.tabs = QTabWidget()
-
-        self.tabs.addTab(self.chassis_panel, "底盘 / 升降")
 
         self.joint_panel = JointControlPanel()
         self.tabs.addTab(self.joint_panel, tr("tab.joint"))
@@ -217,41 +231,104 @@ class MainWindow(QMainWindow):
         self.vr_panel.apply_defaults(self._sys_config.get("vr_defaults", {}))
         self.tabs.addTab(self.vr_panel, tr("tab.vr"))
 
-        self.tabs_dock = QDockWidget(tr("win.panels"), self)
-        self.tabs_dock.setWidget(self.tabs)
-        self.tabs_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
-        _hide2 = QWidget(); _hide2.setFixedHeight(0)
-        self.tabs_dock.setTitleBarWidget(_hide2)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.tabs_dock)
+        self.joycon_left = JoyConPanel("left", ready_check=self._joycon_arm_ready,
+                                       claim_check=self._joycon_can_claim)
+        self.joycon_right = JoyConPanel("right", ready_check=self._joycon_arm_ready,
+                                        claim_check=self._joycon_can_claim)
+        joycon_tab = QWidget()
+        self.joycon_tab = joycon_tab
+        joycon_layout = QVBoxLayout(joycon_tab)
+        joycon_layout.addWidget(self.joycon_left)
+        joycon_layout.addWidget(self.joycon_right)
+        self.tabs.addTab(joycon_tab, "双 Joy-Con")
+
+        # 控制区在右侧，不再使用固定底部 Dock；放进独立滚动视图。
+        self.tabs_dock = QWidget(self)
+        self.tabs_dock.setWindowTitle(tr("win.panels"))
+        tabs_layout = QVBoxLayout(self.tabs_dock)
+        tabs_layout.setContentsMargins(4, 4, 4, 4)
+        tabs_layout.addWidget(self.tabs)
+        self.tabs_scroll = QScrollArea(self)
+        self.tabs_scroll.setObjectName("controlScrollArea")
+        self.tabs_scroll.setWidgetResizable(True)
+        self.tabs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tabs_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tabs_scroll.setWidget(self.tabs_dock)
+        self.tabs_scroll.setMinimumWidth(400)
 
         self.log_console = QTextEdit()
         self.log_console.setObjectName("logConsole")
         self.log_console.setReadOnly(True)
-        self.log_console.setFixedHeight(160)
+        self.log_console.setMinimumHeight(90)
+        self.log_console.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
-        # --- 中央：末端位姿 + 摄像头 + 日志（竖屏上下排列） ---
-        central_widget = QWidget()
-        central_layout = QVBoxLayout(central_widget)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(4)
+        # --- 左侧：末端位姿、摄像头、数据采集与 VLA ---
 
         from debugger.widgets.real_time_kinematics_display import RealTimeKinematicsDisplay
         self.kinematics_display = RealTimeKinematicsDisplay()
-        self.camera_widget = CameraWidget(self, dataset_root=os.path.join(os.path.dirname(os.path.abspath(__file__)), "lerobot_data"))
+        self.camera_widget = CameraWidget(self, work_mode=self.work_mode, dataset_root=os.path.join(os.path.dirname(os.path.abspath(__file__)), "lerobot_data"))
         self.camera_widget.setMinimumWidth(320)
+        self.camera_widget._single_feedback_ready = lambda: self.worker.arm1_connected
         self.camera_widget.set_end_pose_callback(self._get_current_end_pose)
         self.camera_widget.set_end_pose2_callback(self._get_current_end_pose2)
         self.camera_widget.set_torque_callback(self._get_gripper_torque)
         self.camera_widget.set_torque2_callback(self._get_gripper_torque2)
+        self.camera_widget.set_joint_state_callback(self._get_dual_joint_state)
+        self._init_optional_mobile_base()
         self.camera_widget.set_motion_callback(self.worker.submit_command)
         # 摄像头面板日志输出到主界面日志文本框（如 LeRobot 录制保存结果）
         self.camera_widget.camera_log.connect(self._append_log)
 
-        central_layout.addWidget(self.kinematics_display)
-        central_layout.addWidget(self.camera_widget, stretch=1)
-        central_layout.addWidget(self.log_console)
+        # 保留 CameraWidget 的原有采集、模型加载和动作回调，
+        # 通过滚动容器解决高控件密度下的遮挡，不改变控制链路。
+        camera_content = QWidget()
+        camera_layout = QVBoxLayout(camera_content)
+        camera_layout.setContentsMargins(4, 4, 4, 4)
+        camera_layout.setSpacing(6)
+        camera_layout.addWidget(QLabel("视觉 / VLA 推理 / 数据采集"))
+        self.kinematics_scroll = QScrollArea()
+        self.kinematics_scroll.setWidgetResizable(True)
+        self.kinematics_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.kinematics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.kinematics_scroll.setWidget(self.kinematics_display)
+        camera_layout.addWidget(self.kinematics_scroll)
+        camera_layout.addWidget(self.camera_widget)
+        camera_layout.addStretch()
+        self.camera_scroll = QScrollArea(self)
+        self.camera_scroll.setObjectName("cameraScrollArea")
+        self.camera_scroll.setWidgetResizable(True)
+        self.camera_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.camera_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.camera_scroll.setWidget(camera_content)
+        self.camera_scroll.setMinimumWidth(650)
 
-        self.setCentralWidget(central_widget)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.main_splitter.setObjectName("workspaceSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+        self.main_splitter.addWidget(self.camera_scroll)
+        self.main_splitter.addWidget(self.tabs_scroll)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 1)
+
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(4, 2, 4, 2)
+        log_layout.setSpacing(2)
+        log_layout.addWidget(QLabel("运行日志"))
+        log_layout.addWidget(self.log_console)
+
+        self.vertical_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.vertical_splitter.setObjectName("logSplitter")
+        self.vertical_splitter.setChildrenCollapsible(False)
+        self.vertical_splitter.setHandleWidth(8)
+        self.vertical_splitter.addWidget(self.main_splitter)
+        self.vertical_splitter.addWidget(log_panel)
+        self.vertical_splitter.setStretchFactor(0, 4)
+        self.vertical_splitter.setStretchFactor(1, 1)
+        self.setCentralWidget(self.vertical_splitter)
 
         # --- 实时监控弹出窗口（按需打开） ---
         self.monitoring_window = MonitoringWindow(self.worker.data_buffer, parent=self)
@@ -262,15 +339,153 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, self._adjust_dock_sizes)
 
+    def _work_mode_busy_reason(self):
+        if self.camera_widget._camera_binding_busy():
+            return "录制、保存或 VLA 推理尚未停止"
+        if (self.teaching_panel.recorder.is_recording
+                or self.teaching_panel._zero_torque_active):
+            return "示教录制或零力矩模式尚未停止"
+        calibration = self.teaching_panel.calibration_panel._worker
+        if calibration is not None and calibration.isRunning():
+            return "标定尚未停止"
+        if (self.joycon_left.is_controlling or self.joycon_right.is_controlling
+                or self.gamepad_panel._ctrl_running or self.vr_panel._ctrl_running):
+            return "遥操作尚未停止"
+        for panel in (self.gamepad_panel, self.vr_panel):
+            for name in ("_ctrl_thread", "_ctrl_thread2"):
+                thread = getattr(panel, name, None)
+                if thread is not None and thread.is_alive():
+                    return "遥操作线程尚未退出"
+        return ""
+
+    def _on_work_mode_requested(self, mode):
+        mode = normalize_mode(mode)
+        if mode == self.work_mode:
+            return
+        reason = self._work_mode_busy_reason()
+        if reason or not self.worker.try_set_work_mode(mode):
+            self.toolbar.set_work_mode(self.work_mode)
+            QMessageBox.warning(self, "工作模式", (reason or "机械臂连接、使能或命令尚未结束")
+                                + "。请先停止录制/推理/运动，停用并断开机械臂，再切换。")
+            return
+        previous = self.work_mode
+        if not self.camera_widget.set_work_mode(mode):
+            self.worker.try_set_work_mode(previous)
+            self.toolbar.set_work_mode(previous)
+            return
+        # Merge with latest camera/settings values; do not overwrite USB bindings.
+        cfg = load_config()
+        cfg["work_mode"] = mode
+        if not save_config(cfg):
+            self.camera_widget.set_work_mode(previous)
+            self.worker.try_set_work_mode(previous)
+            self.toolbar.set_work_mode(previous)
+            QMessageBox.warning(self, "工作模式", "配置保存失败，已保留原模式。")
+            return
+        self._sys_config = cfg
+        self.work_mode = mode
+        self._last_joint_states = self._last_joint_states2 = None
+        self._last_effort_states = self._last_effort_states2 = None
+        self._last_end_pose = self._last_end_pose2 = None
+        self._last_gripper_angle_rad = self._last_gripper_angle_rad2 = None
+        self._apply_work_mode_ui()
+        self._append_log("[工作模式] " + ("单臂 can0 / pose7 / 双相机" if mode == "single"
+                                       else "双臂 can0+can1 / joint14 / 三相机"))
+
+    def _apply_work_mode_ui(self):
+        dual = self.work_mode == "dual"
+        self.toolbar.set_work_mode(self.work_mode)
+        self.toolbar_scroll.setFixedHeight(self.toolbar.height() + 20)
+        self.kinematics_scroll.setFixedHeight(100 if dual else 64)
+        self.joint_panel._arm_title_labels[1].setVisible(dual)
+        set_layout_visible(self.joint_panel._arm_layouts[1], dual)
+        self.trajectory_panel.movej_group2.setVisible(dual)
+        for layout in (self.gripper_panel._arm2_control_layout,
+                       self.gripper_panel._arm2_feedback_layout,
+                       self.kinematics_display._arm_rows[1]["row"]):
+            set_layout_visible(layout, dual)
+        set_arm_selector(self.diagnostics_panel.arm_combo, dual)
+        self.diagnostics_panel._lbl_arm.setVisible(dual)
+        cal = self.teaching_panel.calibration_panel
+        set_arm_selector(cal._arm_combo, dual)
+        cal._arm_label.setVisible(dual)
+        for key in ("pos_labels", "vel_labels", "torque_labels", "temp_labels"):
+            for label in self.joint_panel._arms[1][key]:
+                label.setText("--")
+        for label in (self.gripper_panel._fb_labels[1], self.gripper_panel._torque_labels[1]):
+            label.setText("--")
+        row2 = self.kinematics_display._arm_rows[1]
+        for key in ("pos_labels", "quat_labels", "euler_labels"):
+            for label in row2[key].values():
+                label.setText("--")
+        row2["gripper_angle_label"].setText("--")
+        row2["gripper_torque_label"].setText("--")
+        self.teaching_panel.work_mode = self.work_mode
+        self.teaching_panel._has_arm2 = False
+        self.teaching_panel._current_positions2 = [0.0] * 7
+        self.diagnostics_panel._state_cache[1] = None
+        self.diagnostics_panel._feedback_cache[1] = None
+        for widget in (self.vr_panel._left_label, self.vr_panel._lbl_target2,
+                       self.vr_panel._target_label2, self.joycon_right):
+            widget.setVisible(dual)
+        self.tabs.setTabText(self.tabs.indexOf(self.joycon_tab), "双 Joy-Con" if dual else "Joy-Con · 臂1")
+        self.setWindowTitle("EL-A3 上位机 · " + ("双臂" if dual else "单臂 can0"))
+
+    def _init_optional_mobile_base(self):
+        if not self._mobile_enabled or getattr(self, "work_mode", "dual") == "single":
+            return
+        try:
+            from chassis_lift_status import create_embedded_panel
+            self._chassis_win, self.chassis_panel = create_embedded_panel()
+            self.tabs.insertTab(0, self.chassis_panel, "底盘 / 升降")
+            self.camera_widget.set_mobile_base_callbacks(
+                self._get_mobile_state,
+                self._chassis_win.set_lift_position_mm,
+                self._chassis_win.set_external_velocity_si,
+                required=True,
+            )
+        except Exception as exc:
+            logger.exception("[MainWindow] 底盘 / 升降初始化失败")
+            if self.chassis_panel is not None:
+                index = self.tabs.indexOf(self.chassis_panel)
+                if index >= 0:
+                    self.tabs.removeTab(index)
+            if self._chassis_win is not None:
+                self._chassis_win.close()
+            self._chassis_win = None
+            self.chassis_panel = None
+            self.camera_widget.set_mobile_base_callbacks(None, None, None, required=True)
+            QMessageBox.warning(self, "底盘 / 升降", f"初始化失败，底盘数据录制已禁用：{exc}")
+
+    def _get_mobile_state(self):
+        if self._chassis_win is None or not self._chassis_win.connected:
+            raise ValueError("底盘 / 升降尚未连接，不能录制 18D 反馈")
+        return self._chassis_win.get_mobile_state()
+
+    def _get_dual_joint_state(self):
+        """录制状态：双臂当前反馈关节 6 + 夹爪弧度，不使用末端位姿。"""
+        if self._last_joint_states is None or self._last_joint_states2 is None:
+            return None
+        try:
+            import numpy as np
+            left = self._last_joint_states.to_list(include_gripper=True)
+            right = self._last_joint_states2.to_list(include_gripper=True)
+            if len(left) != 7 or len(right) != 7:
+                return None
+            state = np.asarray(list(left) + list(right), dtype=np.float32)
+            return state if np.isfinite(state).all() else None
+        except Exception:
+            logger.exception("[MainWindow] 双臂关节反馈无效")
+            return None
+
     def _connect_signals(self):
         tb = self.toolbar
+        tb.mode_requested.connect(self._on_work_mode_requested)
         tb.connect_requested.connect(self._on_connect)
-        tb.disconnect_requested.connect(lambda: self.worker.submit_command("disconnect"))
+        tb.disconnect_requested.connect(self._on_disconnect_requested)
         tb.enable_requested.connect(lambda: self.worker.submit_command("enable"))
         tb.disable_requested.connect(self._on_disable_requested)
-        tb.emergency_stop_requested.connect(
-            lambda: self.worker.submit_command("emergency_stop")
-        )
+        tb.emergency_stop_requested.connect(self._on_emergency_stop_requested)
         tb.safe_exit_requested.connect(self._on_safe_exit)
         tb.open_monitor_requested.connect(self._open_monitoring)
         tb.open_settings_requested.connect(self._open_settings)
@@ -420,15 +635,20 @@ class MainWindow(QMainWindow):
 
         self.gamepad_panel.gamepad_log.connect(self._append_log)
         self.worker.connected_changed.connect(self._on_connected_for_gamepad)
+        self.worker.connected_changed.connect(self._refresh_joycon_arms)
+        self.worker.enabled_changed.connect(self._refresh_joycon_arms)
+        self.joycon_left.joycon_log.connect(self._append_log)
+        self.joycon_right.joycon_log.connect(self._append_log)
+        self.gamepad_panel._motion_start_guard = lambda: self._other_source_can_start("gamepad")
+        self.vr_panel._motion_start_guard = lambda: self._other_source_can_start("vr")
+        self.camera_widget._motion_start_guard = lambda: self._other_source_can_start("vla")
 
         self.vr_panel.vr_log.connect(self._append_log)
-        # VR 左摇杆 → 底盘平移（右摇杆 X → 底盘旋转）
-        self.vr_panel.chassis_cmd.connect(self._on_vr_chassis_cmd)
-        # VR 左手柄 Y/X 键连续升降速度
-        self.vr_panel.lift_vel_cmd.connect(self._on_vr_lift_vel_cmd)
-        # VR 左手柄 X 按住 → 头显位姿控制底盘/升降
-        self.vr_panel.hmd_cmd.connect(self._on_vr_hmd_cmd)
-        self.vr_panel.hmd_released.connect(self._on_vr_hmd_released)
+        if self._mobile_enabled and self._chassis_win is not None:
+            self.vr_panel.chassis_cmd.connect(self._on_vr_chassis_cmd)
+            self.vr_panel.lift_vel_cmd.connect(self._on_vr_lift_vel_cmd)
+            self.vr_panel.hmd_cmd.connect(self._on_vr_hmd_cmd)
+            self.vr_panel.hmd_released.connect(self._on_vr_hmd_released)
         # VR 右手柄扳机键：快捷切换 LeRobot 录制（开始/停止）
         self.vr_panel.record_toggle_requested.connect(
             self._on_vr_record_toggle)
@@ -453,7 +673,7 @@ class MainWindow(QMainWindow):
 
     def _on_gamepad_disconnected_for_vla(self):
         """手柄断开时：若 VLA 仍在运行且处于暂停，自动触发“继续控制”，VLA 重新接管。"""
-        if self._vla_interlock_guard:
+        if self._vla_interlock_guard or self.worker._stopping:
             return
         try:
             self.camera_widget.resume_vla_control()
@@ -491,6 +711,8 @@ class MainWindow(QMainWindow):
         （fb +前进，lr +右移，ld +前左，rd +前右），rot 为旋转；VR 为独立于底盘
         内部实现的上层控制，全向运动合成与加减速斜坡由底盘面板统一执行。
         lift_mm 为右摇杆 Y 升降位置目标（nan=不控升降，升降保持）。"""
+        if not self._mobile_enabled or self._chassis_win is None:
+            return
         try:
             self._chassis_win.set_external_direction_pads(fb, lr, ld, rd, rot)
             if not math.isnan(lift_mm):
@@ -498,12 +720,16 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"[MainWindow] VR 底盘指令失败: {e}")
 
+
     def _on_vr_lift_vel_cmd(self, direction: float, speed_rpm: float):
         """VR 左手柄 Y/X 键连续升降速度控制（direction -1=升 +1=降 0=停）。"""
+        if not self._mobile_enabled or self._chassis_win is None:
+            return
         try:
             self._chassis_win.set_lift_velocity(direction, speed_rpm=speed_rpm)
         except Exception as e:
             logger.warning(f"[MainWindow] VR 升降速度控制失败: {e}")
+
 
     def _on_vr_hmd_cmd(self, target_x: float, target_y: float, target_yaw: float,
                        max_lin: float, lift_mm: float):
@@ -511,6 +737,8 @@ class MainWindow(QMainWindow):
         target_x/y/yaw 为世界系底盘目标位姿 (m, m, rad)，max_lin 为位置伺服
         线速度上限 (m/s)，lift_mm 为升降位置目标 (nan=不控升降)。底盘走里程计
         位置伺服 + 加速度斜坡，升降走位置伺服通道。"""
+        if not self._mobile_enabled or self._chassis_win is None:
+            return
         try:
             self._chassis_win.set_external_pose_target(
                 target_x, target_y, target_yaw, max_lin=max_lin)
@@ -519,28 +747,26 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"[MainWindow] VR 头显底盘指令失败: {e}")
 
+
     def _on_vr_hmd_released(self):
         """VR 左手柄 X 松开：底盘平滑停车（清位姿目标沿斜坡减速），升降冻结。"""
+        if not self._mobile_enabled or self._chassis_win is None:
+            return
         try:
             self._chassis_win.clear_external_pose_target()
             self._chassis_win.clear_lift_target()
         except Exception as e:
             logger.warning(f"[MainWindow] VR 头显控制释放失败: {e}")
 
+
     def _on_chassis_ready(self):
-        """底盘面板就绪后的初始化日志 + 云端推理底盘回调接线。"""
+        """底盘面板就绪后接入 VR 头显升降和位姿提供函数。"""
+        if not self._mobile_enabled or self._chassis_win is None:
+            return
         try:
-            self.camera_widget.set_mobile_base_callbacks(
-                get_state=self._chassis_win.get_mobile_state,
-                lift_position=self._chassis_win.set_lift_position_mm,
-                chassis_velocity=self._chassis_win.set_external_velocity_si,
-            )
-            # VR 头显升降锚定需要读取当前升降高度，位置跟随需要读取底盘位姿
-            # （位姿走里程计 get_odom_pose；get_mobile_state 为训练用速度语义）
             self.vr_panel.set_lift_provider(self._chassis_win.get_lift_mm)
-            self.vr_panel.set_chassis_pose_provider(
-                self._chassis_win.get_odom_pose)
-            self._append_log("底盘/升降面板已就绪（已接入 VR 摇杆与云端推理）")
+            self.vr_panel.set_chassis_pose_provider(self._chassis_win.get_odom_pose)
+            self._append_log("底盘/升降完整功能已恢复：VR 摇杆、头显、升降及状态/执行回调已接入")
         except Exception as e:
             logger.warning(f"[MainWindow] 底盘回调接线失败: {e}")
 
@@ -552,14 +778,18 @@ class MainWindow(QMainWindow):
         self.tabs_dock.setWindowTitle(tr("win.panels"))
         self.statusBar().showMessage(tr("win.ready"))
 
-        self.tabs.setTabText(0, "底盘 / 升降")
-        self.tabs.setTabText(1, tr("tab.joint"))
-        self.tabs.setTabText(2, tr("tab.trajectory"))
-        self.tabs.setTabText(3, tr("tab.teaching"))
-        self.tabs.setTabText(4, tr("tab.diagnostics"))
-        self.tabs.setTabText(5, tr("tab.gripper"))
-        self.tabs.setTabText(6, tr("tab.gamepad"))
-        self.tabs.setTabText(7, tr("tab.vr"))
+        for panel, title in (
+            (self.joint_panel, tr("tab.joint")),
+            (self.trajectory_panel, tr("tab.trajectory")),
+            (self.teaching_panel, tr("tab.teaching")),
+            (self.diagnostics_panel, tr("tab.diagnostics")),
+            (self.gripper_panel, tr("tab.gripper")),
+            (self.gamepad_panel, tr("tab.gamepad")),
+            (self.vr_panel, tr("tab.vr")),
+        ):
+            self.tabs.setTabText(self.tabs.indexOf(panel), title)
+        if self._mobile_enabled and self.chassis_panel is not None:
+            self.tabs.setTabText(self.tabs.indexOf(self.chassis_panel), "底盘 / 升降")
 
         for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
                       self.teaching_panel, self.diagnostics_panel,
@@ -569,15 +799,73 @@ class MainWindow(QMainWindow):
         self.monitoring_window.retranslate_ui()
         if hasattr(self, 'kinematics_display') and self.kinematics_display:
             self.kinematics_display.retranslate_ui()
+        self.setWindowTitle("EL-A3 上位机 · " + ("双臂" if self.work_mode == "dual" else "单臂 can0"))
 
     # ---- helpers ----
 
     def _adjust_dock_sizes(self):
-        # 竖屏布局：底部 Tab 面板约占 45% 高度
-        h = self.height()
-        self.resizeDocks(
-            [self.tabs_dock], [int(h * 0.45)], Qt.Orientation.Vertical
-        )
+        """初始化横屏工作台分隔条；后续可直接用鼠标拖动。"""
+        w = max(1100, self.main_splitter.width())
+        h = max(520, self.vertical_splitter.height())
+        self.main_splitter.setSizes([int(w * 0.64), int(w * 0.36)])
+        self.vertical_splitter.setSizes([int(h * 0.78), int(h * 0.22)])
+
+    def _joycon_arm_ready(self, side):
+        if self.worker._stopping or self.worker._sim_mode:
+            return False
+        if side == "left":
+            return bool(self.worker._connected and self.worker._enabled and self.worker.arm is not None)
+        return bool(self.worker._arm2_connected and self.worker._arm2_enabled and self.worker.arm2 is not None)
+
+    def _refresh_joycon_arms(self, _aggregate=None):
+        self.joycon_left.set_arm_state(self.worker.arm, self.worker._connected,
+                                       self.worker._enabled and not self.worker._sim_mode)
+        self.joycon_right.set_arm_state(self.worker.arm2, self.worker._arm2_connected,
+                                        self.worker._arm2_enabled and not self.worker._sim_mode)
+
+    def _joycon_can_claim(self, side):
+        if not self._joycon_arm_ready(side):
+            return False
+        if self.vr_panel._ctrl_running or any(
+                t is not None and t.is_alive() for t in
+                (self.vr_panel._ctrl_thread, self.vr_panel._ctrl_thread2)):
+            return False
+        if side == "left":
+            if self.gamepad_panel._ctrl_running or (self.gamepad_panel._ctrl_thread is not None
+                                                   and self.gamepad_panel._ctrl_thread.is_alive()):
+                return False
+            if self.camera_widget._vla_running:
+                return False
+        return True
+
+    def _other_source_can_start(self, source):
+        left = self.joycon_left.is_controlling
+        right = self.joycon_right.is_controlling
+        blocked = (right or left) if source == "vr" else left
+        if blocked:
+            self._append_log(f"[{source}] Joy-Con 正在遥操对应机械臂，拒绝并发控制")
+        return not blocked
+
+    def _stop_joycon_inputs(self):
+        ok = True
+        for panel in (self.joycon_left, self.joycon_right):
+            try:
+                ok = panel.disconnect_input() and ok
+            except Exception as exc:
+                ok = False
+                self._append_log(f"[Joy-Con {panel.side}] 停止异常: {exc}")
+        return ok
+
+    def _on_disconnect_requested(self):
+        if self._stop_joycon_inputs():
+            self.worker.submit_command("disconnect")
+        else:
+            self._append_log("[Joy-Con] 停止未确认，拒绝断开；请使用现场急停")
+
+    def _on_emergency_stop_requested(self):
+        if not self._stop_joycon_inputs():
+            self._append_log("[Joy-Con] 停止未确认，急停仍将执行；可能有控制线程滞后指令")
+        self.worker.submit_command("emergency_stop")
 
     def _on_disable_requested(self):
         """失能：若零力矩已开启先自动关闭，再询问是否先回安全位置（第4关节26°，其余关节0）"""
@@ -595,6 +883,9 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes,
         )
         if ret == QMessageBox.StandardButton.Cancel:
+            return
+        if not self._stop_joycon_inputs():
+            self._append_log("[Joy-Con] 停止未确认，拒绝失能流程；请使用现场急停")
             return
         if ret == QMessageBox.StandardButton.Yes:
             self._append_log("[Main] 失能前双臂回安全位置（J4=26°，其余0）")
@@ -717,6 +1008,8 @@ class MainWindow(QMainWindow):
             self.joint_panel._emit_torque_limit()
 
     def _on_connect(self, can_name: str, connect_kwargs: dict):
+        if self.work_mode == "single":
+            connect_kwargs = dict(connect_kwargs, arm2=None)
         self.worker.submit_command("connect", can_name, **connect_kwargs)
 
     def _on_joints_updated2(self, joint_states):
@@ -876,88 +1169,66 @@ class MainWindow(QMainWindow):
         scrollbar.setValue(scrollbar.maximum())
 
     def _on_safe_exit(self):
-        """安全退出：急停电机并断开连接，最后关闭关节控制界面"""
-        if not self.worker.is_connected:
-            self._append_log("未连接，无需安全退出")
-            return
-
+        """请求 worker 按急停、断开、退出的顺序停机。"""
         self._append_log("=== 开始安全退出 ===")
-
-        # 1. 急停（停止控制循环 + 失能电机 + 清除故障）
-        self._append_log("  [1/3] 执行急停...")
-        self.worker.submit_command("emergency_stop")
-        import time
-        time.sleep(0.5)
-
-        # 2. 断开连接
-        self._append_log("  [2/3] 断开连接...")
-        self.worker.submit_command("disconnect")
-        time.sleep(0.3)
-
-        # 3. 停止后台线程
-        self._append_log("  [3/3] 停止后台线程...")
-        self.worker.stop()
-
-        # 4. 关闭关节控制界面和示教界面
-        self._append_log("  [4/4] 关闭关节控制界面...")
+        if not self.worker.stop(before_shutdown=self._stop_motion_sources):
+            self._report_stop_failure()
+            return
         if hasattr(self, 'joint_panel') and self.joint_panel.isVisible():
             self.joint_panel.close()
         if hasattr(self, 'teaching_panel') and self.teaching_panel.isVisible():
             self.teaching_panel.close()
-
         self._append_log("=== 安全退出完成 ===")
+
+    def _report_stop_failure(self):
+        msg = "机械臂停机未确认。工作线程可能仍在运行，或电机失能/断开失败。请使用现场急停并检查通信；窗口保持打开，控制命令已停止接收。"
+        self._append_log(msg)
+        self.toolbar.set_error(msg)
+        QMessageBox.warning(self, "停机未确认", msg)
 
     def closeEvent(self, event):
         self._append_log(tr("win.closing"))
-        # 直接执行急停，确保电机失能
-        if self.worker.is_connected:
-            self._append_log("正在执行急停...")
-            self.worker.submit_command("emergency_stop")
-            import time
-            time.sleep(0.5)  # 等待急停命令执行完成
-        self._cleanup_before_close()
+        if not self._cleanup_before_close():
+            event.ignore()
+            self._report_stop_failure()
+            return
         super().closeEvent(event)
+
+    def _stop_motion_sources(self):
+        """封锁 worker 队列后，先停止可能直接控制 SDK 的运动源。"""
+        errors = []
+        for name, source in (("Joy-Con L", self.joycon_left),
+                             ("Joy-Con R", self.joycon_right),
+                             ("Gamepad", self.gamepad_panel),
+                             ("VR", self.vr_panel), ("VLA", self.camera_widget)):
+            try:
+                source.cleanup()
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+        if errors:
+            raise RuntimeError("；".join(errors))
 
     def _cleanup_before_close(self):
         """关闭程序前的资源清理"""
         self._append_log("正在清理资源...")
 
+        # 先确认 worker 已退出；超时则保留窗口和 worker 对象。
+        if not self.worker.stop(before_shutdown=self._stop_motion_sources):
+            return False
+
         # 停止所有定时器
         if hasattr(self.monitoring_window, 'panel') and hasattr(self.monitoring_window.panel, '_timer'):
             self.monitoring_window.panel._timer.stop()
-
-        # 停止手柄控制
-        self.gamepad_panel.cleanup()
-
-        # 停止 VR 控制
-        self.vr_panel.cleanup()
-
-        # 断开连接
-        if self.worker.is_connected:
-            self.worker.submit_command("disconnect")
-            import time
-            time.sleep(0.2)
-
-        # 停止后台线程
-        self.worker.stop()
 
         # 关闭监控窗口
         if self.monitoring_window.isVisible():
             self.monitoring_window.close()
         if self._perf_dialog is not None:
             self._perf_dialog.close()
-
-        # 清理摄像头资源
-        if hasattr(self, 'camera_widget') and self.camera_widget:
-            self.camera_widget.cleanup()
-
-        # 关闭底盘/升降面板（安全停机 + 断开串口）
-        if hasattr(self, '_chassis_win') and self._chassis_win is not None:
-            try:
-                self._chassis_win.close()
-            except Exception:
-                pass
-
+        if self._chassis_win is not None:
+            self._chassis_win.close()
+            self._chassis_win = None
+            self.chassis_panel = None
 
         # 清理变量
         self._last_joint_states = None
@@ -971,3 +1242,4 @@ class MainWindow(QMainWindow):
         self._last_motor_feedback = None
 
         self._append_log("已清理资源")
+        return True

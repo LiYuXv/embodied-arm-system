@@ -110,11 +110,13 @@ class GripperPanel(QWidget):
         row1, self.angle_slider, self.angle_spin = self._build_arm_row(0)
         g_layout.addLayout(row1)
         row2, self.angle_slider2, self.angle_spin2 = self._build_arm_row(1)
+        self._arm2_control_layout = row2
         g_layout.addLayout(row2)
 
         # 双臂反馈行
         g_layout.addLayout(self._build_feedback_row(0))
-        g_layout.addLayout(self._build_feedback_row(1))
+        self._arm2_feedback_layout = self._build_feedback_row(1)
+        g_layout.addLayout(self._arm2_feedback_layout)
 
         # 力矩限制输入（双臂共用，默认最大 0.5 Nm / 最小 -0.5 Nm）
         limit_layout = QHBoxLayout()

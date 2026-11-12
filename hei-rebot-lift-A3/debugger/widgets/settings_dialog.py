@@ -1,6 +1,7 @@
 """系统设置对话框：分页设置，保存到 settings/main_system_config.json"""
 
 import os
+import re
 
 from PyQt6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -43,7 +44,8 @@ def _list_video_usb_ports():
         if os.path.islink(dev):
             real = os.path.realpath(dev)
             if "/usb" in real:
-                usb_id = os.path.basename(os.readlink(dev))
+                match = re.search(r"/(\d+-[\d.]+:\d+\.\d+)(?:/|$)", real)
+                usb_id = match.group(1) if match else None
         if usb_id:
             ports.append((idx, usb_id))
     return ports
@@ -54,7 +56,8 @@ class SettingsDialog(QDialog):
 
     settings_saved = pyqtSignal(dict)
 
-    def __init__(self, parent=None, camera_ports=None):
+    def __init__(self, parent=None, camera_ports=None, camera_binding_guard=None,
+                 camera_binding_restore=None, work_mode="dual"):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setMinimumWidth(420)
@@ -62,7 +65,10 @@ class SettingsDialog(QDialog):
         # 摄像头端口列表 [(video_idx, usb_id)]；由主窗口传入 CameraWidget 的
         # 检测结果，保证与主界面显示的摄像头串口号一致；未传入时回退到
         # sysfs 扫描。
+        self._work_mode = work_mode
         self._camera_ports = camera_ports
+        self._camera_binding_guard = camera_binding_guard
+        self._camera_binding_restore = camera_binding_restore
 
         root = QVBoxLayout(self)
 
@@ -77,6 +83,8 @@ class SettingsDialog(QDialog):
 
         self.auto_connect_cb = QCheckBox("启动后自动连接串口（连接成功后自动使能）")
         form.addRow(self.auto_connect_cb)
+        self.mobile_base_cb = QCheckBox("启用底盘 / 升降（保存后重启生效）")
+        form.addRow(self.mobile_base_cb)
 
         bitrate_row = QHBoxLayout()
         self.bitrate_combo = QComboBox()
@@ -125,8 +133,10 @@ class SettingsDialog(QDialog):
 
         # 每一行：端口标签 + 角色下拉框
         self.cam_rows = []  # (usb_id, video_idx, QComboBox)
-        ports = self._camera_ports or _list_video_usb_ports()
-        for idx, usb_id in ports[:3]:
+        ports = self._camera_ports if self._camera_ports is not None else _list_video_usb_ports()
+        for idx, usb_id in ports:
+            if not usb_id:
+                continue
             row = QHBoxLayout()
             row.setSpacing(6)
             lbl = QLabel(f"usb {usb_id}  (/dev/video{idx})")
@@ -135,6 +145,9 @@ class SettingsDialog(QDialog):
             combo.addItem("未分配", None)
             for role in CAMERA_ROLES:
                 combo.addItem(CAMERA_ROLE_NAMES[role], role)
+                if self._work_mode == "single" and role == "arm2":
+                    combo.setItemText(combo.count() - 1, "臂2（双臂模式保留）")
+                    combo.model().item(combo.count() - 1).setEnabled(False)
             row.addWidget(lbl)
             row.addWidget(combo, 1)
             lay.addLayout(row)
@@ -156,13 +169,6 @@ class SettingsDialog(QDialog):
         info.setWordWrap(True)
         form.addRow(info)
 
-        self.vr_lift_rpm_spin = QDoubleSpinBox()
-        self.vr_lift_rpm_spin.setRange(10.0, 1000.0)
-        self.vr_lift_rpm_spin.setSingleStep(10.0)
-        self.vr_lift_rpm_spin.setDecimals(0)
-        self.vr_lift_rpm_spin.setSuffix(" RPM")
-        form.addRow(QLabel("升降转速:"), self.vr_lift_rpm_spin)
-
         self.vr_gripper_speed_spin = QDoubleSpinBox()
         self.vr_gripper_speed_spin.setRange(0.1, 5.0)
         self.vr_gripper_speed_spin.setSingleStep(0.1)
@@ -177,26 +183,13 @@ class SettingsDialog(QDialog):
         self.vr_scale_spin.setSuffix(" x")
         form.addRow(QLabel("运动缩放:"), self.vr_scale_spin)
 
-        self.vr_hmd_pos_scale_spin = QDoubleSpinBox()
-        self.vr_hmd_pos_scale_spin.setRange(0.2, 5.0)
-        self.vr_hmd_pos_scale_spin.setSingleStep(0.1)
-        self.vr_hmd_pos_scale_spin.setDecimals(1)
-        self.vr_hmd_pos_scale_spin.setSuffix(" x")
-        form.addRow(QLabel("头显位置缩放:"), self.vr_hmd_pos_scale_spin)
-
-        self.vr_hmd_max_lin_spin = QDoubleSpinBox()
-        self.vr_hmd_max_lin_spin.setRange(0.05, 1.00)
-        self.vr_hmd_max_lin_spin.setSingleStep(0.05)
-        self.vr_hmd_max_lin_spin.setDecimals(2)
-        self.vr_hmd_max_lin_spin.setSuffix(" m/s")
-        form.addRow(QLabel("头显速度跟随:"), self.vr_hmd_max_lin_spin)
-
         self.tabs.addTab(tab, "VR 控制")
 
     def _load(self):
         cfg = load_config()
         self.auto_connect_cb.setChecked(
             bool(cfg.get("auto_connect_on_startup", True)))
+        self.mobile_base_cb.setChecked(bool(cfg.get("mobile_base_enabled", False)))
         bitrate = int(cfg.get("can_bitrate", 500000))
         for i in range(self.bitrate_combo.count()):
             if self.bitrate_combo.itemData(i) == bitrate:
@@ -220,24 +213,19 @@ class SettingsDialog(QDialog):
     def _load_vr_tab(self, cfg):
         d = cfg.get("vr_defaults")
         d = dict(d) if isinstance(d, dict) else {}
-        self.vr_lift_rpm_spin.setValue(float(d.get("lift_speed_rpm", 200.0)))
         self.vr_gripper_speed_spin.setValue(float(d.get("gripper_speed_rad_s", 2.0)))
         self.vr_scale_spin.setValue(float(d.get("scale", 1.0)))
-        self.vr_hmd_pos_scale_spin.setValue(float(d.get("hmd_pos_scale", 1.0)))
-        self.vr_hmd_max_lin_spin.setValue(float(d.get("hmd_max_lin", 0.30)))
 
     def _collect_vr_defaults(self):
         return {
-            "lift_speed_rpm": self.vr_lift_rpm_spin.value(),
             "gripper_speed_rad_s": self.vr_gripper_speed_spin.value(),
             "scale": self.vr_scale_spin.value(),
-            "hmd_pos_scale": self.vr_hmd_pos_scale_spin.value(),
-            "hmd_max_lin": self.vr_hmd_max_lin_spin.value(),
         }
 
     def get_config(self) -> dict:
         return {
             "auto_connect_on_startup": self.auto_connect_cb.isChecked(),
+            "mobile_base_enabled": self.mobile_base_cb.isChecked(),
             "can_bitrate": self.bitrate_combo.currentData() or 500000,
         }
 
@@ -271,6 +259,10 @@ class SettingsDialog(QDialog):
 
         for role, usb_id, idx in assigned:
             existing[role] = {"usb": usb_id, "index": idx}
+        used_usbs = [info.get("usb") for info in existing.values()
+                     if isinstance(info, dict) and info.get("usb")]
+        if len(used_usbs) != len(set(used_usbs)):
+            return None, "同一 USB 端口不能绑定多个角色"
         return existing, None
 
     def _on_save(self):
@@ -279,6 +271,14 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "摄像头设置", err)
             return
         cfg = load_config()
+        camera_changed = roles != (cfg.get("camera_roles") or {})
+        if (camera_changed
+                and self._camera_binding_guard is not None
+                and not self._camera_binding_guard()):
+            QMessageBox.warning(
+                self, "摄像头设置",
+                "录像、LeRobot、rollout、VLA 运行中，或旧采集线程未退出；不能切换绑定")
+            return
         cfg.update(self.get_config())
         cfg["camera_roles"] = roles
         cfg["vr_defaults"] = self._collect_vr_defaults()
@@ -286,4 +286,6 @@ class SettingsDialog(QDialog):
             self.settings_saved.emit(cfg)
             self.accept()
         else:
+            if camera_changed and self._camera_binding_restore is not None:
+                self._camera_binding_restore()
             QMessageBox.warning(self, "保存失败", "配置文件写入失败，请检查文件权限")

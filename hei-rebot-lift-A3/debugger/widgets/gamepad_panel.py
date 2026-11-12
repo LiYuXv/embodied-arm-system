@@ -632,6 +632,10 @@ class GamepadPanel(QWidget):
             self._start_control()
 
     def _start_control(self):
+        if not getattr(self, "_motion_start_guard", lambda: True)():
+            self.gamepad_log.emit("Joy-Con 正在遥操左臂，拒绝 Xbox 并发控制")
+            return
+
         """启动手柄控臂后台线程。"""
         if not self._joystick or not self._joystick.connected:
             self.gamepad_log.emit(tr("gp.connect_first"))

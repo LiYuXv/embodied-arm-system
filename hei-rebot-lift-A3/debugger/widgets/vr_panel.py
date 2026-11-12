@@ -1235,6 +1235,10 @@ class VrPanel(QWidget):
             self._start_control()
 
     def _start_control(self):
+        if not getattr(self, "_motion_start_guard", lambda: True)():
+            self.vr_log.emit("Joy-Con 正在遥操，拒绝 VR 并发控制")
+            return
+
         if self._receiver is None:
             self.vr_log.emit(tr("vr.connect_first"))
             return

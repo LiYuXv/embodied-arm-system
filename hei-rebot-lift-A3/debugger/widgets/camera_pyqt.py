@@ -18,6 +18,7 @@ import signal
 import subprocess
 import threading
 import math
+import re
 from pathlib import Path
 from queue import Queue, Empty, Full
 from collections import deque
@@ -46,11 +47,16 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QComboBox, QMessageBox, QGridLayout, QLineEdit, QFileDialog,
-    QCheckBox, QDoubleSpinBox, QTextEdit, QApplication
+    QCheckBox, QDoubleSpinBox, QTextEdit, QApplication, QScrollArea, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
+from debugger.backend.dual_arm_lerobot import (
+    DualArmLeRobotRecordThread, make_dual_arm_features, make_single_arm_features, features_are_compatible,
+)
 
+from debugger.utils.work_mode import camera_roles, load_model_contract, validate_model_contract
+from debugger.utils.mode_ui import set_layout_visible
 
 # ============================================================================
 # 后台采集线程：每路摄像头一个线程，避免阻塞主线程
@@ -78,7 +84,7 @@ class CameraCaptureThread(QThread):
 
     def stop(self):
         self._running = False
-        self.wait(500)
+        return self.wait(2000)
 
     def get_last_frame(self):
         return self._last_frame
@@ -128,7 +134,7 @@ class LeRobotRecordThread(QThread):
 
     def __init__(self, dataset, pose_callback, fps=20, max_queue=60,
                  torque_callback=None, action_lookahead=1, parent=None,
-                 extra_state_callback=None, pose2_callback=None,
+                 pose2_callback=None,
                  torque2_callback=None):
         super().__init__(parent)
         self.dataset = dataset
@@ -137,10 +143,6 @@ class LeRobotRecordThread(QThread):
         # 臂2 回调：位姿/夹爪力矩（None 时以 0 填充，保持 14 维状态维度一致）
         self.pose2_callback = pose2_callback
         self.torque2_callback = torque2_callback
-        # 底盘/升降附加状态回调：() -> array(4) [lift_m, vx, vy, omega]，
-        # （升降绝对位置米 + 底盘机体系实测速度 m/s, m/s, rad/s）
-        # 设置后 state/action 从 14 维扩展为 18 维
-        self.extra_state_callback = extra_state_callback
         self.fps = fps
         self.max_queue = max_queue
         # action 标签前瞻帧数：action[t] = pose[t+lookahead]。
@@ -210,23 +212,9 @@ class LeRobotRecordThread(QThread):
         return out
 
     def _get_pose_dual(self):
-        """获取双臂位姿 [arm1_pose7, arm2_pose7] (+底盘 4 维)，失败对应臂填 0。
-
-        每臂 7 维：[x,y,z,rx,ry,rz,gripper_rad]，欧拉角为弧度，与 MoveL/EndPoseCtrl
-        约定一致，推理端可直接用于逆解控制。接入底盘后追加
-        [lift_m, vx, vy, omega]（升降绝对位置 + 底盘机体系实测速度），
-        与推理观测维度一致。
-        """
-        pose = np.concatenate([self._base_pose7(self.pose_callback),
+        """双臂末端 pose7 拼接为固定 14 维；失败的臂填零。"""
+        return np.concatenate([self._base_pose7(self.pose_callback),
                                self._base_pose7(self.pose2_callback)])
-        if self.extra_state_callback is not None:
-            try:
-                extra = np.asarray(self.extra_state_callback(), dtype=np.float32)
-            except Exception as e:
-                logger.warning(f"[LeRobotThread] 获取底盘状态失败: {e}")
-                extra = np.zeros(4, dtype=np.float32)
-            pose = np.concatenate([pose, extra])
-        return pose
 
     def _base_pose7(self, callback):
         if callback is None:
@@ -688,6 +676,7 @@ class VLAInferenceThread(QThread):
             ckpt = _Path(self.model_path).resolve()
             if (ckpt / "pretrained_model").is_dir():
                 ckpt = ckpt / "pretrained_model"
+            validate_model_contract(load_model_contract(str(ckpt)), "single")
             device = "cuda" if torch.cuda.is_available() else "cpu"
             try:
                 config = PreTrainedConfig.from_pretrained(str(ckpt))
@@ -1016,6 +1005,12 @@ class CloudInferenceThread(QThread):
                     f"  autossh -M 0 -N -L 50051:localhost:50051 "
                     f"-p <ssh端口> root@<云端地址>")
             return
+        if reply.error:
+            self.error.emit(f"云端握手失败: {reply.error}")
+            channel.close()
+            return
+        # 原 Ping 协议只报告能力，不能证明 checkpoint 的动作语义。
+        # 保持旧服务器兼容；每次回复均在 _do_infer 中严格校验完整 pose7 chunk。
         self._trained_max_delay = int(reply.trained_max_delay)
         self._trained_rtc_active = bool(self.rtc_trained and self._trained_max_delay > 0)
         self.server_info.emit({
@@ -1026,7 +1021,7 @@ class CloudInferenceThread(QThread):
         rtc_note = (f"，trained RTC 可用(max_delay={self._trained_max_delay})"
                     if self._trained_rtc_active else "")
         self.status.emit(
-            f"云端模型就绪 ({reply.policy_type} @ {reply.device}){rtc_note}，推理中...")
+            f"云端模型就绪 ({reply.policy_type} @ {reply.device}){rtc_note}，checkpoint 动作语义未预先校验")
         self.model_loaded.emit()
 
         next_hb = 0.0
@@ -1037,7 +1032,11 @@ class CloudInferenceThread(QThread):
             if now >= next_hb:
                 next_hb = now + 1.0
                 try:
-                    stub.Ping(pb2.PingRequest(token=self.token), timeout=2)
+                    heartbeat = stub.Ping(pb2.PingRequest(token=self.token), timeout=2)
+                    if heartbeat.error:
+                        self._running = False
+                        self.error.emit(f"云端心跳失败: {heartbeat.error}")
+                        break
                     hb_fail = 0
                     if self._link_down:
                         self._link_down = False
@@ -1129,6 +1128,10 @@ class CloudInferenceThread(QThread):
             return
         # 过期响应丢弃：request_id 必须是最新发出的
         if reply.request_id != self._request_id:
+            return
+        if int(reply.action_dim) != 7 or int(reply.num_steps) <= 0:
+            self.status.emit("云端动作空间不匹配：此执行器只接受 Cartesian pose7；joint14/18 禁止下发")
+            logger.error("[VLA-云] 拒绝 %s 维动作：运行时仅支持 Cartesian pose7", reply.action_dim)
             return
         try:
             chunk = np.asarray(reply.actions, dtype=np.float64).reshape(
@@ -1307,7 +1310,7 @@ class ValueJudgeLoadThread(QThread):
 
 
 class CameraWidget(QWidget):
-    """可嵌入的摄像头监控组件（双路摄像头）—— 优化版，支持 LeRobot v0.3 数据采集"""
+    """按工作模式绑定两路/三路相机，支持 LeRobot v3 数据采集。"""
 
     # 摄像头角色（录制/推理语义）：cam1=臂1腕部, cam2=头部, cam3=臂2腕部。
     # 角色与物理 USB 端口（sysfs 拓扑路径，重启不变）绑定，持久化到
@@ -1330,8 +1333,11 @@ class CameraWidget(QWidget):
     # 日志文本（供主窗口显示到日志文本框）
     camera_log = pyqtSignal(str)
 
-    def __init__(self, parent=None, save_dir=None, dataset_root=None):
+    def __init__(self, parent=None, save_dir=None, dataset_root=None, work_mode="dual"):
         super().__init__(parent)
+
+        self.work_mode = work_mode
+        self.CAMERA_ROLES = list(camera_roles(work_mode))
 
         # 分辨率选项 (名称, 宽度, 高度)：只保留 LeRobot 录制所需的采集分辨率
         # （720x720 中心裁切同样来自 1280x720 采集）
@@ -1360,9 +1366,11 @@ class CameraWidget(QWidget):
         self.latest_frames = {}
         self.caps = {}
         self.capture_threads = {}  # 后台采集线程
+        self._capture_tokens = {}  # 拒绝重开前旧线程排队的帧信号
         self.recorders = {}
         self.is_recording = False
         self.camera_indices = []
+        self._detected_indices = []
         # 角色 -> 摄像头索引（{"arm1": idx, "head": idx, "arm2": idx}），
         # 检测后按持久化的 USB 端口绑定分配，也可用画面下方下拉框手动调整
         self._role_to_idx = {}
@@ -1393,6 +1401,11 @@ class CameraWidget(QWidget):
         self._lerobot_get_torque = None    # callback() -> float (臂1夹爪力矩 Nm) 或 None
         self._lerobot_get_end_pose2 = None  # callback() -> (ArmEndPose-like, gripper_rad) 臂2
         self._lerobot_get_torque2 = None    # callback() -> float (臂2夹爪力矩 Nm) 或 None
+        self._joint_state_callback = None  # joint14 录制专用；VLA 仍使用 pose7
+        self._mobile_get_state = None
+        self._mobile_lift_cmd = None
+        self._mobile_chassis_vel = None
+        self._mobile_required = False
         self._lerobot_task_name = ""
         self._lerobot_repo_name = "ela3_demo"
         self._lerobot_fps = 20
@@ -1518,7 +1531,7 @@ class CameraWidget(QWidget):
         self._rollout_recording = False
         self._rollout_record_thread = None
         self._rollout_dataset = None
-        self._rollout_repo_name = "ela3_rollout"
+        self._rollout_repo_name = "ela3_rollout_single" if work_mode == "single" else "ela3_rollout"
         self._rollout_frame_count = 0
         self._rollout_staged_intervals = []   # 暂存接管区间（保存时统一写入标注）
         self._rollout_takeover_start = None   # 当前接管起始推帧计数（None=未在接管中）
@@ -1532,6 +1545,7 @@ class CameraWidget(QWidget):
         self._rollout_active_group_id = None   # 本次录制所属任务组（None=未分组）
 
         self._setup_ui()
+        self._update_mode_ui()
 
         # 任务组下拉框：启动即加载历史组名（首项留空=不分组；开录时再刷新）
         self.rollout_group_input.addItem("")
@@ -1548,19 +1562,82 @@ class CameraWidget(QWidget):
         self._display_timer.timeout.connect(self._refresh_display)
         self._display_timer.start(66)  # 15fps
 
+    def _update_mode_ui(self):
+        single = self.work_mode == "single"
+        set_layout_visible(self._camera_columns["arm2"], not single)
+        self.spin_lookahead.setToolTip(
+            "单臂 pose7 / 双臂 joint14(可选18)，20Hz，action[t]=state[t+5]。")
+        self.btn_lerobot.setToolTip("单臂：7维末端+单夹爪+双相机；双臂：14维关节+双夹爪+三相机")
+
+    def set_work_mode(self, mode):
+        if mode not in ("single", "dual"):
+            return False
+        if self._camera_binding_busy():
+            self._binding_warning("请先停止录制、保存和 VLA 推理再切换工作模式")
+            return False
+        if self.detect_thread is not None and self.detect_thread.isRunning():
+            self._binding_warning("请等待摄像头检测结束再切换工作模式")
+            return False
+        if not self._stop_capture_for_binding():
+            self._binding_warning("摄像头采集线程尚未退出，模式未切换")
+            return False
+        self.work_mode = mode
+        self.CAMERA_ROLES = list(camera_roles(mode))
+        self._update_mode_ui()
+        self._assign_camera_roles(self._detected_indices)
+        self._set_recording_indices()
+        for idx in self._role_to_idx.values():
+            self.open_camera(idx, *self.capture_res)
+        self._update_port_labels()
+        self._sync_camera_role_combos()
+        self._lerobot_dataset = self._rollout_dataset = None
+        self._rollout_repo_name = "ela3_rollout_single" if mode == "single" else "ela3_rollout"
+        self.rollout_group_input.clear()
+        self.rollout_group_input.addItem("")
+        self._refresh_rollout_group_labels()
+        return True
+
+    def _required_cameras_ready(self):
+        # Compare semantic roles, never compact a partial mapping into another role.
+        roles = self.CAMERA_ROLES
+        return (all(role in self._role_to_idx for role in roles)
+                and self.camera_indices == [self._role_to_idx[role] for role in roles]
+                and len(set(self.camera_indices)) == len(roles))
+
+    def _add_horizontal_controls(self, parent_layout, controls):
+        """长控制行允许横向滚动，避免横屏分栏时把输入框挤没。"""
+        strip = QWidget()
+        strip.setLayout(controls)
+        # 完整保留每个控件的 sizeHint，窄窗口只移动视口而不压缩按钮。
+        strip.setFixedWidth(max(1, controls.sizeHint().width()))
+        strip.setFixedHeight(max(36, controls.sizeHint().height() + 4))
+        scroll = QScrollArea(self)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(False)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFixedHeight(strip.height() + 20)
+        scroll.setWidget(strip)
+        parent_layout.addWidget(scroll)
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # 三个视频显示标签，横向排列（第3路仅显示，不参与录制/推理）
+        # 三个固定语义位置；显示顺序与 cam1/cam2/cam3 录制顺序不同。
         video_layout = QHBoxLayout()
         self.video_labels = []
         self.port_labels = []
+        self.camera_role_combos = {}
+        self._camera_columns = {}
         for i in range(3):
+            role = self.CAMERA_DISPLAY_ROLES[i]
             col = QVBoxLayout()
+            self._camera_columns[role] = col
             col.setSpacing(2)
-            label = QLabel(f"摄像头 {i + 1}\n未连接")
+            col.addWidget(QLabel(f"{self.CAMERA_ROLE_NAMES[role]}{'腕部' if role != 'head' else ''}"))
+            label = QLabel(f"{self.CAMERA_ROLE_NAMES[role]}\n未连接")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setStyleSheet("background-color: #222; color: #fff; font-size: 12px;")
             label.setMinimumSize(240, 180)
@@ -1572,8 +1649,23 @@ class CameraWidget(QWidget):
             port_label.setStyleSheet("color: #666; font-size: 10px;")
             self.port_labels.append(port_label)
             col.addWidget(port_label)
+            combo = QComboBox()
+            combo.addItem("未分配", None)
+            combo.setToolTip(f"为{self.CAMERA_ROLE_NAMES[role]}选择已检测的 USB 摄像头")
+            self.camera_role_combos[role] = combo
+            col.addWidget(combo)
             video_layout.addLayout(col)
         layout.addLayout(video_layout)
+
+        binding_row = QHBoxLayout()
+        self.btn_camera_refresh = QPushButton("刷新/检测摄像头")
+        self.btn_camera_refresh.clicked.connect(self.refresh_camera_devices)
+        binding_row.addWidget(self.btn_camera_refresh)
+        self.btn_camera_apply = QPushButton("应用绑定")
+        self.btn_camera_apply.clicked.connect(self.apply_selected_camera_roles)
+        binding_row.addWidget(self.btn_camera_apply)
+        binding_row.addStretch()
+        layout.addLayout(binding_row)
 
         # 状态标签
         self.status_label = QLabel("准备就绪")
@@ -1731,14 +1823,11 @@ class CameraWidget(QWidget):
         self.spin_lookahead.setSingleStep(1)
         self.spin_lookahead.setDecimals(0)
         self.spin_lookahead.setValue(self._action_lookahead)
+        self.spin_lookahead.setRange(5, 5)
         self.spin_lookahead.setFixedWidth(58)
         self.spin_lookahead.setStyleSheet("font-size: 11px; padding: 1px 2px;")
         self.spin_lookahead.setToolTip(
-            "action 标签前瞻帧数 N：录制时 action[t] = pose[t+N]。\n"
-            "- 1 = 下一帧位姿（最低要求，避免 action==state 退化）\n"
-            "- 5~10 = 每步目标增量 ×N，信噪比更高，模型输出更平滑\n"
-            "注意：与旧数据（N=1）混训前需用 fix_action_labels.py --lookahead N 统一；"
-            "录制期间锁定不可改")
+            "双臂 joint14/18 录制固定 20Hz，action[t]=state[t+5]。")
         self.spin_lookahead.valueChanged.connect(
             lambda v: setattr(self, "_action_lookahead", int(v)))
         control_layout.addWidget(self.spin_lookahead)
@@ -1774,7 +1863,7 @@ class CameraWidget(QWidget):
         control_layout.addWidget(QLabel("组:"))
         control_layout.addWidget(self.rollout_group_input)
         control_layout.addWidget(self.btn_rollout_record)
-        layout.addLayout(control_layout)
+        self._add_horizontal_controls(layout, control_layout)
 
         # VLA 推理控制栏
         vla_layout = QHBoxLayout()
@@ -1950,7 +2039,7 @@ class CameraWidget(QWidget):
         )
         self.btn_vla_once.clicked.connect(self._on_vla_once_clicked)
         vla_layout.addWidget(self.btn_vla_once)
-        layout.addLayout(vla_layout)
+        self._add_horizontal_controls(layout, vla_layout)
 
         # “推理一次”结果信息框
         self.vla_once_info = QTextEdit()
@@ -2080,7 +2169,7 @@ class CameraWidget(QWidget):
         self._load_cloud_settings()
 
         rtc_layout.addStretch()
-        layout.addLayout(rtc_layout)
+        self._add_horizontal_controls(layout, rtc_layout)
 
         # 保存路径提示标签
         self.lbl_save_dir = QLabel(f"保存目录: {self.save_dir}")
@@ -2098,34 +2187,36 @@ class CameraWidget(QWidget):
         角色（臂1腕部/头部/臂2腕部）按持久化的 USB 端口绑定自动分配，
         camera_indices 重排为 [臂1腕部, 头部, 臂2腕部]，保证录制/推理的
         cam1/cam2/cam3 与摄像头硬件的对应关系不随 video 索引漂移。"""
-        self._assign_camera_roles(indices)
-        ordered = [self._role_to_idx[r] for r in self.CAMERA_ROLES
-                   if self._role_to_idx.get(r) is not None]
-        self.camera_indices = ordered + [i for i in indices if i not in ordered]
-        cam_count = len(self.camera_indices)
+        self._detected_indices = list(dict.fromkeys(indices))
+        self._assign_camera_roles(self._detected_indices)
+        self._set_recording_indices()
+        cam_count = len(self._detected_indices)
         logger.info(f"[Camera] 检测到 {cam_count} 个摄像头: {indices}，"
                     f"角色映射: {self._role_map_text()}")
 
-        for idx in self.camera_indices[:3]:
+        for idx in self._role_to_idx.values():
             self.open_camera(idx, *self.capture_res)
 
         if cam_count == 0:
             self.status_label.setText("未检测到摄像头")
-            self.video_labels[0].setText("摄像头 1\n未连接")
-            self.video_labels[1].setText("摄像头 2\n未连接")
-            self.video_labels[2].setText("摄像头 3\n未连接")
+            for role, label in zip(self.CAMERA_DISPLAY_ROLES, self.video_labels):
+                label.setText(f"{self.CAMERA_ROLE_NAMES[role]}\n未连接")
         else:
-            shown = self.camera_indices[:3]
             self.status_label.setText(
                 f"已连接 {cam_count} 个摄像头：{self._role_map_text()}"
             )
-            for i in range(len(shown), 3):
-                self.video_labels[i].setText(f"摄像头 {i + 1}\n未连接")
-            # 画面显示关闭时：已连接的摄像头提示“画面已隐藏”（采集/录制正常进行）
-            if not self._show_video:
-                for i in range(len(shown)):
-                    self.video_labels[i].setText(f"摄像头 {i + 1}\n画面已隐藏")
+            for role, label in zip(self.CAMERA_DISPLAY_ROLES, self.video_labels):
+                label.setText(f"{self.CAMERA_ROLE_NAMES[role]}\n"
+                              f"{'画面已隐藏' if role in self._role_to_idx and not self._show_video else '未绑定/缺席'}")
         self._update_port_labels()
+        self._sync_camera_role_combos()
+        self.btn_camera_refresh.setEnabled(True)
+
+    def _set_recording_indices(self):
+        """只有三路语义齐全时才允许位置索引用于录制和推理。"""
+        self.camera_indices = ([self._role_to_idx[r] for r in self.CAMERA_ROLES]
+                               if all(r in self._role_to_idx for r in self.CAMERA_ROLES)
+                               else [])
 
     # ------------------------------------------------- 角色 ↔ USB 端口绑定
     def _role_map_text(self):
@@ -2140,7 +2231,11 @@ class CameraWidget(QWidget):
         try:
             sys_link = f"/sys/class/video4linux/video{idx}/device"
             if os.path.islink(sys_link):
-                return os.path.basename(os.readlink(sys_link))
+                real = os.path.realpath(sys_link)
+                if "/usb" in real:
+                    match = re.search(r"/(\d+-[\d.]+:\d+\.\d+)(?:/|$)", real)
+                    if match:
+                        return match.group(1)
         except Exception:
             pass
         return None
@@ -2153,7 +2248,7 @@ class CameraWidget(QWidget):
         检测未完成（camera_indices 为空）时返回空列表，由调用方兜底。
         """
         return [(idx, self._usb_id_of_index(idx))
-                for idx in self.camera_indices[:3]]
+                for idx in self._detected_indices]
 
     def _load_camera_settings(self):
         from debugger.utils.system_config import load_config, save_config
@@ -2185,44 +2280,25 @@ class CameraWidget(QWidget):
                 logger.warning(f"[Camera] 迁移旧摄像头配置失败 {path}: {e}")
         return {}
 
-    def _save_camera_settings(self):
-        from debugger.utils.system_config import load_config, save_config
-        cfg = load_config()
-        roles = dict(cfg.get("camera_roles") or {})
-        for role, idx in self._role_to_idx.items():
-            roles[role] = {"usb": self._usb_id_of_index(idx), "index": idx}
-        cfg["camera_roles"] = roles
-        try:
-            save_config(cfg)
-        except Exception as e:
-            logger.warning(f"[Camera] 保存摄像头角色设置失败: {e}")
-
     def _assign_camera_roles(self, indices):
-        """按持久化的 USB 端口绑定分配角色；未匹配的角色按索引顺序兜底并保存。"""
-        shown = list(indices[:3])
+        """只按已保存的 USB 身份匹配；缺席角色绝不由别的设备补位。"""
+        shown = list(indices)
         usb_map = {idx: self._usb_id_of_index(idx) for idx in shown}
         saved = self._load_camera_settings().get("roles", {})
         role_to_idx = {}
         used = set()
+        used_usb = set()
         # 1) USB 端口匹配（重启后 video 索引变化也能对上）
         for role in self.CAMERA_ROLES:
             usb = (saved.get(role) or {}).get("usb")
-            if usb:
+            if usb and usb not in used_usb:
                 for idx in shown:
                     if idx not in used and usb_map.get(idx) == usb:
                         role_to_idx[role] = idx
                         used.add(idx)
+                        used_usb.add(usb)
                         break
-        # 2) 仅对从未绑定过的角色按剩余索引顺序兜底（首次使用时）；
-        #    已绑定但本次缺席的角色保留原绑定，不抢占其他摄像头，
-        #    避免某次检测不全把持久化映射打乱
-        remaining = [idx for idx in shown if idx not in used]
-        for role in self.CAMERA_ROLES:
-            if (role not in role_to_idx and remaining
-                    and not (saved.get(role) or {}).get("usb")):
-                role_to_idx[role] = remaining.pop(0)
         self._role_to_idx = role_to_idx
-        self._save_camera_settings()
 
     def apply_camera_roles(self):
         """设置对话框保存摄像头角色后重新按 USB 端口绑定分配，并刷新显示。
@@ -2230,41 +2306,190 @@ class CameraWidget(QWidget):
         主窗口在设置对话框保存后调用，使新的角色↔USB 端口映射立即生效，
         无需重启（重启后由 _assign_camera_roles 自动加载，二者同源）。
         """
-        if not self.camera_indices:
-            return
-        self._assign_camera_roles(self.camera_indices)
-        ordered = [self._role_to_idx[r] for r in self.CAMERA_ROLES
-                   if self._role_to_idx.get(r) is not None]
-        self.camera_indices = ordered + [i for i in self.camera_indices
-                                         if i not in ordered]
+        if self._camera_binding_busy():
+            self._binding_warning("录制、采集写盘或推理运行中，不能切换摄像头绑定")
+            return False
+        old_map = dict(self._role_to_idx)
+        self._assign_camera_roles(self._detected_indices)
+        if old_map != self._role_to_idx:
+            if not self._stop_capture_for_binding():
+                self._role_to_idx = old_map
+                self._binding_warning("旧采集线程未退出，绑定已保存但须重启后生效")
+                return False
+            for idx in self._role_to_idx.values():
+                self.open_camera(idx, *self.capture_res)
+        self._set_recording_indices()
+        self.latest_frames.clear()
+        self._pending_frames.clear()
         self._update_port_labels()
+        self._sync_camera_role_combos()
         self.status_label.setText(
-            f"已连接 {len(self.camera_indices)} 个摄像头：{self._role_map_text()}")
+            f"已连接 {len(self._detected_indices)} 个摄像头：{self._role_map_text()}")
+        return True
 
     def _update_port_labels(self):
         """在各路画面下方显示 角色名 + /dev/videoN + USB 端口号"""
-        ordered = self._display_order_indices()
-        idx_to_role = {v: k for k, v in self._role_to_idx.items()}
-        for i in range(3):
-            if i < len(ordered):
-                idx = ordered[i]
-                role = idx_to_role.get(idx)
-                prefix = f"{self.CAMERA_ROLE_NAMES[role]} " if role else ""
-                self.port_labels[i].setText(prefix + self._usb_port_text(idx))
+        saved = self._load_camera_settings()["roles"]
+        for i, role in enumerate(self.CAMERA_DISPLAY_ROLES):
+            idx = self._role_to_idx.get(role)
+            info = saved.get(role) or {}
+            if idx is not None:
+                self.port_labels[i].setText(self._usb_port_text(idx))
+            elif info.get("usb"):
+                self.port_labels[i].setText(f"USB {info['usb']} 缺席")
             else:
-                self.port_labels[i].setText("USB: —")
+                self.port_labels[i].setText("未绑定 USB 端口")
 
     def _usb_port_text(self, idx):
         dev = f"/dev/video{idx}"
         usb_id = self._usb_id_of_index(idx)
-        return f"{dev} (usb {usb_id})" if usb_id else dev
+        return f"{dev} (usb {usb_id})" if usb_id else f"{dev} (USB 身份不可用，无法持久绑定)"
+
+    def _camera_binding_busy(self):
+        return any((self.is_recording, self._lerobot_recording,
+                    self._lerobot_record_thread is not None,
+                    self._rollout_recording, self._rollout_record_thread is not None,
+                    self._vla_running, self._vla_thread is not None,
+                    self._single_active))
+
+    def _binding_warning(self, message):
+        logger.warning(f"[Camera] {message}")
+        self.camera_log.emit(message)
+        self.status_label.setText(message)
+        QMessageBox.warning(self, "摄像头绑定", message)
+
+    def _sync_camera_role_combos(self):
+        saved = self._load_camera_settings()["roles"]
+        for role in self.CAMERA_DISPLAY_ROLES:
+            combo = self.camera_role_combos[role]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("未分配", None)
+            for idx in self._detected_indices:
+                combo.addItem(self._usb_port_text(idx), idx)
+            target = self._role_to_idx.get(role)
+            if target is None and (saved.get(role) or {}).get("usb"):
+                combo.addItem(f"已保存 USB {saved[role]['usb']}（缺席，保持绑定）", "keep")
+                target = "keep"
+            combo.setCurrentIndex(max(0, combo.findData(target)))
+            combo.blockSignals(False)
+
+    def _stop_capture_for_binding(self):
+        # 先等待所有线程退出，确认没有 read() 再释放 VideoCapture。
+        stopped = []
+        for idx, thread in list(self.capture_threads.items()):
+            if not thread.stop():
+                logger.error(f"[Camera] video{idx} 采集线程未退出，取消重开")
+                for previous in stopped:
+                    self.open_camera(previous, *self.capture_res)
+                return False
+            stopped.append(idx)
+        for thread in self.capture_threads.values():
+            thread.deleteLater()
+        self.capture_threads.clear()
+        for cap in self.caps.values():
+            if cap is not None:
+                cap.release()
+        self.caps.clear()
+        self._capture_tokens.clear()
+        self.latest_frames.clear()
+        self._pending_frames.clear()
+        return True
+
+    def prepare_camera_binding_change(self):
+        """设置对话框保存前确认并停流，避免保存成功但旧采集线程未退出。"""
+        return not self._camera_binding_busy() and self._stop_capture_for_binding()
+
+    def restore_camera_binding_capture(self):
+        """保存失败时按仍在内存中的旧角色恢复预览。"""
+        for idx in self._role_to_idx.values():
+            if idx not in self.caps:
+                self.open_camera(idx, *self.capture_res)
+
+    def refresh_camera_devices(self):
+        if self._camera_binding_busy():
+            self._binding_warning("录像、LeRobot、rollout 或 VLA 运行中，不能刷新摄像头")
+            return False
+        if self.detect_thread is not None and self.detect_thread.isRunning():
+            self._binding_warning("摄像头检测尚未结束")
+            return False
+        if not self._stop_capture_for_binding():
+            self._binding_warning("旧采集线程未退出，已取消刷新")
+            return False
+        self.btn_camera_refresh.setEnabled(False)
+        self.status_label.setText("正在检测摄像头...")
+        self.detect_thread = CameraDetectThread()
+        self.detect_thread.indices_found.connect(self.on_indices_found)
+        self.detect_thread.start()
+        return True
+
+    def apply_selected_camera_roles(self):
+        if self._camera_binding_busy():
+            self._binding_warning("录像、LeRobot、rollout 或 VLA 运行中，不能切换绑定")
+            return False
+        selected = {role: self.camera_role_combos[role].currentData()
+                    for role in self.CAMERA_ROLES}
+        indices = [idx for idx in selected.values() if isinstance(idx, int)]
+        if len(indices) != len(set(indices)):
+            self._binding_warning("同一设备不能分配给多个角色")
+            return False
+        if (any(idx not in self._detected_indices for idx in indices)
+                or any(idx not in (None, "keep") and not isinstance(idx, int)
+                       for idx in selected.values())):
+            self._binding_warning("设备已不在检测列表中，请刷新后重选")
+            return False
+        if any(not self._usb_id_of_index(idx) for idx in indices):
+            self._binding_warning("所选设备缺少 USB 端口身份，无法保证重启后绑定稳定；请检查 sysfs")
+            return False
+        from debugger.utils.system_config import load_config, save_config
+        cfg = load_config()
+        old = dict(cfg.get("camera_roles") or {})
+        roles = {role: info for role, info in old.items()
+                 if role not in self.CAMERA_ROLES}
+        for role, idx in selected.items():
+            if idx == "keep" and (old.get(role) or {}).get("usb"):
+                roles[role] = old[role]
+            elif isinstance(idx, int):
+                roles[role] = {"usb": self._usb_id_of_index(idx), "index": idx}
+        # An explicit single-arm selection can transfer a reserved arm2 USB role.
+        # Otherwise retain the inactive binding for the next dual-arm session.
+        transferred = False
+        if getattr(self, "work_mode", "dual") == "single":
+            active_usb = {info.get("usb") for role, info in roles.items()
+                          if role in self.CAMERA_ROLES and isinstance(info, dict)}
+            if (roles.get("arm2") or {}).get("usb") in active_usb:
+                roles.pop("arm2", None)
+                transferred = True
+        if len({info["usb"] for info in roles.values() if isinstance(info, dict)
+                and info.get("usb")}) != sum(bool(info.get("usb")) for info in roles.values()
+                                                   if isinstance(info, dict)):
+            self._binding_warning("同一 USB 端口已绑定多个角色")
+            return False
+        if roles != old and not self._stop_capture_for_binding():
+            self._binding_warning("旧采集线程未退出，绑定未保存")
+            return False
+        cfg["camera_roles"] = roles
+        if not save_config(cfg):
+            self.restore_camera_binding_capture()
+            self._binding_warning("配置保存失败，绑定未生效")
+            return False
+        if not self.apply_camera_roles():
+            return False
+        self.status_label.setText(f"绑定已保存：{self._role_map_text()}")
+        if transferred:
+            self.camera_log.emit("所选 USB 已从臂2转为当前单臂角色；切回双臂后请重新绑定臂2相机。")
+        return True
 
     def open_camera(self, idx, width, height):
         """在主线程中打开指定摄像头并启动后台采集线程"""
         # 关闭已有的
         if idx in self.capture_threads:
-            self.capture_threads[idx].stop()
+            if not self.capture_threads[idx].stop():
+                logger.error(f"[Camera] video{idx} 旧采集线程未退出，拒绝重复打开")
+                return
+            self.capture_threads[idx].deleteLater()
             del self.capture_threads[idx]
+            self._capture_tokens.pop(idx, None)
         if idx in self.caps and self.caps[idx] is not None:
             self.caps[idx].release()
             del self.caps[idx]
@@ -2272,6 +2497,8 @@ class CameraWidget(QWidget):
         cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
         if not cap.isOpened():
             logger.error(f"[Camera] 无法打开摄像头 [{idx}]")
+            self.camera_log.emit(f"无法打开 /dev/video{idx}")
+            cap.release()
             return
 
         # 使用MJPEG格式降低CPU占用
@@ -2306,9 +2533,16 @@ class CameraWidget(QWidget):
 
         # 启动后台采集线程
         thread = CameraCaptureThread(idx, cap)
-        thread.frame_ready.connect(self._on_frame_received)
+        token = object()
+        self._capture_tokens[idx] = token
+        thread.frame_ready.connect(
+            lambda camera_idx, frame, t=token: self._on_frame_if_current(t, camera_idx, frame))
         thread.start()
         self.capture_threads[idx] = thread
+
+    def _on_frame_if_current(self, token, camera_idx, frame):
+        if self._capture_tokens.get(camera_idx) is token:
+            self._on_frame_received(camera_idx, frame)
 
     def _apply_focus(self, cap):
         """对单个 VideoCapture 应用当前对焦设置。
@@ -2462,16 +2696,8 @@ class CameraWidget(QWidget):
                 writer.write(frame)
 
     def _display_order_indices(self):
-        """按界面布局（左=臂2腕部，中=头部，右=臂1腕部）返回显示顺序的摄像头索引；
-        未分配角色的索引保持原相对顺序附后"""
-        shown = list(self.camera_indices[:3])
-        ordered = []
-        for role in self.CAMERA_DISPLAY_ROLES:
-            idx = self._role_to_idx.get(role)
-            if idx is not None and idx in shown:
-                ordered.append(idx)
-        ordered += [i for i in shown if i not in ordered]
-        return ordered
+        """按固定界面位置返回索引；缺席角色返回 None，绝不压缩位置。"""
+        return [self._role_to_idx.get(role) for role in self.CAMERA_DISPLAY_ROLES]
 
     def _refresh_display(self):
         """统一显示刷新：15fps，将缓存的帧转换为QPixmap显示。
@@ -2485,7 +2711,7 @@ class CameraWidget(QWidget):
             self._pending_frames.clear()
             return
         for i, idx in enumerate(self._display_order_indices()):
-            if idx not in self._pending_frames:
+            if idx is None or idx not in self._pending_frames:
                 continue
 
             frame = self._pending_frames[idx]
@@ -2579,17 +2805,20 @@ class CameraWidget(QWidget):
                 f"视频已保存到:\n{self.save_dir}"
             ))
         else:
+            if len(self.camera_indices) != 3:
+                QMessageBox.warning(self, "录像", "请先绑定并连接臂1、头部、臂2三路摄像头")
+                return
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            for idx in self.camera_indices[:3]:
+            for cam_no, idx in enumerate(self.camera_indices[:3], 1):
                 if idx not in self.caps:
                     continue
                 cap = self.caps[idx]
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = 20.0
-                filename = os.path.join(self.save_dir, f"Video_cam{idx}_{timestamp}.mp4")
+                filename = os.path.join(self.save_dir, f"Video_cam{cam_no}_{timestamp}.mp4")
                 writer = cv2.VideoWriter(filename, fourcc, fps, (w, h))
                 self.recorders[idx] = writer
                 logger.info(f"[Camera] 开始录像: {filename} @ {w}x{h}")
@@ -2621,6 +2850,51 @@ class CameraWidget(QWidget):
         """设置臂2 末端位姿回调，签名同 set_end_pose_callback（用于双臂录制）"""
         self._lerobot_get_end_pose2 = callback
 
+    def set_joint_state_callback(self, callback):
+        self._joint_state_callback = callback
+
+    def set_mobile_base_callbacks(self, get_state=None, lift_position=None,
+                                  chassis_velocity=None, *, required=False):
+        """配置底盘状态和执行回调；动作空间校验仍阻止 joint14/18 走 Cartesian 执行器。"""
+        self._mobile_get_state = get_state
+        self._mobile_lift_cmd = lift_position
+        self._mobile_chassis_vel = chassis_velocity
+        self._mobile_required = bool(required)
+
+    def _get_record_state(self):
+        if getattr(self, "work_mode", "dual") == "single":
+            return self._get_valid_single_pose()
+        if self._joint_state_callback is None:
+            return None
+        state = self._joint_state_callback()
+        if state is None:
+            return None
+        state = np.asarray(state, dtype=np.float32)
+        if state.shape != (14,) or not np.isfinite(state).all():
+            raise ValueError("双臂 joint14 反馈必须为有限的 14 维")
+        if getattr(self, "_mobile_required", False) and self._mobile_get_state is None:
+            raise ValueError("底盘 / 升降初始化失败，不能录制配置要求的 18D 数据")
+        if self._mobile_get_state is not None:
+            mobile = np.asarray(self._mobile_get_state(), dtype=np.float32)
+            if mobile.shape != (4,) or not np.isfinite(mobile).all():
+                raise ValueError("底盘反馈必须为 [lift_m,vx,vy,omega]")
+            state = np.concatenate((state, mobile))
+        return state
+
+    def _get_record_torque(self):
+        values = []
+        callbacks = ((self._lerobot_get_torque,) if getattr(self, "work_mode", "dual") == "single"
+                     else (self._lerobot_get_torque, self._lerobot_get_torque2))
+        for cb in callbacks:
+            value = cb() if cb is not None else None
+            if getattr(self, "work_mode", "dual") == "single" and value is None:
+                raise ValueError("单臂夹爪力矩反馈尚未就绪")
+            values.append(0.0 if value is None else float(value))
+        torque = np.asarray(values, dtype=np.float32)
+        if not np.isfinite(torque).all():
+            raise ValueError("夹爪力矩反馈包含 NaN/Inf")
+        return torque
+
     def set_torque2_callback(self, callback):
         """设置臂2 夹爪力矩回调，签名同 set_torque_callback（用于双臂录制）"""
         self._lerobot_get_torque2 = callback
@@ -2649,77 +2923,32 @@ class CameraWidget(QWidget):
         """设置 VLA 请求接管控制权时的回调 fn()，外部应断连其他控制源。"""
         self._on_vla_takeover_requested = callback
 
-    def set_mobile_base_callbacks(self, get_state=None, lift_position=None,
-                                  chassis_velocity=None):
-        """设置移动底盘回调（底盘+升降，可选；不设置则保持 7 维纯机械臂模式）。
-
-        - get_state() -> (lift_m, vx, vy, omega)：并入
-          observation.state / action，维度从 7 扩展为 11：
-          [x,y,z,rx,ry,rz,gripper, lift_m, vx, vy, omega]
-          （底盘为机体系实测速度 m/s, m/s, rad/s——里程计位姿无 IMU
-          漂移大且原点任意，不能作训练标签；升降为绝对位置米）
-        - lift_position(mm)：云端推理动作升降维（lift_m → mm）位置伺服目标
-        - chassis_velocity(vx, vy, omega)：云端推理动作底盘 3 维
-          (m/s, m/s, rad/s) 底盘速度指令
-        """
-        self._mobile_get_state = get_state
-        self._mobile_lift_cmd = lift_position
-        self._mobile_chassis_vel = chassis_velocity
-
-    def _get_mobile_state(self):
-        """返回 [lift_m, vx, vy, omega]（升降绝对位置米 + 底盘机体系
-        实测速度 m/s, m/s, rad/s）；未接底盘时返回 None。"""
-        cb = getattr(self, "_mobile_get_state", None)
-        if cb is None:
-            return None
-        try:
-            lift_m, vx, vy, omega = cb()
-            return np.array([lift_m, vx, vy, omega], dtype=np.float32)
-        except Exception as e:
-            logger.warning(f"[VLA] 获取底盘状态失败: {e}")
-            return np.zeros(4, dtype=np.float32)
-
     def _pose_dim(self):
-        """录制用 state/action 维度：双臂 14（arm1_pose7 + arm2_pose7），
-        接入底盘后 +4（lift/vx/vy/omega）= 18"""
-        return 14 + (4 if getattr(self, "_mobile_get_state", None) is not None else 0)
+        """录制维度；运行时 VLA 始终单独使用 Cartesian pose7。"""
+        if getattr(self, "work_mode", "dual") == "single":
+            return 7
+        return 18 if getattr(self, "_mobile_required", False) else 14
 
     def _zero_pose(self):
         return np.zeros(self._pose_dim(), dtype=np.float32)
 
-    def _dispatch_mobile_action(self, rows):
-        """把 action 末尾 4 维分发给升降/底盘：[-4]=lift_m（绝对位置伺服），
-        [-3:]=vx,vy,omega（机体系速度指令，与录制标签同源——实测速度经
-        lookahead 写入，部署按速度下发，语义闭环）。
-
-        底盘维位置随臂数变化：单臂 11 维在 [7:11]，双臂 18 维在 [14:18]，
-        故从末尾倒推，不能硬编码 [7]/[8:11]。
-        """
+    def _valid_action_chunk(self, chunk, expected_dim=7):
+        """在任何执行命令前拒绝历史底盘维度及不完整动作。"""
         try:
-            dim = int(rows[0].shape[0]) if hasattr(rows[0], "shape") else len(rows[0])
-        except Exception:
-            return
-        # 仅当接入了底盘回调且维度确实是含底盘的合法布局时分发
-        # （11=单臂+底盘，18=双臂+底盘；14=双臂无底盘等维度不分发，
-        # 防止旧模型输出被错当底盘指令）
-        if getattr(self, "_mobile_get_state", None) is None or dim not in (11, 18):
-            return
-        base = dim - 4
-        last = rows[-1]
-        lift_cb = getattr(self, "_mobile_lift_cmd", None)
-        if lift_cb is not None:
-            try:
-                lift_cb(float(last[base]) * 1000.0)  # m → mm
-            except Exception as e:
-                logger.warning(f"[VLA] 升降目标下发失败: {e}")
-        vel_cb = getattr(self, "_mobile_chassis_vel", None)
-        if vel_cb is not None:
-            try:
-                vel_cb(float(last[base + 1]), float(last[base + 2]),
-                       float(last[base + 3]))
-            except Exception as e:
-                logger.warning(f"[VLA] 底盘速度下发失败: {e}")
-
+            arr = np.asarray(chunk, dtype=np.float64)
+            valid = arr.ndim == 2 and arr.shape[0] > 0 and arr.shape[1] == expected_dim
+            valid = (valid and bool(np.isfinite(arr).all())
+                     and getattr(self, "work_mode", "single") == "single")
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            logger.error("[VLA] 拒绝动作维度/数值不匹配：当前执行路径只支持 Cartesian pose%d；"
+                         "joint14/18 模型需要对应双臂执行器，不能裁剪或作为末端指令下发",
+                         expected_dim)
+            if hasattr(self, "status_label"):
+                self.status_label.setText(
+                    "[VLA] 动作空间不匹配：仅接受 Cartesian pose7；joint14/18 禁止执行")
+        return valid
 
     # ==================== VLA 推理 ====================
 
@@ -2807,18 +3036,18 @@ class CameraWidget(QWidget):
 
     def _vla_get_obs(self):
         """供推理线程调用：返回 (rgb0, rgb1, state7) 或 None。与录制数据格式一致。"""
-        if len(self.camera_indices) < 2:
+        if getattr(self, "work_mode", "dual") != "single" or not self._required_cameras_ready():
             return None
-        f0 = self.latest_frames.get(self.camera_indices[0])
-        f1 = self.latest_frames.get(self.camera_indices[1])
+        f0 = self.latest_frames.get(self._role_to_idx["arm1"])
+        f1 = self.latest_frames.get(self._role_to_idx["head"])
         if f0 is None or f1 is None:
             return None
         rgb0 = self._resize_frame(f0, *self._lerobot_image_size,
                                   crop_side=self._lerobot_crop_side)
         rgb1 = self._resize_frame(f1, *self._lerobot_image_size,
                                   crop_side=self._lerobot_crop_side)
-        state = self._get_pose_7d()
-        return rgb0, rgb1, state
+        state = self._get_valid_single_pose()
+        return None if state is None else (rgb0, rgb1, state)
 
     def _sync_image_size_from_model(self, model_path):
         """从模型 checkpoint 的 config.json 读取图像输入分辨率，同步到
@@ -2862,6 +3091,16 @@ class CameraWidget(QWidget):
             self._start_vla_inference()
 
     def _start_vla_inference(self):
+        if not getattr(self, "_motion_start_guard", lambda: True)():
+            self.camera_log.emit("Joy-Con 正在遥操左臂，拒绝 VLA 并发控制")
+            return
+
+        if self.work_mode != "single":
+            QMessageBox.warning(self, "VLA 模型不兼容", "现有执行器只支持单臂 pose7，请停用、断开并切换单臂模式。双臂 joint14/18 不可下发。")
+            return
+        if not self._required_cameras_ready():
+            QMessageBox.warning(self, "VLA 相机", "请绑定臂1腕部和头部两路相机，不能用臂2替代。")
+            return
         if self._motion_cb is None:
             QMessageBox.warning(self, "提示", "运动控制未连接（motion callback 未设置）")
             return
@@ -2871,6 +3110,11 @@ class CameraWidget(QWidget):
         if not use_cloud:
             if not model_path:
                 QMessageBox.warning(self, "提示", "请填写模型路径")
+                return
+            try:
+                validate_model_contract(load_model_contract(model_path), self.work_mode)
+            except (ValueError, OSError, TypeError, KeyError) as exc:
+                QMessageBox.warning(self, "VLA 模型不兼容", str(exc))
                 return
             # 推理分辨率必须与训练数据一致：从模型 config.json 自动同步（先于采集分辨率检查）
             self._sync_image_size_from_model(model_path)
@@ -3163,6 +3407,9 @@ class CameraWidget(QWidget):
         这样手柄可以接入控制。继续后：VLA 重新接管机械臂运动控制。
         """
         # 如果当前准备恢复 VLA 控制，先请求外部控制源释放（如手柄）
+        if self._vla_control_paused and not getattr(self, "_motion_start_guard", lambda: True)():
+            self.camera_log.emit("Joy-Con 正在遥操左臂，拒绝 VLA 恢复控制")
+            return
         if self._vla_control_paused and self._on_vla_takeover_requested is not None:
             try:
                 self._on_vla_takeover_requested()
@@ -3580,6 +3827,8 @@ class CameraWidget(QWidget):
             return
         if not rows:
             return
+        if not self._valid_action_chunk(rows):
+            return
 
         # 每段执行窗口最长 0.5s（fps//2 步）：截断过长的 chunk（如 SmolVLA 50 步）
         max_steps = max(1, int(self._lerobot_fps) // 2)
@@ -3598,8 +3847,6 @@ class CameraWidget(QWidget):
         self._seq_grip_values = deque(float(r[6]) for r in rows)
         if self._seq_grip_timer is not None:
             self._seq_grip_timer.start(int(1000 / fps))
-        # 底盘/升降动作分量（action 第 8~11 维，未接底盘时为空操作）
-        self._dispatch_mobile_action(rows)
         # 执行窗口结束 → 请求下一段推理
         chunk_ms = int(1000.0 * len(rows) / fps)
         if self._seq_timer is not None:
@@ -3807,6 +4054,9 @@ class CameraWidget(QWidget):
 
     def _on_vla_once_clicked(self):
         """点击“推理一次”：确保处于暂停控制状态，请求一次完整 chunk 推理。"""
+        if not getattr(self, "_motion_start_guard", lambda: True)():
+            self.camera_log.emit("Joy-Con 正在遥操左臂，拒绝 VLA 单次动作")
+            return
         if not self._vla_running or self._vla_thread is None:
             QMessageBox.warning(self, "提示", "请先启动模型推理")
             return
@@ -3824,6 +4074,11 @@ class CameraWidget(QWidget):
 
     def _on_single_chunk(self, chunk, info):
         """收到单次推理 chunk：显示到信息框、保存诊断数据、装入队列开始执行。"""
+        if not getattr(self, "_motion_start_guard", lambda: True)():
+            self.camera_log.emit("Joy-Con 正在遥操左臂，拒绝 VLA 单次动作下发")
+            return
+        if not self._valid_action_chunk(chunk):
+            return
         chunk = np.asarray(chunk, dtype=np.float64)
         lines = [f"chunk {chunk.shape[0]} 帧 @ {self._lerobot_fps}fps "
                  f"(列: x y z rx ry rz gripper_rad)"]
@@ -3874,8 +4129,6 @@ class CameraWidget(QWidget):
         except Exception as e:
             logger.warning(f"[VLA] 推理一次主运动下发失败: {e}")
 
-        # 底盘/升降动作分量（action 第 8~11 维，未接底盘时为空操作）
-        self._dispatch_mobile_action([np.asarray(r) for r in chunk])
 
         # EMA 基准从当前位姿起步，避免与上一段执行的残留状态叠加
         self._rtc_last_sent = None
@@ -3959,6 +4212,8 @@ class CameraWidget(QWidget):
         except Exception:
             return
         if not rows:
+            return
+        if not self._valid_action_chunk(rows):
             return
 
         # 每段执行窗口固定 0.5s（fps//2 步）。段时长不做自适应缩短——短窗口
@@ -4079,8 +4334,6 @@ class CameraWidget(QWidget):
             if self._rtc_grip_timer is not None:
                 self._rtc_grip_timer.start(int(1000 / fps))
 
-        # 底盘/升降动作分量（action 第 8~11 维，未接底盘时为空操作）
-        self._dispatch_mobile_action(rows)
 
         # 提前调度下一段推理：在本段窗口结束前 (实测延迟+40ms 裕量) 触发，
         # 新段到达时本段已走完 ≥90%（少吞段尾），且留 40ms 抖动余量防停顿；
@@ -4155,14 +4408,16 @@ class CameraWidget(QWidget):
 
         dataset_dir = os.path.join(self.dataset_root, self._lerobot_repo_name)
 
-        # 当前目标配置
-        target_h, target_w = self._lerobot_image_size
-        target_cam_dtype = "video"  # 使用视频编码
-        target_video_codec = "h264"  # canonical 名称，对应 h264_nvenc / libx264
-        state_dim = self._pose_dim()
-        target_state_shape = (state_dim,)
-        target_action_shape = (state_dim,)
-        target_torque_shape = (2,)  # 双臂夹爪力矩 [臂1, 臂2]
+        if float(self._lerobot_fps) != 20.0:
+            logger.error("[LeRobot] 双臂录制固定为 20Hz")
+            return "incompatible"
+        if self._pose_dim() == 7:
+            features = make_single_arm_features(self._lerobot_image_size)
+            robot_type = "ela3"
+        else:
+            features = make_dual_arm_features(
+                self._lerobot_image_size, include_mobile=self._pose_dim() == 18)
+            robot_type = "ela3_dual_arm_mobile" if self._pose_dim() == 18 else "ela3_dual_arm"
 
         # 编码器（流式编码用）：硬件优先 NVENC，否则软件 libx264。
         # 流式编码把 add_frame 的帧直接喂给 PyAV 编码器（后台线程），
@@ -4186,40 +4441,17 @@ class CameraWidget(QWidget):
                     info = json.load(f)
 
                 existing_features = info.get("features", {})
-                state_shape = existing_features.get("observation.state", {}).get("shape", [7])
-                action_shape = existing_features.get("action", {}).get("shape", [7])
-                torque_shape = existing_features.get(
-                    "observation.gripper_torque", {}).get("shape", [1])
-
-                cam_feats = {}
-                for ci in (1, 2, 3):
-                    cf = existing_features.get(f"observation.images.cam{ci}", {})
-                    cam_feats[ci] = (
-                        cf.get("shape", [0, 0, 0]),
-                        cf.get("dtype", "image"),
-                        cf.get("info", {}).get("video.codec", ""),
-                    )
-
-                # 夹爪力矩特征必须存在且为双臂 2 维，否则 add_frame 会失败
-                has_torque = "observation.gripper_torque" in existing_features
-
                 compatible = (
-                    tuple(state_shape) == target_state_shape and
-                    tuple(action_shape) == target_action_shape and
-                    tuple(torque_shape) == target_torque_shape and
-                    has_torque and
-                    all(cam_feats[ci][1] == target_cam_dtype and
-                        cam_feats[ci][2] == target_video_codec and
-                        tuple(cam_feats[ci][0]) == (target_h, target_w, 3)
-                        for ci in (1, 2, 3))
+                    int(info.get("fps", -1)) == 20
+                    and info.get("robot_type") == robot_type
+                    and features_are_compatible(existing_features, features)
                 )
 
                 if not compatible:
-                    logger.warning(
-                        f"[LeRobot] 数据集 '{self._lerobot_repo_name}' 格式不兼容 "
-                        f"(state={state_shape}, action={action_shape}, "
-                        f"torque={torque_shape}, cam_feats={cam_feats})"
-                    )
+                    logger.error(
+                        "[LeRobot] 拒绝向现有数据集 %s 追加：fps、维度或 feature names "
+                        "与当前 %dD schema 不一致；原数据保持不变。",
+                        dataset_dir, self._pose_dim())
                     return "incompatible"
                 else:
                     # 兼容，加载已有数据集
@@ -4258,42 +4490,6 @@ class CameraWidget(QWidget):
                     f"[LeRobot] 加载已有数据集 '{self._lerobot_repo_name}' 失败: {e}")
                 return "incompatible"
 
-        # LeRobot v3.0 features 格式 - 摄像头使用 video dtype 才能配合 use_videos=True
-        # 双臂：state/action = arm1_pose7 + arm2_pose7（+底盘 4 维 = 18）；
-        # 三路摄像头：cam1=臂1腕部，cam2=头部，cam3=臂2腕部
-        features = {
-            "observation.images.cam1": {
-                "dtype": "video",
-                "shape": (*self._lerobot_image_size, 3),
-                "names": ["height", "width", "channels"],
-            },
-            "observation.images.cam2": {
-                "dtype": "video",
-                "shape": (*self._lerobot_image_size, 3),
-                "names": ["height", "width", "channels"],
-            },
-            "observation.images.cam3": {
-                "dtype": "video",
-                "shape": (*self._lerobot_image_size, 3),
-                "names": ["height", "width", "channels"],
-            },
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (state_dim,),
-                "names": ["state"],
-            },
-            "observation.gripper_torque": {
-                "dtype": "float32",
-                "shape": (2,),
-                "names": ["torque_arm1", "torque_arm2"],
-            },
-            "action": {
-                "dtype": "float32",
-                "shape": (state_dim,),
-                "names": ["action"],
-            },
-        }
-
         try:
             # 设置离线模式避免联网
             import os as os_module
@@ -4308,7 +4504,7 @@ class CameraWidget(QWidget):
                     fps=self._lerobot_fps,
                     features=features,
                     root=dataset_dir,
-                    robot_type="ela3",
+                    robot_type=robot_type,
                     use_videos=True,
                     vcodec=vcodec,
                     encoder_threads=encoder_threads,
@@ -4326,7 +4522,7 @@ class CameraWidget(QWidget):
                     fps=self._lerobot_fps,
                     features=features,
                     root=dataset_dir,
-                    robot_type="ela3",
+                    robot_type=robot_type,
                     use_videos=True,  # 视频编码，大幅降低 I/O 和 save_episode 耗时
                     image_writer_processes=0,
                     image_writer_threads=4,
@@ -4365,27 +4561,17 @@ class CameraWidget(QWidget):
         else:
             return
 
-        if len(self.camera_indices) < 3:
+        if not self._required_cameras_ready():
             return
-
-        # cam1=臂1腕部(idx0), cam2=头部(idx1), cam3=臂2腕部(idx2)
-        idx0, idx1, idx2 = (self.camera_indices[0], self.camera_indices[1],
-                            self.camera_indices[2])
-        frame0 = self.latest_frames.get(idx0)
-        frame1 = self.latest_frames.get(idx1)
-        frame2 = self.latest_frames.get(idx2)
-        if frame0 is None or frame1 is None or frame2 is None:
+        frames = [self.latest_frames.get(self._role_to_idx[role]) for role in self.CAMERA_ROLES]
+        if any(frame is None for frame in frames):
             return
 
         try:
             t0 = time.perf_counter()
-            rgb0 = self._resize_frame(frame0, *self._lerobot_image_size,
-                                      crop_side=self._lerobot_crop_side)
-            rgb1 = self._resize_frame(frame1, *self._lerobot_image_size,
-                                      crop_side=self._lerobot_crop_side)
-            rgb2 = self._resize_frame(frame2, *self._lerobot_image_size,
-                                      crop_side=self._lerobot_crop_side)
-            thread.push_frame(rgb0, rgb1, rgb2)
+            images = {f"cam{i+1}": self._resize_frame(frame, *self._lerobot_image_size,
+                       crop_side=self._lerobot_crop_side) for i, frame in enumerate(frames)}
+            thread.push_frame(images)
             dt = (time.perf_counter() - t0) * 1000
 
             if thread is self._rollout_record_thread:
@@ -4404,19 +4590,27 @@ class CameraWidget(QWidget):
         """已废弃：旧主线程 add_frame 路径，保留兼容"""
         pass
 
+    def _get_valid_single_pose(self):
+        if not getattr(self, "_single_feedback_ready", lambda: True)():
+            return None
+        if self._lerobot_get_end_pose is None:
+            return None
+        result = self._lerobot_get_end_pose()
+        if not isinstance(result, tuple) or len(result) < 2:
+            return None
+        pose, gripper = result[:2]
+        if pose is None or gripper is None:
+            return None
+        state = np.asarray([getattr(pose, name) for name in ("x", "y", "z", "rx", "ry", "rz")]
+                           + [float(gripper)], dtype=np.float32)
+        return state if state.shape == (7,) and np.isfinite(state).all() else None
+
     def _zero_pose7(self):
-        """VLA 单臂路径的零位姿：7 + 底盘 4 维（与 _get_pose_7d 一致）"""
-        return np.zeros(
-            7 + (4 if getattr(self, "_mobile_get_state", None) is not None else 0),
-            dtype=np.float32)
+        """VLA 单臂兼容路径固定为 7 维。"""
+        return np.zeros(7, dtype=np.float32)
 
     def _get_pose_7d(self):
-        """返回 [x, y, z, rx, ry, rz, gripper_rad] (+底盘 4 维) 或回调不可用时全0
-
-        基础 7 维：位置(3) + 欧拉角(3，弧度) + 夹爪角度(1，弧度)。
-        接入底盘后追加 [lift_m, vx, vy, omega]（升降绝对位置 +
-        底盘机体系实测速度）共 11 维。
-        """
+        """返回单臂兼容路径的 pose7，回调不可用时全零。"""
         if self._lerobot_get_end_pose is None:
             return self._zero_pose7()
 
@@ -4448,9 +4642,6 @@ class CameraWidget(QWidget):
             gripper_rad = 0.0
 
         pose = np.array([x, y, z, rx, ry, rz, float(gripper_rad)], dtype=np.float32)
-        mobile = self._get_mobile_state()
-        if mobile is not None:
-            pose = np.concatenate([pose, mobile])
         return pose
 
     def _center_crop_to_lerobot(self, frame):
@@ -4574,9 +4765,18 @@ class CameraWidget(QWidget):
         if self._rollout_recording:
             QMessageBox.information(self, "LeRobot 录制", "推理录制进行中，请先停止。")
             return
-        if len(self.camera_indices) < 3:
+        if not self._required_cameras_ready():
             QMessageBox.warning(self, "LeRobot 录制",
-                                "需要 3 个摄像头才能录制（臂1腕部/头部/臂2腕部）")
+                                "请绑定当前模式所需相机：" + "/".join(self.CAMERA_ROLE_NAMES[r] for r in self.CAMERA_ROLES))
+            return
+        try:
+            record_state = self._get_record_state()
+            self._get_record_torque()
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "LeRobot 录制", str(exc))
+            return
+        if record_state is None:
+            QMessageBox.warning(self, "LeRobot 录制", "等待当前模式的真实反馈（单臂末端 pose7 / 双臂关节 joint14）。")
             return
 
         # 关键：录制前确保采集分辨率不低于目标分辨率，避免低分辨率放大存储
@@ -4611,8 +4811,8 @@ class CameraWidget(QWidget):
         if isinstance(dataset, str) and dataset == "incompatible":
             QMessageBox.warning(
                 self, "LeRobot 录制",
-                f"文件夹 '{self._lerobot_repo_name}' 已存在，但格式不兼容，"
-                f"请修改文件夹名。"
+                f"文件夹 '{self._lerobot_repo_name}' 与当前 {self._pose_dim()}D schema 不兼容。"
+                "已拒绝追加，原数据未修改；请选择新文件夹名。"
             )
             return
         if dataset is None:
@@ -4625,16 +4825,15 @@ class CameraWidget(QWidget):
         self._lerobot_recording = True
 
         # 启动后台录制线程
-        self._lerobot_record_thread = LeRobotRecordThread(
+        self._lerobot_record_thread = DualArmLeRobotRecordThread(
             dataset=self._lerobot_dataset,
-            pose_callback=self._lerobot_get_end_pose,
-            pose2_callback=self._lerobot_get_end_pose2,
+            state_callback=self._get_record_state,
+            include_mobile=self._pose_dim() == 18,
+            single_arm=self._pose_dim() == 7,
             fps=self._lerobot_fps,
             max_queue=5,
-            torque_callback=self._lerobot_get_torque,
-            torque2_callback=self._lerobot_get_torque2,
-            action_lookahead=self._action_lookahead,
-            extra_state_callback=self._get_mobile_state,
+            torque_callback=self._get_record_torque,
+            action_lookahead=5,
             parent=self,
         )
         self._lerobot_record_thread.set_task_name(self._lerobot_task_name)
@@ -4655,11 +4854,6 @@ class CameraWidget(QWidget):
         )
         self.status_label.setText(f"LeRobot 录制中: {self._lerobot_task_name}")
         logger.info(f"[LeRobot] 开始录制任务: {self._lerobot_task_name}，频率 {self._lerobot_fps}Hz")
-        if getattr(self, "_mobile_get_state", None) is not None:
-            logger.info(
-                "[LeRobot] 底盘 4 维 = [lift_m(绝对位置), vx, vy, omega(机体系实测速度)]。"
-                "注意：与旧的 [lift, odom_x, odom_y, yaw] 位姿数据语义不同，不可混训")
-
     def _on_lerobot_frame_written(self, count):
         """后台线程写入帧数回调（可选）"""
         pass
@@ -4784,9 +4978,18 @@ class CameraWidget(QWidget):
         if self._lerobot_recording:
             QMessageBox.information(self, "推理录制", "遥操作录制进行中，请先停止。")
             return
-        if len(self.camera_indices) < 3:
+        if not self._required_cameras_ready():
             QMessageBox.warning(self, "推理录制",
-                                "需要 3 个摄像头才能录制（臂1腕部/头部/臂2腕部）")
+                                "请绑定当前模式所需相机：" + "/".join(self.CAMERA_ROLE_NAMES[r] for r in self.CAMERA_ROLES))
+            return
+        try:
+            record_state = self._get_record_state()
+            self._get_record_torque()
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "推理录制", str(exc))
+            return
+        if record_state is None:
+            QMessageBox.warning(self, "推理录制", "等待当前模式的真实反馈（单臂末端 pose7 / 双臂关节 joint14）。")
             return
 
         self._ensure_capture_resolution()
@@ -4797,7 +5000,7 @@ class CameraWidget(QWidget):
         dataset = self._ensure_lerobot_dataset()
         self._lerobot_repo_name = prev_repo
         if isinstance(dataset, str) and dataset == "incompatible":
-            QMessageBox.warning(self, "推理录制", "ela3_rollout 已存在但格式不兼容，请检查。")
+            QMessageBox.warning(self, "推理录制", f"{self._rollout_repo_name} 已存在但格式不兼容，请检查。")
             return
         if dataset is None:
             QMessageBox.critical(self, "推理录制", "无法初始化 LeRobotDataset，请检查日志")
@@ -4817,16 +5020,15 @@ class CameraWidget(QWidget):
         self._rollout_takeover_start = 0 if self._vla_control_paused else None
         self._rollout_recording = True
 
-        self._rollout_record_thread = LeRobotRecordThread(
+        self._rollout_record_thread = DualArmLeRobotRecordThread(
             dataset=self._rollout_dataset,
-            pose_callback=self._lerobot_get_end_pose,
-            pose2_callback=self._lerobot_get_end_pose2,
+            state_callback=self._get_record_state,
+            include_mobile=self._pose_dim() == 18,
+            single_arm=self._pose_dim() == 7,
             fps=self._lerobot_fps,
             max_queue=5,
-            torque_callback=self._lerobot_get_torque,
-            torque2_callback=self._lerobot_get_torque2,
-            action_lookahead=self._action_lookahead,
-            extra_state_callback=self._get_mobile_state,
+            torque_callback=self._get_record_torque,
+            action_lookahead=5,
             parent=self,
         )
         self._rollout_record_thread.set_task_name(task_text)
@@ -4841,9 +5043,9 @@ class CameraWidget(QWidget):
             "font-size: 12px; padding: 4px 12px; background-color: #ff4444; color: white;"
         )
         grp = f", 组={self._rollout_active_group_id}" if self._rollout_active_group_id else ""
-        self.status_label.setText(f"推理录制中: {task_text} → ela3_rollout{grp}")
+        self.status_label.setText(f"推理录制中: {task_text} → {self._rollout_repo_name}{grp}")
         logger.info(
-            f"[RolloutRec] 开始推理录制: task={task_text}, repo=ela3_rollout, "
+            f"[RolloutRec] 开始推理录制: task={task_text}, repo={self._rollout_repo_name}, "
             f"policy={self._rollout_policy_tag}, group={self._rollout_active_group_id}")
 
     def _on_rollout_thread_error(self, msg):
@@ -5273,6 +5475,7 @@ class CameraWidget(QWidget):
             if cap is not None:
                 cap.release()
         self.caps.clear()
+        self._capture_tokens.clear()
         self.latest_frames.clear()
         self._pending_frames.clear()
         logger.info("[Camera] 摄像头资源已清理")

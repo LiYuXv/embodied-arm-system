@@ -42,9 +42,10 @@ CAN_BITRATE_OPTIONS = [
 class InterfaceRow(QWidget):
     """单臂接口选择行：后端 + CAN/串口选择 + 开启/关闭 + 波特率 + 刷新"""
 
-    def __init__(self, parent=None, default_can: str = "can0"):
+    def __init__(self, parent=None, default_can: str = "can0", active=True):
         super().__init__(parent)
         self._default_can = default_can
+        self._active = active
         self._init_ui()
         self._on_backend_changed()
 
@@ -142,6 +143,8 @@ class InterfaceRow(QWidget):
     # ---- 刷新接口 ----
 
     def _on_refresh_clicked(self):
+        if not self._active:
+            return
         if self.is_slcan_mode():
             self._refresh_serial_ports()
         else:
@@ -204,6 +207,8 @@ class InterfaceRow(QWidget):
         return raw or "COM3"
 
     def _get_selected_state(self) -> str:
+        if not self._active:
+            return ""
         return get_can_state(self._default_can)
 
     def _update_can_toggle_label(self):
@@ -214,6 +219,8 @@ class InterfaceRow(QWidget):
             self.can_toggle_btn.setText(tr("tb.open"))
 
     def _on_can_toggle(self):
+        if not self._active:
+            return
         name = self._get_selected_can_name()
         state = self._get_selected_state()
 
@@ -267,6 +274,7 @@ class InterfaceRow(QWidget):
 class ToolbarPanel(QWidget):
     """顶部工具栏（双臂两行接口选择 + 控制按钮）"""
 
+    mode_requested = pyqtSignal(str)
     connect_requested = pyqtSignal(str, dict)
     disconnect_requested = pyqtSignal()
     enable_requested = pyqtSignal()
@@ -276,8 +284,9 @@ class ToolbarPanel(QWidget):
     open_monitor_requested = pyqtSignal()
     open_settings_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, work_mode="dual"):
         super().__init__(parent)
+        self.work_mode = work_mode
         self._connected = False
         self._enabled = False
         self.setFixedHeight(80)
@@ -301,6 +310,17 @@ class ToolbarPanel(QWidget):
         # ---- 第一行：臂1 接口 + 控制按钮 ----
         row = QHBoxLayout()
         row.setSpacing(6)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.setObjectName("workModeCombo")
+        self.mode_combo.addItem("单臂 · can0", "single")
+        self.mode_combo.addItem("双臂 · can0 + can1", "dual")
+        self.mode_combo.setCurrentIndex(0 if self.work_mode == "single" else 1)
+        self.mode_combo.setStyleSheet("font-weight: bold; border: 2px solid #3984c6;")
+        self.mode_combo.setToolTip("切换前请停止录制/推理/遥操，停用并断开机械臂")
+        self.mode_combo.currentIndexChanged.connect(
+            lambda _: self.mode_requested.emit(self.mode_combo.currentData()))
+        row.addWidget(self.mode_combo)
 
         self.arm1_label = QLabel(tr("tb.arm1"))
         self.arm1_label.setStyleSheet("font-weight: bold;")
@@ -389,11 +409,26 @@ class ToolbarPanel(QWidget):
         self.arm2_label.setStyleSheet("font-weight: bold;")
         row2.addWidget(self.arm2_label)
 
-        self.arm2_row = InterfaceRow(default_can="can1")
+        self.arm2_row = InterfaceRow(default_can="can1", active=self.work_mode == "dual")
         row2.addWidget(self.arm2_row)
         row2.addStretch()
 
         root.addLayout(row2)
+        self.set_work_mode(self.work_mode)
+
+    def set_work_mode(self, mode):
+        self.work_mode = mode
+        dual = mode == "dual"
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(1 if dual else 0)
+        self.mode_combo.blockSignals(False)
+        was_active = self.arm2_row._active
+        self.arm2_row._active = dual
+        self.arm2_row.setVisible(dual)
+        self.arm2_label.setVisible(dual)
+        self.setFixedHeight(80 if dual else 44)
+        if dual and not was_active:
+            self.arm2_row._on_refresh_clicked()
 
     def _add_sep(self, layout):
         sep = QFrame()
@@ -449,10 +484,10 @@ class ToolbarPanel(QWidget):
     def _on_connect_clicked(self):
         if not self._connected:
             cfg1 = self.arm1_row.get_config()
-            cfg2 = self.arm2_row.get_config()
             kwargs = dict(cfg1)
             kwargs.pop("can_name", None)
-            kwargs["arm2"] = cfg2
+            kwargs["arm2"] = (self.arm2_row.get_config()
+                              if self.work_mode == "dual" else None)
             can_name = cfg1.get("can_name") or cfg1.get("serial_port", "can0")
             self.connect_requested.emit(can_name, kwargs)
         else:

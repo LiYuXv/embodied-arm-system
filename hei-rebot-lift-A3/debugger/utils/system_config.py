@@ -9,8 +9,11 @@ logger = logging.getLogger("debugger")
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "settings" / "main_system_config.json"
 
 DEFAULT_CONFIG = {
+    "work_mode": "single",
+    # 底盘/升降仅在下次启动时创建；旧配置缺失此键也保持关闭。
+    "mobile_base_enabled": False,
     # 启动 main.py 后自动连接串口（连接成功后自动使能）
-    "auto_connect_on_startup": True,
+    "auto_connect_on_startup": False,
     # CAN 串口控制波特率 (bit/s)
     "can_bitrate": 500000,
     # 摄像头角色绑定：{角色: {"usb": 端口拓扑路径, "index": /dev/videoN}}
@@ -19,11 +22,8 @@ DEFAULT_CONFIG = {
     "camera_roles": {},
     # VR 控制面板默认设置（启动时应用到 VR 面板，运行时仍可在面板内临时调整）
     "vr_defaults": {
-        "lift_speed_rpm": 200.0,      # 升降转速 (RPM)
         "gripper_speed_rad_s": 2.0,   # 摇杆 Y → 夹爪速度 (rad/s)
         "scale": 1.0,                 # 运动缩放 (x)
-        "hmd_pos_scale": 1.0,         # 头显位置缩放 (x)
-        "hmd_max_lin": 0.30,          # 头显速度跟随 (m/s)
     },
 }
 
